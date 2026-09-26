@@ -5,10 +5,12 @@
 # 用法:
 #   bash proxy.sh                 # 交互式菜单
 #   bash proxy.sh --auto          # 全部默认值自动安装
+#   bash proxy.sh --nat           # NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine）
 #   bash proxy.sh --help          # 查看全部参数
 # 安装完成后可直接使用命令: proxy
 #
 # 支持: Debian 11/12/13, Ubuntu 20.04+, Rocky/Alma/CentOS Stream 8/9(+), RHEL, Fedora (systemd, amd64/arm64)
+#       NAT 模式 (--nat) 另支持 Alpine 3.18+ (OpenRC) 及 armv7
 #
 # shellcheck disable=SC2317  # 通过 trap / 菜单间接调用的函数
 
@@ -18,9 +20,10 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.1.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
-readonly SCRIPT_URL="https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh"
+# 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
+readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
 
 # ----------------------------- 路径 -----------------------------
 readonly STATE_DIR="/root/.proxy-oneclick"
@@ -48,6 +51,21 @@ readonly XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install
 readonly HY_INSTALL_URL="https://get.hy2.sh/"
 readonly SCANNER_VER="v0.2.3"
 readonly NFT_TABLE="proxy_oneclick"
+# NAT 模式
+readonly XRAY_ASSET_DIR="/usr/local/share/xray"
+readonly XRAY_UNIT="/etc/systemd/system/xray.service"
+readonly HY_UNIT="/etc/systemd/system/hysteria-server.service"
+readonly XRAY_RC="/etc/init.d/xray"
+readonly HY_RC="/etc/init.d/hysteria-server"
+readonly XRAY_LOG="/var/log/xray/xray.log"
+readonly HY_LOG="/var/log/hysteria/hysteria.log"
+readonly HOP_SCRIPT="${STATE_DIR}/nat-hop.sh"
+readonly HOP_UNIT="/etc/systemd/system/proxy-oneclick-hop.service"
+readonly HOP_RC="/etc/init.d/proxy-oneclick-hop"
+readonly HOP_TABLE="proxy_oneclick_hop"
+readonly RESOLV_BAK="${STATE_DIR}/resolv.conf.bak"
+# 公共 DNS64 服务器（nat64.net / Trex），仅在 IPv6-only 且用户同意时写入 /etc/resolv.conf
+readonly DNS64_SERVERS="2a00:1098:2b::1 2a00:1098:2c::1 2a01:4f8:c2c:123f::1"
 readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
 
 # ----------------------------- 默认值 / 运行参数 -----------------------------
@@ -59,16 +77,26 @@ OPT_HY2=""          # 空=询问(交互)/默认启用(auto); 1/0
 OPT_HY2_PORT=""
 OPT_HOP=""          # "20000-50000" 或 "none"
 OPT_FIREWALL=1
-OPT_UPGRADE=1
-OPT_TUNE=1
+OPT_UPGRADE=""      # 空=默认（普通模式 1，NAT 模式 0）
+OPT_TUNE=""         # 空=默认（普通模式 1，NAT 模式 0）
 OPT_SCAN=0
 OPT_NAME=""
 OPT_ACTION=""
+OPT_NAT=""          # 空=沿用已安装的模式; 1/0
+OPT_NAT_ADDR=""
+OPT_NAT_EXT=""      # 映射端口列表 --nat-ports（外部[:内部]，逗号分隔；或整段 a-b[:c-d]）
+OPT_NAT_EXCLUDE=""  # 端口段内需要排除的外部端口（例如 SSH 映射）
+OPT_NAT_SHARE=""    # 1 = Reality(TCP) 与 Hy2(UDP) 共用一个外部端口；0 = 分开
+OPT_DNS64=0
 
 # 运行时变量（部分持久化到 STATE_FILE）
 OS_ID="" OS_VER="" OS_NAME="" PKG="" ARCH=""
 PUBLIC_IP4="" PUBLIC_IP6="" GEO_CC="" GEO_REGION="" GEO_CITY="" GEO_ORG=""
 TMP_DIR=""
+INIT_SYS=""         # systemd | openrc | none
+NO_V4=0             # 1 = 没有 IPv4 出口（IPv6-only / NAT64）
+IPFAM=4             # 探测 / 测速使用的地址族
+FETCH_IP=()         # 传给 curl 的地址族参数（IPv6-only 时为 -6）
 
 # ----------------------------- 输出 -----------------------------
 if [[ -t 1 ]]; then
@@ -91,7 +119,7 @@ on_error() {
   local rc=$? line=$1 cmd=$2
   trap - ERR
   printf '\n%s[错误]%s 脚本在第 %s 行执行失败 (退出码 %s)：\n    %s\n' "$C_RED" "$C_NONE" "$line" "$rc" "$cmd" >&2
-  printf '%s如需帮助，请带上以上信息及 journalctl -xe 输出反馈。重新运行本脚本是安全的（幂等）。%s\n' "$C_YELLOW" "$C_NONE" >&2
+  printf '%s如需帮助，请带上以上信息及服务日志（journalctl -xe 或 /var/log/xray、/var/log/hysteria）反馈。重新运行本脚本是安全的（幂等）。%s\n' "$C_YELLOW" "$C_NONE" >&2
   exit "$rc"
 }
 cleanup() { [[ -n ${TMP_DIR} && -d ${TMP_DIR} ]] && rm -rf "${TMP_DIR}"; return 0; }
@@ -157,10 +185,77 @@ urlencode() {
 }
 rand_hex() { openssl rand -hex "$1"; }
 rand_pass() { openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | cut -c1-24; }
-ver_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]; }
-fetch() { curl -fsSL --connect-timeout 10 --retry 2 --retry-delay 2 "$@"; }
-svc_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+ver_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | awk 'NR==1')" == "$2" ]]; }
+fetch() { curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 --retry 2 --retry-delay 2 "$@"; }
 host_fmt() { [[ $1 == *:* ]] && printf '[%s]' "$1" || printf '%s' "$1"; }
+
+# ----------------------------- 服务管理（systemd / OpenRC 抽象） -----------------------------
+detect_init() {
+  if [[ -d /run/systemd/system ]] && have systemctl; then INIT_SYS=systemd
+  elif have openrc-run || have rc-service; then INIT_SYS=openrc
+  else INIT_SYS=none; fi
+}
+is_openrc() { [[ $INIT_SYS == openrc ]]; }
+openrc_ready() { # 非 OpenRC 引导的精简容器缺少 softlevel 时 rc-service 会拒绝工作
+  is_openrc || return 0
+  if [[ ! -e /run/openrc/softlevel ]]; then
+    warn "OpenRC 尚未初始化（/run/openrc/softlevel 不存在），已自动补齐；建议确认容器以 /sbin/init 启动，否则重启后服务可能不会自启。"
+    mkdir -p /run/openrc && touch /run/openrc/softlevel
+  fi
+}
+svc_log_file() { case $1 in xray) printf '%s' "$XRAY_LOG" ;; hysteria-server) printf '%s' "$HY_LOG" ;; esac; }
+svc_exists() {
+  if is_openrc; then [[ -x /etc/init.d/$1 ]]; else systemctl cat "$1" >/dev/null 2>&1; fi
+}
+svc_active() {
+  if is_openrc; then [[ -x /etc/init.d/$1 ]] && rc-service --quiet "$1" status >/dev/null 2>&1
+  else systemctl is-active --quiet "$1" 2>/dev/null; fi
+}
+svc_state() { # 输出 active / inactive / failed ... ；未安装输出 none
+  svc_exists "$1" || { echo none; return 0; }
+  if is_openrc; then
+    if svc_active "$1"; then echo active
+    else rc-service "$1" status 2>/dev/null | awk -F': *' '/status/{print $NF; f=1} END{if(!f) print "inactive"}' | tail -n1; fi
+  else
+    systemctl is-active "$1" 2>/dev/null || true
+  fi
+}
+sd_reload() { [[ $INIT_SYS == systemd ]] && systemctl daemon-reload >/dev/null 2>&1; return 0; }
+svc_enable() {
+  if is_openrc; then rc-update add "$1" default >/dev/null 2>&1 || true
+  else systemctl enable "$1" >/dev/null 2>&1 || true; fi
+}
+svc_restart() {
+  # 9>&- ：不要把脚本的锁文件描述符继承给常驻的 supervise-daemon（否则锁永远不会释放）
+  if is_openrc; then rc-service "$1" restart >/dev/null 2>&1 9>&- || rc-service "$1" start >/dev/null 2>&1 9>&-
+  else systemctl restart "$1"; fi
+}
+svc_disable_stop() { # 停止并取消开机自启（不存在时静默）
+  if is_openrc; then
+    [[ -x /etc/init.d/$1 ]] || return 0
+    rc-service "$1" stop >/dev/null 2>&1 || true
+    rc-update del "$1" default >/dev/null 2>&1 || true
+  elif have systemctl; then
+    systemctl disable --now "$1" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+svc_logs() { # $1 服务 $2 行数
+  if is_openrc; then
+    local f; f=$(svc_log_file "$1")
+    if [[ -n $f && -s $f ]]; then tail -n "${2:-80}" "$f"; else warn "暂无日志（${f:-$1}）。"; fi
+  else
+    journalctl -u "$1" -n "${2:-80}" --no-pager
+  fi
+}
+svc_follow() {
+  if is_openrc; then
+    local f; f=$(svc_log_file "$1"); [[ -n $f ]] || return 0
+    info "按 Ctrl+C 退出（日志文件 ${f}）"; tail -n 20 -f "$f"
+  else
+    journalctl -u "$1" -f
+  fi
+}
 
 require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 用户运行本脚本（例如: sudo -i 后再执行）。"; }
 
@@ -174,10 +269,14 @@ take_lock() {
 # 持久化的键
 STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY SNI SNI_TARGET
             HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED SSH_PORTS
-            EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR)
+            EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
+            NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
+            HOP_BACKEND VIRT DNS64_SET)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
 EXTRA_TCP="" EXTRA_UDP="" DISABLED_FW="" SWAP_CREATED=0 SERVER_ADDR=""
+NAT_MODE=0 NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE=""
+HOP_BACKEND="" VIRT="" DNS64_SET=0
 
 load_state() {
   [[ -f $STATE_FILE ]] || return 0
@@ -232,8 +331,11 @@ detect_os() {
   local major=${OS_VER%%.*}
   [[ $major =~ ^[0-9]+$ ]] || major=0
 
-  if [[ ! -d /run/systemd/system ]] || ! have systemctl; then
-    refuse_os "当前系统未使用 systemd 作为 init（${OS_NAME}），本脚本不支持（例如 OpenVZ/LXC 精简容器、Alpine/OpenRC）。"
+  detect_init
+  if [[ $OS_ID == alpine ]]; then
+    alpine_check
+  elif [[ $INIT_SYS != systemd ]]; then
+    refuse_os "当前系统未使用 systemd 作为 init（${OS_NAME}），本脚本不支持（Debian/Ubuntu/RHEL 需 systemd；非 systemd 环境仅支持 Alpine + OpenRC 且需使用 --nat）。"
   fi
   case $OS_ID in
     debian)
@@ -250,7 +352,7 @@ detect_os() {
     fedora)
       PKG=dnf ;;
     alpine)
-      refuse_os "不支持 Alpine（musl + OpenRC）。" ;;
+      PKG=apk ;;
     *)
       if [[ " ${ID_LIKE,,} " == *" debian "* ]] && have apt-get; then
         warn "未经测试的 Debian 系发行版: ${OS_NAME}，将按 Debian 方式尝试。"; PKG=apt
@@ -265,9 +367,48 @@ detect_os() {
   case $(uname -m) in
     x86_64|amd64) ARCH=amd64 ;;
     aarch64|arm64) ARCH=arm64 ;;
-    *) die "不支持的 CPU 架构: $(uname -m)（仅支持 amd64 / arm64）" ;;
+    armv7*|armv8l)
+      direct_mode || die "不支持的 CPU 架构: $(uname -m)（普通模式仅支持 amd64 / arm64；armv7 请使用 --nat）"
+      ARCH=armv7 ;;
+    *) die "不支持的 CPU 架构: $(uname -m)（仅支持 amd64 / arm64$(direct_mode && echo ' / armv7')）" ;;
   esac
 }
+
+# Alpine：仅 NAT 模式支持（musl + OpenRC，官方安装脚本不支持，改为直接下载二进制）
+alpine_check() {
+  ver_ge "$OS_VER" "3.18" || refuse_os "Alpine ${OS_VER} 版本过旧，NAT 模式需要 Alpine 3.18 及以上。"
+  [[ $INIT_SYS == openrc ]] || refuse_os "Alpine 未检测到 OpenRC（缺少 openrc-run / rc-service），请先执行: apk add openrc"
+  if (( ! NAT_MODE )); then
+    warn "Alpine（musl + OpenRC）只支持 NAT / 精简模式（--nat）：直接下载官方二进制、使用 OpenRC 服务、跳过调优/防火墙/fail2ban。"
+    if [[ $OPT_NAT == 0 ]] || (( OPT_AUTO )) || ! confirm "是否以 NAT 模式继续安装？" y; then
+      printf '%s[错误]%s Alpine 请使用: bash proxy.sh --nat（自动安装: bash proxy.sh --nat --auto --nat-ports 公网端口[:内部端口]）\n' "$C_RED" "$C_NONE" >&2
+      exit 1
+    fi
+    NAT_MODE=1
+  fi
+}
+
+# 直接从 GitHub Releases 下载二进制（NAT 模式或 Alpine）
+direct_mode() { (( NAT_MODE )) || [[ $OS_ID == alpine ]]; }
+
+# 虚拟化类型：kvm / lxc / openvz / docker / podman / none ...
+detect_virt() {
+  local v=""
+  if have systemd-detect-virt; then v=$(systemd-detect-virt 2>/dev/null || true); fi
+  if [[ -z $v || $v == none ]]; then
+    if [[ -f /proc/user_beancounters ]] || { [[ -d /proc/vz ]] && [[ ! -d /proc/bc ]]; }; then v=openvz
+    elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null || grep -qE '/lxc/|lxc\.payload' /proc/1/cgroup 2>/dev/null; then v=lxc
+    elif [[ -f /run/.containerenv ]]; then v=podman
+    elif [[ -f /.dockerenv ]]; then v=docker
+    elif grep -qaE 'container=' /proc/1/environ 2>/dev/null; then v=container-other
+    elif [[ -d /proc/xen ]]; then v=xen
+    elif [[ -r /sys/class/dmi/id/sys_vendor ]] && grep -qiE 'qemu|kvm|vmware|microsoft|xen|virtualbox|amazon|google|alibaba|tencent' /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null; then v=vm
+    elif grep -qw hypervisor /proc/cpuinfo 2>/dev/null; then v=vm
+    else v=none; fi
+  fi
+  VIRT=$v
+}
+is_container() { [[ $VIRT =~ ^(lxc|lxc-libvirt|openvz|docker|podman|rkt|systemd-nspawn|wsl|container-other|proot|pouch)$ ]]; }
 
 sysval() { sysctl -n "$1" 2>/dev/null || echo "-"; }
 kernel_ge() { ver_ge "$(uname -r | cut -d- -f1)" "$1"; }
@@ -285,6 +426,9 @@ detect_ip() {
     [[ $PUBLIC_IP6 == *:* ]] && break
     PUBLIC_IP6=""
   done
+  NO_V4=0
+  [[ -z $PUBLIC_IP4 && -n $PUBLIC_IP6 ]] && NO_V4=1
+  if (( NAT_MODE && NO_V4 )); then IPFAM=6; FETCH_IP=(-6); fi
   if [[ -z $PUBLIC_IP4 && -z $PUBLIC_IP6 ]]; then
     PUBLIC_IP4=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || true
     [[ -n $PUBLIC_IP4 ]] || die "无法获取本机公网 IP，请检查网络连接。"
@@ -318,14 +462,34 @@ detect_geo() {
 
 mem_mb() { awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo; }
 swap_mb() { awk '/^SwapTotal:/{printf "%d", $2/1024}' /proc/meminfo; }
+# 实际可用内存上限（容器内取 cgroup 限制与 /proc/meminfo 的较小值）
+mem_limit_mb() {
+  local m c=""
+  m=$(mem_mb)
+  if [[ -r /sys/fs/cgroup/memory.max ]]; then c=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+  elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then c=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null); fi
+  if [[ $c =~ ^[0-9]+$ ]]; then c=$(( c / 1048576 )); (( c > 0 && c < m )) && m=$c; fi
+  printf '%s' "$m"
+}
+# 低内存（< 256MB）时为 Go 程序设置 GOMEMLIMIT / GOGC，输出 "KEY=VAL" 行。
+# 总预算约为内存上限的 60%，启用 Hysteria2 时由 xray / hysteria 平分（软限制，超出时只是更积极地 GC）
+go_mem_env() {
+  local m n=1; m=$(mem_limit_mb)
+  (( m > 0 && m < 256 )) || return 0
+  (( HY2_ENABLED )) && n=2
+  local lim=$(( m * 60 / 100 / n )); (( lim < 24 )) && lim=24
+  printf 'GOMEMLIMIT=%sMiB\nGOGC=50\n' "$lim"
+}
 
 show_sysinfo() {
   hr
   printf '  系统:     %s (%s)\n' "$OS_NAME" "$ARCH"
   printf '  内核:     %s\n' "$(uname -r)"
-  printf '  内存:     %s MB   Swap: %s MB\n' "$(mem_mb)" "$(swap_mb)"
+  printf '  内存:     %s MB   Swap: %s MB\n' "$(mem_limit_mb)" "$(swap_mb)"
+  printf '  虚拟化:   %s   init: %s\n' "${VIRT:-未知}" "${INIT_SYS:-未知}"
   printf '  IPv4:     %s\n' "${PUBLIC_IP4:-无}"
   printf '  IPv6:     %s\n' "${PUBLIC_IP6:-无（不影响使用）}"
+  (( NO_V4 )) && printf '  %s注意:     无 IPv4 出口（IPv6-only / NAT64）%s\n' "$C_YELLOW" "$C_NONE"
   printf '  位置:     %s %s %s\n' "${GEO_CC:-未知}" "${GEO_REGION}" "${GEO_CITY}"
   printf '  ASN:      %s\n' "${GEO_ORG:-未知}"
   hr
@@ -348,7 +512,14 @@ ensure_swap() {
 }
 
 pkg_update_upgrade() {
-  if [[ $PKG == apt ]]; then
+  if [[ $PKG == apk ]]; then
+    info "更新软件包索引 (apk update) ..."
+    apk update >/dev/null || warn "apk update 失败，继续尝试。"
+    if (( OPT_UPGRADE )); then
+      info "升级系统软件包 (apk upgrade) ..."
+      apk upgrade --no-cache >/dev/null || warn "系统升级出现问题，继续安装。"
+    fi
+  elif [[ $PKG == apt ]]; then
     info "更新软件包索引 (apt-get update) ..."
     apt-get update -qq || apt-get update
     if (( OPT_UPGRADE )); then
@@ -367,7 +538,9 @@ pkg_update_upgrade() {
 }
 
 pkg_install() { # 必需包，失败则退出
-  if [[ $PKG == apt ]]; then
+  if [[ $PKG == apk ]]; then
+    apk add --no-cache "$@" >/dev/null
+  elif [[ $PKG == apt ]]; then
     apt-get -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --no-install-recommends "$@" >/dev/null
   else
     dnf -y -q --setopt=install_weak_deps=False install "$@" >/dev/null
@@ -380,6 +553,7 @@ pkg_try() { # 可选包，逐个安装，失败只警告
 
 install_deps() {
   step "安装依赖"
+  if (( NAT_MODE )); then install_deps_nat; return; fi
   if [[ $PKG == apt ]]; then
     pkg_install ca-certificates curl openssl nftables jq unzip tar iproute2 procps gawk netbase
     pkg_try qrencode fail2ban python3-systemd
@@ -406,6 +580,28 @@ install_deps() {
   ok "依赖安装完成。"
 }
 
+# NAT 模式：只装必需组件（不装 fail2ban；nftables 仅用于 Hysteria2 端口跳跃，可选）
+install_deps_nat() {
+  if [[ $PKG == apk ]]; then
+    # bash/curl 必须事先安装；coreutils/grep/gawk 替换 busybox 中功能不全的同名命令
+    # 磁盘很小：只装必需包（busybox 已提供其余命令）；gawk/grep 替换功能不全的 busybox 版本
+    pkg_install bash ca-certificates curl openssl jq unzip iproute2 grep gawk musl-utils
+    pkg_try libqrencode-tools
+  elif [[ $PKG == apt ]]; then
+    pkg_install ca-certificates curl openssl jq unzip iproute2 procps gawk netbase
+    pkg_try qrencode
+  else
+    local need=(ca-certificates) cmd
+    for cmd in curl:curl openssl:openssl jq:jq unzip:unzip tar:tar ss:iproute ps:procps-ng awk:gawk flock:util-linux; do
+      have "${cmd%%:*}" || need+=("${cmd#*:}")
+    done
+    pkg_install "${need[@]}"
+    [[ $OS_ID == fedora ]] || rpm -q epel-release >/dev/null 2>&1 || pkg_try epel-release
+    pkg_try qrencode
+  fi
+  ok "依赖安装完成（NAT 精简模式）。"
+}
+
 # ---------- 时间同步（REALITY 对时间误差敏感，全新 DD 镜像常常没有时间同步服务） ----------
 TIME_SYNC_SVCS=(systemd-timesyncd chronyd chrony ntpsec ntp ntpd openntpd)
 time_sync_svc() { # 输出正在运行的时间同步服务名，没有则返回 1
@@ -413,9 +609,12 @@ time_sync_svc() { # 输出正在运行的时间同步服务名，没有则返回
   for s in "${TIME_SYNC_SVCS[@]}"; do svc_active "$s" && { printf '%s' "$s"; return 0; }; done
   return 1
 }
-time_synced() { [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; }
+time_synced() { have timedatectl && [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; }
 time_sync_status() { # 供状态页显示
   local svc; svc=$(time_sync_svc) || svc=""
+  if (( NAT_MODE )) && [[ -z $svc ]] && { [[ -n $VIRT ]] || detect_virt; is_container; }; then
+    printf '由宿主机管理（容器 %s）' "$VIRT"; return 0
+  fi
   if time_synced; then printf '%s已同步%s%s' "$C_GREEN" "$C_NONE" "${svc:+（${svc}）}"
   elif [[ -n $svc ]]; then printf '%s同步中/未同步%s（%s）' "$C_YELLOW" "$C_NONE" "$svc"
   else printf '%s未启用时间同步服务%s（重新运行安装可自动配置）' "$C_RED" "$C_NONE"; fi
@@ -424,11 +623,17 @@ ensure_time_sync() {
   step "时间同步（REALITY 需要准确的系统时间）"
   local svc
   if svc=$(time_sync_svc); then ok "时间同步服务已在运行：${svc}"; return 0; fi
-  if systemd-detect-virt -cq 2>/dev/null; then
-    info "容器环境，系统时间由宿主机管理，跳过。"; return 0
+  [[ -n $VIRT ]] || detect_virt
+  if is_container || { have systemd-detect-virt && systemd-detect-virt -cq 2>/dev/null; }; then
+    info "容器环境（${VIRT}），系统时间由宿主机管理，跳过。当前时间 $(date '+%F %T %Z')"; return 0
   fi
   info "未检测到时间同步服务，正在安装并启用 ..."
-  if [[ $PKG == apt ]]; then
+  if [[ $PKG == apk ]]; then
+    if pkg_install chrony 2>/dev/null; then
+      rc-update add chronyd default >/dev/null 2>&1 || true
+      rc-service chronyd start >/dev/null 2>&1 9>&- || true
+    fi
+  elif [[ $PKG == apt ]]; then
     if pkg_install systemd-timesyncd 2>/dev/null; then
       systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
     fi
@@ -439,7 +644,7 @@ ensure_time_sync() {
   else
     if pkg_install chrony 2>/dev/null; then systemctl enable --now chronyd >/dev/null 2>&1 || true; fi
   fi
-  timedatectl set-ntp true >/dev/null 2>&1 || true
+  have timedatectl && { timedatectl set-ntp true >/dev/null 2>&1 || true; }
   if svc=$(time_sync_svc); then
     ok "已启用时间同步服务：${svc}（当前时间 $(date '+%F %T %Z')）"
   else
@@ -452,11 +657,13 @@ preflight() {
   step "环境检测"
   require_root
   detect_os
+  openrc_ready
   have curl || pkg_bootstrap_curl
-  info "系统: ${OS_NAME} / 架构: ${ARCH} / 包管理: ${PKG}"
+  info "系统: ${OS_NAME} / 架构: ${ARCH} / 包管理: ${PKG} / init: ${INIT_SYS}$( ((NAT_MODE)) && echo ' / NAT 模式')"
 }
 pkg_bootstrap_curl() {
-  if [[ $PKG == apt ]]; then apt-get update -qq && pkg_install curl ca-certificates; else pkg_install curl ca-certificates; fi
+  if [[ $PKG == apk ]]; then apk add --no-cache curl ca-certificates >/dev/null
+  elif [[ $PKG == apt ]]; then apt-get update -qq && pkg_install curl ca-certificates; else pkg_install curl ca-certificates; fi
 }
 
 # ============================================================
@@ -671,6 +878,19 @@ in_cf_v6() {
   return 1
 }
 
+# 目标是否支持后量子密钥交换 X25519MLKEM768（新版 Xray 客户端的 uTLS 指纹默认携带；
+# 目标不支持时 REALITY 握手会失败："handshake did not complete successfully"）。
+# 用已安装的 xray 自带的 `xray tls ping` 检测；返回 0=支持 1=明确不支持 2=无法判断（xray 未安装/网络失败，放行）
+sni_pq_check() { # $1 域名 [$2 IP]
+  [[ -x $XRAY_BIN ]] || return 2
+  local out pq
+  out=$(timeout 12 "$XRAY_BIN" tls ping ${2:+-ip "$2"} "$1" 2>&1) || true
+  pq=$(awk '/Pinging with SNI/{f=1} f && /Post-Quantum key exchange:/{print; exit}' <<<"$out")
+  [[ -n $pq ]] || return 2
+  [[ $pq == *true* ]] && return 0
+  return 1
+}
+
 # 探测单个候选域名。输出一行:
 #   PASS|域名|TCP延迟ms|TLS握手完成ms|IP|国家|城市|ASN
 #   FAIL|域名|原因
@@ -680,20 +900,29 @@ sni_probe() {
   [[ $host =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || { echo "FAIL|$host|域名格式无效"; return; }
   if sni_blacklisted "$host"; then echo "FAIL|$host|大厂/被墙/CDN/国内域名（黑名单）"; return; fi
   ip4s=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u) || true
-  [[ -n $ip4s ]] || { echo "FAIL|$host|无 IPv4 解析"; return; }
-  for ip in $ip4s; do in_cf_v4 "$ip" && { echo "FAIL|$host|解析到 Cloudflare IP ($ip)"; return; }; done
   ip6s=$(getent ahostsv6 "$host" 2>/dev/null | awk '$1 ~ /:/ && $1 !~ /^::ffff:/ {print $1}' | sort -u) || true
+  if (( IPFAM == 6 )); then
+    [[ -n $ip6s ]] || { echo "FAIL|$host|无 IPv6 解析（IPv6-only 机器需目标支持 IPv6 或配置 DNS64）"; return; }
+  else
+    [[ -n $ip4s ]] || { echo "FAIL|$host|无 IPv4 解析"; return; }
+  fi
+  for ip in $ip4s; do in_cf_v4 "$ip" && { echo "FAIL|$host|解析到 Cloudflare IP ($ip)"; return; }; done
   for ip in $ip6s; do in_cf_v6 "$ip" && { echo "FAIL|$host|解析到 Cloudflare IPv6 ($ip)"; return; }; done
-  first=$(head -n1 <<<"$ip4s")
+  local conn
+  if (( IPFAM == 6 )); then first=$(head -n1 <<<"$ip6s"); conn="[${first}]:443"
+  else first=$(head -n1 <<<"$ip4s"); conn="${first}:443"; fi
 
-  out=$(timeout 12 openssl s_client -connect "${first}:443" -servername "$host" -tls1_3 -groups X25519 -alpn h2 \
+  out=$(timeout 12 openssl s_client -connect "$conn" -servername "$host" -tls1_3 -groups X25519 -alpn h2 \
         -verify_return_error -verify_hostname "$host" </dev/null 2>&1) || true
   grep -q 'TLSv1.3' <<<"$out" || { echo "FAIL|$host|不支持 TLS1.3 / X25519"; return; }
   grep -q 'ALPN protocol: h2' <<<"$out" || { echo "FAIL|$host|不支持 ALPN h2"; return; }
   grep -q 'Verify return code: 0 (ok)' <<<"$out" || { echo "FAIL|$host|证书链/域名校验失败"; return; }
+  local pqrc=0
+  sni_pq_check "$host" "$first" || pqrc=$?
+  (( pqrc == 1 )) && { echo "FAIL|$host|不支持后量子密钥交换 X25519MLKEM768（新版 Xray 客户端 REALITY 握手会失败）"; return; }
 
   hdr=$(mktemp)
-  w=$(curl -4 -sS -o /dev/null -D "$hdr" --http2 -L --max-redirs 3 --connect-timeout 5 -m 15 -A "$UA" \
+  w=$(curl "-${IPFAM}" -sS -o /dev/null -D "$hdr" --http2 -L --max-redirs 3 --connect-timeout 5 -m 15 -A "$UA" \
         -w '%{http_version} %{time_connect} %{time_appconnect} %{http_code}' "https://${host}/" 2>/dev/null) || true
   read -r ver tconn tapp code <<<"$w"
   if [[ -z $code || $code == 000 ]]; then rm -f "$hdr"; echo "FAIL|$host|HTTPS 请求失败"; return; fi
@@ -706,7 +935,7 @@ sni_probe() {
   local i best_tls=999999 t_ms a_ms
   for i in 0 1 2; do
     if (( i > 0 )); then
-      w=$(curl -4 -sS -o /dev/null -I --http2 --connect-timeout 5 -m 8 -A "$UA" -w '%{time_connect} %{time_appconnect}' "https://${host}/" 2>/dev/null) || true
+      w=$(curl "-${IPFAM}" -sS -o /dev/null -I --http2 --connect-timeout 5 -m 8 -A "$UA" -w '%{time_connect} %{time_appconnect}' "https://${host}/" 2>/dev/null) || true
       read -r tconn tapp <<<"$w"
     fi
     t_ms=$(awk -v t="${tconn:-0}" 'BEGIN{printf "%d", t*1000}')
@@ -727,16 +956,21 @@ sni_probe() {
   echo "PASS|$host|$best|$tls_ms|$first|$cc|$city|$org"
 }
 
+# NAT 模式（小内存）降低并发并减少候选数量
+SNI_PAR=10
+sni_cap() { # 输出候选列表（NAT 模式最多 12 个）
+  if (( NAT_MODE )); then tr ' ' '\n' <<<"$*" | awk 'NF && ++n <= 12' | tr '\n' ' '; else printf '%s' "$*"; fi
+}
 # 并发测试一组域名，结果写入 $1 文件
 sni_test_list() {
   local outfile=$1; shift
   local h n=0 total=$#
   mktmp
   load_cf_ranges
-  local dir; dir=$(mktemp -d "${TMP_DIR}/probe.XXXX")
+  local dir; dir=$(mktemp -d "${TMP_DIR}/probe.XXXXXX")
   for h in "$@"; do
     n=$((n + 1))
-    while (( $(jobs -rp | wc -l) >= 10 )); do wait -n 2>/dev/null || true; done
+    while (( $(jobs -rp | wc -l) >= SNI_PAR )); do wait -n 2>/dev/null || true; done
     ( trap - ERR; set +e; sni_probe "$h" >"${dir}/${n}.res" 2>/dev/null ) &
     printf '\r  正在检测 %d/%d ...' "$n" "$total"
   done
@@ -766,7 +1000,7 @@ scanner_parse() {
   awk -F',' 'NR==1{for(i=1;i<=NF;i++){gsub(/"/,"",$i); c[$i]=i}; next}
     { tls=(c["TLS"] ? $(c["TLS"]) : "TLS 1.3"); alpn=(c["ALPN"] ? $(c["ALPN"]) : "h2"); d=$(c["CERT_DOMAIN"]); gsub(/"/,"",d)
       if (tls ~ /1\.3/ && alpn=="h2" && d !~ /^\*/ && d ~ /\./) print tolower(d) }' "$1" | sort -u |
-    while read -r dom; do sni_blacklisted "$dom" || echo "$dom"; done | head -n 40
+    while read -r dom; do sni_blacklisted "$dom" || echo "$dom"; done | awk 'NR <= 40'
 }
 
 # 使用 RealiTLScanner 扫描 VPS 附近 IP（同 ASN / 同机房）的可用目标
@@ -811,8 +1045,13 @@ select_sni() {
   keys=$(sni_region_keys)
   main=${keys%%|*} near=${keys#*|}
   step "自动优选 REALITY 目标网站 (SNI)"
+  if (( NAT_MODE )); then
+    SNI_PAR=3
+    (( OPT_SCAN )) && { warn "NAT 模式不支持 --scan（节省资源，且 NAT 机器扫描邻居 IP 意义不大），已忽略。"; OPT_SCAN=0; }
+    info "NAT 精简模式：每个地区最多测试 12 个候选，并发 3。"
+  fi
   info "VPS 位置: ${GEO_CC:-未知} ${GEO_REGION} ${GEO_CITY}  ${GEO_ORG}"
-  info "筛选规则: 同地区 · TLS1.3+X25519 · ALPN h2 · HSTS · 证书有效 · 非 Cloudflare · 非大厂/被墙域名"
+  info "筛选规则: 同地区 · TLS1.3+X25519 · X25519MLKEM768 · ALPN h2 · HSTS · 证书有效 · 非 Cloudflare · 非大厂/被墙域名"
 
   if (( OPT_SCAN )); then
     local scanned="${TMP_DIR}/scan.list"
@@ -823,7 +1062,7 @@ select_sni() {
     fi
   fi
   if [[ ! -s ${sorted} ]]; then
-    [[ -n $main ]] && cands=$(sni_candidates "$main")
+    [[ -n $main ]] && cands=$(sni_cap "$(sni_candidates "$main")")
     info "测试 ${main:-通用} 地区候选（$(wc -w <<<"$cands") 个）..."
     # shellcheck disable=SC2086
     [[ -n $cands ]] && sni_test_list "$res" $cands
@@ -832,6 +1071,7 @@ select_sni() {
     if (( $(wc -l <"$sorted") < 3 )) && [[ -n $near ]]; then
       cands=""
       for k in $near; do cands+=" $(sni_candidates "$k")"; done
+      cands=$(sni_cap "$cands")
       info "本地区合格数量不足，扩大到邻近地区（$(wc -w <<<"$cands") 个）..."
       # shellcheck disable=SC2086
       sni_test_list "${res}.2" $cands
@@ -843,7 +1083,7 @@ select_sni() {
   local npass; npass=$(wc -l <"$sorted")
   if (( npass == 0 )); then
     warn "没有候选域名通过全部检测。"
-    awk -F'|' '$1=="FAIL"{printf "    %s: %s\n", $2, $3}' "$res" | head -n 15
+    awk -F'|' '$1=="FAIL" && ++n <= 15 {printf "    %s: %s\n", $2, $3}' "$res"
     (( OPT_AUTO )) && die "自动模式下无法确定 SNI，请用 --sni 指定（或 --force-sni）。"
     manual_sni && return 0
     die "未选择 SNI。"
@@ -905,6 +1145,11 @@ check_port_free() { # $1 proto $2 port $3 允许的进程名(正则)
   port_in_use "$1" "$2" || return 0
   owner=$(port_owner "$1" "$2")
   [[ -n $owner && $owner =~ ^($3)$ ]] && return 0
+  # 容器内缺少 CAP_SYS_PTRACE 时 ss 看不到进程名：若本脚本服务正在运行且配置的就是该端口，视为自身占用
+  if [[ -z $owner ]]; then
+    [[ $1 == tcp && $2 == "$XRAY_PORT" && xray =~ ^($3)$ ]] && svc_active xray && return 0
+    [[ $1 == udp && $2 == "$HY2_PORT" && hysteria =~ ^($3)$ ]] && svc_active hysteria-server && return 0
+  fi
   warn "${1^^} 端口 $2 已被占用（进程: ${owner:-未知}）。"
   return 1
 }
@@ -947,6 +1192,7 @@ other_listen_ports() { # $1 = tcp|udp
 #                        Xray 安装与配置
 # ============================================================
 install_xray() {
+  if direct_mode; then install_xray_direct; return; fi
   step "安装 / 更新 Xray-core（官方 XTLS/Xray-install 脚本）"
   mktmp
   fetch -o "${TMP_DIR}/xray-install.sh" "$XRAY_INSTALL_URL" || die "下载 Xray 安装脚本失败，请检查网络（GitHub 可达性）。"
@@ -963,13 +1209,276 @@ install_xray() {
     fi
   fi
   [[ -x $XRAY_BIN ]] || die "未找到 ${XRAY_BIN}，Xray 安装可能失败。"
-  ok "Xray 已安装: $("$XRAY_BIN" version | head -n1 | awk '{print $2}')"
+  ok "Xray 已安装: $("$XRAY_BIN" version | awk 'NR==1{print $2}')"
 }
 
-# 不依赖 GitHub API，从 releases/latest 的跳转地址解析最新版本号
+# 不依赖 GitHub API，从 releases/latest 的跳转地址解析最新版本号（跟随仓库改名等多次跳转）
 latest_tag() {
-  curl -fsSI --connect-timeout 10 -m 15 "https://github.com/$1/releases/latest" 2>/dev/null |
-    awk -F'/tag/' 'tolower($0) ~ /^location:/ {gsub(/[\r\n]/, "", $2); print $2; exit}' || true
+  curl -fsSIL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 "https://github.com/$1/releases/latest" 2>/dev/null |
+    awk -F'/tag/' 'tolower($0) ~ /^location:/ && NF > 1 {gsub(/[\r\n]/, "", $2); t=$2} END{if (t != "") print t}' || true
+}
+# 最新版本号：先 GitHub API，失败（限流 / 不可达）时改用 releases/latest 跳转
+gh_latest_tag() {
+  local t=""
+  t=$(curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || t=""
+  [[ -n $t ]] || t=$(latest_tag "$1")
+  printf '%s' "$t"
+}
+
+# ============================================================
+#          NAT 模式：直接下载官方二进制 + 自建 systemd / OpenRC 服务
+# ============================================================
+xray_asset_name() {
+  case $ARCH in
+    amd64) echo "Xray-linux-64.zip" ;;
+    arm64) echo "Xray-linux-arm64-v8a.zip" ;;
+    armv7) echo "Xray-linux-arm32-v7a.zip" ;;
+  esac
+}
+hy_asset_name() {
+  case $ARCH in
+    amd64) echo "hysteria-linux-amd64" ;;
+    arm64) echo "hysteria-linux-arm64" ;;
+    armv7) echo "hysteria-linux-arm" ;;
+  esac
+}
+github_hint() {
+  warn "无法访问 GitHub。$( ((NO_V4)) && echo 'GitHub 不支持 IPv6，IPv6-only 机器请配置 DNS64/NAT64（重新运行并加 --dns64，或手动把 /etc/resolv.conf 改为 DNS64 服务器）。')"
+}
+
+install_xray_direct() {
+  step "安装 / 更新 Xray-core（直接下载 XTLS/Xray-core 官方 Release）"
+  mktmp
+  local tag asset base cur="" want dg sum
+  tag=$(gh_latest_tag XTLS/Xray-core)
+  [[ -n $tag ]] || { github_hint; die "获取 Xray 最新版本号失败。"; }
+  [[ -x $XRAY_BIN ]] && cur=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}')
+  if [[ -n $cur && "v${cur#v}" == "$tag" ]] && { (( NAT_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
+    ok "Xray 已是最新版本 ${tag}，跳过下载。"
+  else
+    asset=$(xray_asset_name)
+    base="https://github.com/XTLS/Xray-core/releases/download/${tag}"
+    info "下载 ${asset} (${tag}) ..."
+    fetch -o "${TMP_DIR}/${asset}" "${base}/${asset}" || { github_hint; die "下载 Xray 失败。"; }
+    if fetch -o "${TMP_DIR}/${asset}.dgst" "${base}/${asset}.dgst" 2>/dev/null; then
+      want=$(awk -F'= *' '/^SHA2-256/{print tolower($2); exit}' "${TMP_DIR}/${asset}.dgst" | tr -d '[:space:]')
+      sum=$(sha256sum "${TMP_DIR}/${asset}" | awk '{print $1}')
+      if [[ -n $want ]]; then
+        [[ $want == "$sum" ]] || die "Xray 压缩包 SHA256 校验失败（期望 ${want}，实际 ${sum}），已中止。"
+        ok "SHA256 校验通过。"
+      else
+        warn "无法解析 .dgst 文件，跳过 SHA256 校验。"
+      fi
+    else
+      warn "未能下载 .dgst 校验文件，跳过 SHA256 校验。"
+    fi
+    dg="${TMP_DIR}/xray-unzip"; rm -rf "$dg"; mkdir -p "$dg"
+    # NAT 小鸡磁盘很小：只解压 xray 本体（配置不使用 geoip/geosite，内网段直接写 CIDR），解压后立即删除压缩包
+    if (( NAT_MODE )); then
+      unzip -qo "${TMP_DIR}/${asset}" xray -d "$dg" || die "解压 Xray 失败。"
+    else
+      unzip -qo "${TMP_DIR}/${asset}" -d "$dg" || die "解压 Xray 失败。"
+    fi
+    rm -f "${TMP_DIR}/${asset}"
+    [[ -f $dg/xray ]] || die "压缩包中没有 xray 可执行文件。"
+    chmod 755 "$dg/xray"
+    "$dg/xray" version >/dev/null 2>&1 || die "下载的 xray 无法运行（架构不匹配？当前 ${ARCH}）。"
+    install -m 755 "$dg/xray" "${XRAY_BIN}.new" && mv -f "${XRAY_BIN}.new" "$XRAY_BIN"
+    mkdir -p "$XRAY_ASSET_DIR"
+    local f
+    for f in geoip.dat geosite.dat; do [[ -f $dg/$f ]] && install -m 644 "$dg/$f" "${XRAY_ASSET_DIR}/$f"; done
+    rm -rf "$dg"
+  fi
+  write_xray_service
+  [[ -x $XRAY_BIN ]] || die "未找到 ${XRAY_BIN}，Xray 安装可能失败。"
+  ok "Xray 已安装: $("$XRAY_BIN" version | awk 'NR==1{print $2}')"
+}
+
+install_hysteria_direct() {
+  step "安装 / 更新 Hysteria2（直接下载 apernet/hysteria 官方 Release）"
+  mktmp
+  local tag asset base cur="" want sum
+  tag=$(gh_latest_tag apernet/hysteria)
+  [[ -n $tag ]] || { github_hint; die "获取 Hysteria2 最新版本号失败。"; }
+  [[ -x $HY_BIN ]] && cur=$("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')
+  if [[ -n $cur && "app/${cur}" == "$tag" ]]; then
+    ok "Hysteria2 已是最新版本 ${tag#app/}，跳过下载。"
+  else
+    asset=$(hy_asset_name)
+    base="https://github.com/apernet/hysteria/releases/download/${tag}"
+    info "下载 ${asset} (${tag#app/}) ..."
+    fetch -o "${TMP_DIR}/${asset}" "${base}/${asset}" || { github_hint; die "下载 Hysteria2 失败。"; }
+    if fetch -o "${TMP_DIR}/hy-hashes.txt" "${base}/hashes.txt" 2>/dev/null; then
+      want=$(awk -v a="$asset" '{n=$2; sub(/^.*\//, "", n)} n==a {print tolower($1); exit}' "${TMP_DIR}/hy-hashes.txt")
+      sum=$(sha256sum "${TMP_DIR}/${asset}" | awk '{print $1}')
+      if [[ -n $want ]]; then
+        [[ $want == "$sum" ]] || die "Hysteria2 SHA256 校验失败（期望 ${want}，实际 ${sum}），已中止。"
+        ok "SHA256 校验通过。"
+      else
+        warn "hashes.txt 中未找到 ${asset}，跳过 SHA256 校验。"
+      fi
+    else
+      warn "未能下载 hashes.txt，跳过 SHA256 校验。"
+    fi
+    chmod 755 "${TMP_DIR}/${asset}"
+    "${TMP_DIR}/${asset}" version >/dev/null 2>&1 || die "下载的 hysteria 无法运行（架构不匹配？当前 ${ARCH}）。"
+    install -m 755 "${TMP_DIR}/${asset}" "${HY_BIN}.new" && mv -f "${HY_BIN}.new" "$HY_BIN"
+  fi
+  ensure_hy_user
+  write_hy2_service
+  ok "Hysteria2 已安装: $("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
+}
+
+ensure_hy_user() {
+  id hysteria >/dev/null 2>&1 && return 0
+  if have useradd; then
+    useradd -r -M -s "$(command -v nologin 2>/dev/null || echo /bin/false)" hysteria >/dev/null 2>&1 || true
+  elif have adduser; then
+    addgroup -S hysteria >/dev/null 2>&1 || true
+    adduser -S -D -H -h /var/empty -s /sbin/nologin -G hysteria hysteria >/dev/null 2>&1 || true
+  fi
+  id hysteria >/dev/null 2>&1 || warn "无法创建 hysteria 用户，将以 root 运行 Hysteria2。"
+}
+
+# 需要绑定 1024 以下端口时才申请 CAP_NET_BIND_SERVICE（老内核 / OpenVZ 不支持 ambient capabilities）
+need_bind_cap() { (( ${1:-0} > 0 && ${1:-0} < 1024 )); }
+
+write_xray_service() {
+  local envs; envs=$(go_mem_env)
+  if is_openrc; then
+    local sargs="--env XRAY_LOCATION_ASSET=${XRAY_ASSET_DIR}" e
+    for e in $envs; do sargs+=" --env ${e}"; done
+    cat >"$XRAY_RC" <<RC
+#!/sbin/openrc-run
+# 由 proxy-oneclick 生成（NAT 模式）
+name="xray"
+description="Xray (proxy-oneclick)"
+supervisor=supervise-daemon
+command="${XRAY_BIN}"
+command_args="run -config ${XRAY_CONF}"
+command_user="nobody:$(id -gn nobody 2>/dev/null || echo nobody)"
+output_log="${XRAY_LOG}"
+error_log="${XRAY_LOG}"
+respawn_delay=3
+respawn_max=0
+supervise_daemon_args="${sargs}"
+$(need_bind_cap "$XRAY_PORT" && echo 'capabilities="^cap_net_bind_service"')
+
+depend() {
+  want net
+  after net firewall
+}
+
+start_pre() {
+  checkpath -d -m 0755 -o "\${command_user}" /var/log/xray
+  checkpath -f -m 0644 -o "\${command_user}" "${XRAY_LOG}"
+  # 简单的日志大小控制：超过 2MB 时只保留最后 500 行
+  if [ "\$(wc -c <"${XRAY_LOG}")" -gt 2097152 ]; then
+    tail -n 500 "${XRAY_LOG}" >"${XRAY_LOG}.tmp" && cat "${XRAY_LOG}.tmp" >"${XRAY_LOG}"; rm -f "${XRAY_LOG}.tmp"
+  fi
+}
+RC
+    chmod 755 "$XRAY_RC"
+  else
+    rm -rf /etc/systemd/system/xray.service.d
+    {
+      echo "# 由 proxy-oneclick 生成（NAT 模式）"
+      echo "[Unit]"
+      echo "Description=Xray Service (proxy-oneclick)"
+      echo "After=network-online.target nss-lookup.target"
+      echo "Wants=network-online.target"
+      echo
+      echo "[Service]"
+      echo "User=nobody"
+      echo "NoNewPrivileges=true"
+      if need_bind_cap "$XRAY_PORT"; then
+        echo "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+        echo "AmbientCapabilities=CAP_NET_BIND_SERVICE"
+      fi
+      echo "Environment=XRAY_LOCATION_ASSET=${XRAY_ASSET_DIR}"
+      local e; for e in $envs; do echo "Environment=${e}"; done
+      echo "ExecStart=${XRAY_BIN} run -config ${XRAY_CONF}"
+      echo "Restart=on-failure"
+      echo "RestartSec=3"
+      echo "RestartPreventExitStatus=23"
+      echo "LimitNOFILE=65535"
+      echo
+      echo "[Install]"
+      echo "WantedBy=multi-user.target"
+    } >"$XRAY_UNIT"
+    systemctl daemon-reload
+  fi
+}
+
+write_hy2_service() {
+  local envs user="root" grp="root"; envs=$(go_mem_env)
+  if id hysteria >/dev/null 2>&1; then user=hysteria; grp=$(id -gn hysteria); fi
+  if is_openrc; then
+    local sargs="--env HYSTERIA_LOG_LEVEL=warn --env HYSTERIA_DISABLE_UPDATE_CHECK=1" e
+    for e in $envs; do sargs+=" --env ${e}"; done
+    cat >"$HY_RC" <<RC
+#!/sbin/openrc-run
+# 由 proxy-oneclick 生成（NAT 模式）
+name="hysteria-server"
+description="Hysteria2 server (proxy-oneclick)"
+supervisor=supervise-daemon
+command="${HY_BIN}"
+command_args="server --config ${HY_CONF}"
+command_user="${user}:${grp}"
+directory="${HY_DIR}"
+output_log="${HY_LOG}"
+error_log="${HY_LOG}"
+respawn_delay=3
+respawn_max=0
+supervise_daemon_args="${sargs}"
+$(need_bind_cap "$HY2_PORT" && echo 'capabilities="^cap_net_bind_service"')
+
+depend() {
+  want net
+  after net firewall proxy-oneclick-hop
+}
+
+start_pre() {
+  checkpath -d -m 0755 -o "\${command_user}" /var/log/hysteria
+  checkpath -f -m 0644 -o "\${command_user}" "${HY_LOG}"
+  if [ "\$(wc -c <"${HY_LOG}")" -gt 2097152 ]; then
+    tail -n 500 "${HY_LOG}" >"${HY_LOG}.tmp" && cat "${HY_LOG}.tmp" >"${HY_LOG}"; rm -f "${HY_LOG}.tmp"
+  fi
+}
+RC
+    chmod 755 "$HY_RC"
+  else
+    rm -rf /etc/systemd/system/hysteria-server.service.d
+    {
+      echo "# 由 proxy-oneclick 生成（NAT 模式）"
+      echo "[Unit]"
+      echo "Description=Hysteria2 Server (proxy-oneclick)"
+      echo "After=network-online.target"
+      echo "Wants=network-online.target"
+      echo
+      echo "[Service]"
+      echo "User=${user}"
+      echo "Group=${grp}"
+      echo "WorkingDirectory=${HY_DIR}"
+      echo "NoNewPrivileges=true"
+      if need_bind_cap "$HY2_PORT"; then
+        echo "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+        echo "AmbientCapabilities=CAP_NET_BIND_SERVICE"
+      fi
+      echo "Environment=HYSTERIA_LOG_LEVEL=warn"
+      echo "Environment=HYSTERIA_DISABLE_UPDATE_CHECK=1"
+      local e; for e in $envs; do echo "Environment=${e}"; done
+      echo "ExecStart=${HY_BIN} server --config ${HY_CONF}"
+      echo "Restart=on-failure"
+      echo "RestartSec=3"
+      echo "LimitNOFILE=65535"
+      echo
+      echo "[Install]"
+      echo "WantedBy=multi-user.target"
+    } >"$HY_UNIT"
+    systemctl daemon-reload
+  fi
 }
 
 gen_xray_keys() { # 生成/重新生成全部 Xray 密钥
@@ -1004,17 +1513,19 @@ xray_clients_json() {
   printf '%s' "$list"
 }
 
+# NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
+PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
 write_xray_config() {
   local clients tmp
   clients=$(xray_clients_json)
   mkdir -p "$(dirname "$XRAY_CONF")"
-  tmp=$(mktemp --suffix=.json "$(dirname "$XRAY_CONF")/.config.XXXXXX")
+  tmp=$(mktemp "$(dirname "$XRAY_CONF")/.config.XXXXXX"); mv -f "$tmp" "${tmp}.json"; tmp="${tmp}.json"
   jq -n \
     --argjson port "$XRAY_PORT" --argjson clients "$clients" \
     --arg target "${SNI_TARGET:-$SNI:443}" --arg sni "$SNI" \
-    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$MLDSA_SEED" '
+    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$MLDSA_SEED" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" '
   {
-    log: {loglevel: "warning"},
+    log: ({loglevel: "warning"} + (if $nat == 1 then {access: "none"} else {} end)),
     inbounds: [{
       tag: "vless-reality",
       port: $port,
@@ -1041,12 +1552,12 @@ write_xray_config() {
     routing: {
       domainStrategy: "AsIs",
       rules: [
-        {type: "field", ip: ["geoip:private"], outboundTag: "block"},
+        {type: "field", ip: (if $nat == 1 then $privnets else ["geoip:private"] end), outboundTag: "block"},
         {type: "field", protocol: ["bittorrent"], outboundTag: "block"}
       ]
     }
   }' >"$tmp"
-  if ! "$XRAY_BIN" run -test -config "$tmp" >"${tmp}.log" 2>&1; then
+  if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2; rm -f "$tmp" "${tmp}.log"
     die "Xray 配置校验失败（xray run -test），未应用新配置。"
   fi
@@ -1061,15 +1572,15 @@ write_xray_config() {
 }
 
 restart_xray() {
-  systemctl daemon-reload
-  systemctl enable xray >/dev/null 2>&1 || true
-  systemctl restart xray
+  sd_reload
+  svc_enable xray
+  svc_restart xray || true
   sleep 1
   if ! svc_active xray; then
-    journalctl -u xray -n 20 --no-pager >&2 || true
+    svc_logs xray 20 >&2 || true
     die "Xray 启动失败，请查看上方日志。"
   fi
-  ok "Xray 运行中 (TCP ${XRAY_PORT})"
+  ok "Xray 运行中 (TCP ${XRAY_PORT}$( ((NAT_MODE)) && [[ $XRAY_EXT_PORT != "$XRAY_PORT" ]] && echo "，外部端口 ${XRAY_EXT_PORT}"))"
 }
 
 selinux_fix() {
@@ -1081,6 +1592,7 @@ selinux_fix() {
 #                        Hysteria2
 # ============================================================
 install_hysteria() {
+  if direct_mode; then install_hysteria_direct; return; fi
   step "安装 / 更新 Hysteria2（官方 get.hy2.sh 脚本）"
   mktmp
   fetch -o "${TMP_DIR}/hy2-install.sh" "$HY_INSTALL_URL" || die "下载 Hysteria2 安装脚本失败。"
@@ -1132,25 +1644,31 @@ HY
 }
 
 restart_hy2() {
-  systemctl daemon-reload
-  systemctl enable hysteria-server >/dev/null 2>&1 || true
-  systemctl restart hysteria-server
+  sd_reload
+  svc_enable hysteria-server
+  svc_restart hysteria-server || true
   sleep 2
   if ! svc_active hysteria-server; then
-    journalctl -u hysteria-server -n 20 --no-pager >&2 || true
+    svc_logs hysteria-server 20 >&2 || true
     die "Hysteria2 启动失败，请查看上方日志。"
   fi
-  ok "Hysteria2 运行中 (UDP ${HY2_PORT}${HOP_RANGE:+，端口跳跃 ${HOP_RANGE}})"
+  if (( NAT_MODE )); then
+    ok "Hysteria2 运行中 (UDP ${HY2_PORT}$([[ $HY2_EXT_PORT != "$HY2_PORT" ]] && echo "，外部端口 ${HY2_EXT_PORT}")${HOP_RANGE:+，端口跳跃 ${HOP_EXT_RANGE}})"
+  else
+    ok "Hysteria2 运行中 (UDP ${HY2_PORT}${HOP_RANGE:+，端口跳跃 ${HOP_RANGE}})"
+  fi
 }
 
 remove_hysteria() {
-  systemctl disable --now hysteria-server >/dev/null 2>&1 || true
-  systemctl disable --now 'hysteria-server@*' >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
-  rm -rf /etc/systemd/system/hysteria-server.service.d
+  svc_disable_stop hysteria-server
+  if have systemctl; then systemctl disable --now 'hysteria-server@*' >/dev/null 2>&1 || true; fi
+  rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service "$HY_RC"
+  rm -rf /etc/systemd/system/hysteria-server.service.d /var/log/hysteria
   rm -f "$HY_BIN"; rm -rf "$HY_DIR"
-  if id hysteria >/dev/null 2>&1; then userdel hysteria >/dev/null 2>&1 || true; fi
-  systemctl daemon-reload
+  if id hysteria >/dev/null 2>&1; then userdel hysteria >/dev/null 2>&1 || deluser hysteria >/dev/null 2>&1 || true; fi
+  if getent group hysteria >/dev/null 2>&1; then groupdel hysteria >/dev/null 2>&1 || delgroup hysteria >/dev/null 2>&1 || true; fi
+  sd_reload
+  remove_nat_hop
 }
 
 # ============================================================
@@ -1248,6 +1766,7 @@ render_firewall_compat() {
 }
 
 apply_firewall() {
+  if (( NAT_MODE )); then apply_nat_hop; return; fi
   (( FW_ENABLED )) || { warn "已跳过防火墙配置（--no-firewall 或保留了其它防火墙）。"; return 0; }
   step "配置 nftables 防火墙"
   have nft || die "未安装 nftables。"
@@ -1291,12 +1810,176 @@ UNIT
 }
 
 remove_firewall() {
-  systemctl disable --now proxy-oneclick-fw >/dev/null 2>&1 || true
-  nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
-  nft delete table ip "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
-  nft delete table ip6 "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
+  if [[ $INIT_SYS == systemd ]]; then systemctl disable --now proxy-oneclick-fw >/dev/null 2>&1 || true; fi
+  if have nft; then
+    nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+    nft delete table ip "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
+    nft delete table ip6 "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
+  fi
   rm -f "$FW_UNIT" "$FW_FILE"
-  systemctl daemon-reload
+  sd_reload
+}
+
+# ============================================================
+#     NAT 模式：Hysteria2 端口跳跃（容器内 DNAT/REDIRECT，能力不足时自动降级）
+# ============================================================
+# 探测能否在本机网络命名空间内添加 nat 规则。输出后端: nft-inet / nft-ip / iptables
+nat_hop_probe() {
+  local t="${HOP_TABLE}_probe" fam
+  if have nft; then
+    for fam in inet ip; do
+      if nft -f - >/dev/null 2>&1 <<NFT
+table ${fam} ${t} {
+  chain p {
+    type nat hook prerouting priority -100; policy accept;
+    udp dport 65000-65001 redirect to :65002
+  }
+}
+NFT
+      then
+        nft delete table "$fam" "$t" >/dev/null 2>&1 || true
+        echo "nft-${fam}"; return 0
+      fi
+      nft delete table "$fam" "$t" >/dev/null 2>&1 || true
+    done
+  fi
+  if have iptables && iptables -t nat -N PROXY_OC_PROBE >/dev/null 2>&1; then
+    local okk=0
+    iptables -t nat -A PROXY_OC_PROBE -p udp --dport 65000:65001 -j REDIRECT --to-ports 65002 >/dev/null 2>&1 && okk=1
+    iptables -t nat -F PROXY_OC_PROBE >/dev/null 2>&1 || true
+    iptables -t nat -X PROXY_OC_PROBE >/dev/null 2>&1 || true
+    (( okk )) && { echo iptables; return 0; }
+  fi
+  return 1
+}
+
+# shellcheck disable=SC2016  # 生成的脚本中的 $1/$0 需保持字面量
+render_hop_script() { # 根据 HOP_BACKEND / HOP_RANGE(内部端口段，可多段) / HY2_PORT 生成 start|stop 脚本
+  local p=$HY2_PORT bin fam seg nftset
+  nftset=${HOP_RANGE//,/, }
+  {
+    echo '#!/bin/sh'
+    echo "# 由 proxy-oneclick 生成：NAT 模式 Hysteria2 端口跳跃（内部 UDP ${HOP_RANGE} -> ${p}，后端 ${HOP_BACKEND}）"
+    echo 'case "$1" in'
+    echo '  start)'
+    case $HOP_BACKEND in
+      nft-inet|nft-ip)
+        bin=$(command -v nft)
+        local fams="inet"; [[ $HOP_BACKEND == nft-ip ]] && fams="ip ip6"
+        for fam in $fams; do
+          echo "    ${bin} -f - <<'NFT' || [ ${fam} = ip6 ]"
+          echo "table ${fam} ${HOP_TABLE}"
+          echo "delete table ${fam} ${HOP_TABLE}"
+          echo "table ${fam} ${HOP_TABLE} {"
+          echo "  chain prerouting {"
+          echo "    type nat hook prerouting priority -100; policy accept;"
+          echo "    udp dport { ${nftset} } counter redirect to :${p}"
+          echo "  }"
+          echo "}"
+          echo "NFT"
+        done
+        echo '    ;;'
+        echo '  stop)'
+        for fam in inet ip ip6; do echo "    ${bin} delete table ${fam} ${HOP_TABLE} >/dev/null 2>&1"; done
+        echo '    exit 0 ;;' ;;
+      iptables)
+        local t
+        for t in iptables ip6tables; do
+          bin=$(command -v "$t" 2>/dev/null) || continue
+          local q=""; [[ $t == ip6tables ]] && q=" 2>/dev/null || true"
+          echo "    ${bin} -t nat -N PROXY_OC_HOP >/dev/null 2>&1; ${bin} -t nat -F PROXY_OC_HOP${q}"
+          for seg in ${HOP_RANGE//,/ }; do
+            echo "    ${bin} -t nat -A PROXY_OC_HOP -p udp --dport ${seg/-/:} -j REDIRECT --to-ports ${p}${q}"
+          done
+          echo "    ${bin} -t nat -C PREROUTING -j PROXY_OC_HOP >/dev/null 2>&1 || ${bin} -t nat -A PREROUTING -j PROXY_OC_HOP${q}"
+        done
+        echo '    ;;'
+        echo '  stop)'
+        for t in iptables ip6tables; do
+          bin=$(command -v "$t" 2>/dev/null) || continue
+          echo "    ${bin} -t nat -D PREROUTING -j PROXY_OC_HOP >/dev/null 2>&1; ${bin} -t nat -F PROXY_OC_HOP >/dev/null 2>&1; ${bin} -t nat -X PROXY_OC_HOP >/dev/null 2>&1"
+        done
+        echo '    exit 0 ;;' ;;
+    esac
+    echo '  *) echo "usage: $0 start|stop"; exit 1 ;;'
+    echo 'esac'
+  } >"${HOP_SCRIPT}.tmp"
+  chmod 700 "${HOP_SCRIPT}.tmp"; mv -f "${HOP_SCRIPT}.tmp" "$HOP_SCRIPT"
+}
+
+write_hop_service() {
+  if is_openrc; then
+    cat >"$HOP_RC" <<RC
+#!/sbin/openrc-run
+# 由 proxy-oneclick 生成（NAT 模式 Hysteria2 端口跳跃）
+description="proxy-oneclick NAT Hysteria2 port hopping"
+depend() {
+  want net
+  after net firewall
+  before hysteria-server
+}
+start() {
+  ebegin "Applying proxy-oneclick port hopping rules"
+  /bin/sh "${HOP_SCRIPT}" start
+  eend \$?
+}
+stop() {
+  ebegin "Removing proxy-oneclick port hopping rules"
+  /bin/sh "${HOP_SCRIPT}" stop
+  eend 0
+}
+RC
+    chmod 755 "$HOP_RC"
+  else
+    cat >"$HOP_UNIT" <<UNIT
+[Unit]
+Description=proxy-oneclick NAT Hysteria2 port hopping
+After=network.target
+Before=hysteria-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh ${HOP_SCRIPT} start
+ExecStop=/bin/sh ${HOP_SCRIPT} stop
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+  fi
+}
+
+apply_nat_hop() {
+  if (( ! HY2_ENABLED )) || [[ -z $HOP_RANGE ]]; then remove_nat_hop; HOP_BACKEND=""; return 0; fi
+  step "配置 Hysteria2 端口跳跃（NAT 端口范围内）"
+  local be
+  if ! be=$(nat_hop_probe); then
+    warn "当前环境无法添加 NAT 转发规则（LXC/OpenVZ 容器通常没有 CAP_NET_ADMIN，或内核不支持 nat 表），已关闭端口跳跃，Hysteria2 仅使用单端口 ${HY2_EXT_PORT}。"
+    HOP_RANGE="" HOP_EXT_RANGE="" HOP_BACKEND=""
+    remove_nat_hop
+    return 0
+  fi
+  HOP_BACKEND=$be
+  mkdir -p "$STATE_DIR"
+  render_hop_script
+  write_hop_service
+  svc_enable proxy-oneclick-hop
+  svc_restart proxy-oneclick-hop >/dev/null 2>&1 || true
+  if ! svc_active proxy-oneclick-hop; then
+    warn "端口跳跃规则加载失败，已关闭端口跳跃（Hysteria2 仍可通过单端口 ${HY2_EXT_PORT} 使用）。"
+    HOP_RANGE="" HOP_EXT_RANGE="" HOP_BACKEND=""
+    remove_nat_hop
+    return 0
+  fi
+  ok "端口跳跃已启用（${be}）：外部 UDP ${HOP_EXT_RANGE} → 内部 ${HOP_RANGE} → ${HY2_PORT}"
+}
+
+remove_nat_hop() {
+  [[ -f $HOP_SCRIPT ]] && { sh "$HOP_SCRIPT" stop >/dev/null 2>&1 || true; }
+  if [[ -f $HOP_UNIT || -f $HOP_RC ]]; then svc_disable_stop proxy-oneclick-hop; fi
+  rm -f "$HOP_UNIT" "$HOP_RC" "$HOP_SCRIPT"
+  sd_reload
 }
 
 ask_extra_ports() {
@@ -1318,6 +2001,20 @@ ask_extra_ports() {
 
 cloud_fw_reminder() {
   echo
+  if (( NAT_MODE )); then
+    _yellow "【重要】NAT 机器：请确认服务商面板中的端口映射包含以下外部端口（链接地址: $(server_addr)）："
+    printf '   TCP %s → 本机 %s（VLESS-REALITY）\n' "$XRAY_EXT_PORT" "$XRAY_PORT"
+    if (( HY2_ENABLED )); then
+      printf '   UDP %s → 本机 %s（Hysteria2）\n' "$HY2_EXT_PORT" "$HY2_PORT"
+      [[ -n $HOP_RANGE ]] && printf '   UDP %s → 本机 %s（端口跳跃）\n' "$HOP_EXT_RANGE" "$HOP_RANGE"
+    fi
+    if (( HY2_ENABLED )) && [[ $HY2_EXT_PORT == "$XRAY_EXT_PORT" ]]; then
+      echo "   Reality 与 Hysteria2 共用外部端口 ${XRAY_EXT_PORT}：该映射必须同时包含 TCP 和 UDP。"
+    else
+      echo "   若服务商只映射 TCP，Hysteria2 将无法使用（Reality 不受影响）。"
+    fi
+    return 0
+  fi
   _yellow "【重要】请同时在云服务商控制台的安全组 / 防火墙中放行以下端口，否则无法连接："
   printf '   TCP %s（VLESS-REALITY）\n' "$XRAY_PORT"
   (( HY2_ENABLED )) && printf '   UDP %s%s（Hysteria2）\n' "$HY2_PORT" "${HOP_RANGE:+ 以及 UDP ${HOP_RANGE}（端口跳跃）}"
@@ -1362,21 +2059,29 @@ server_addr() {
   printf '%s' "${PUBLIC_IP4:-$PUBLIC_IP6}"
 }
 
+# 链接中使用的（外部）端口：NAT 模式为服务商映射的外部端口
+pub_xray_port() { if (( NAT_MODE )) && [[ -n $XRAY_EXT_PORT ]]; then printf '%s' "$XRAY_EXT_PORT"; else printf '%s' "$XRAY_PORT"; fi; }
+pub_hy2_port() { if (( NAT_MODE )) && [[ -n $HY2_EXT_PORT ]]; then printf '%s' "$HY2_EXT_PORT"; else printf '%s' "$HY2_PORT"; fi; }
+pub_hop() { # NAT 模式只认实际生效的外部跳跃段，绝不回落到默认 HOP_RANGE
+  if (( ${NAT_MODE:-0} )); then printf '%s' "${HOP_EXT_RANGE:-}"; return 0; fi
+  printf '%s' "${HOP_RANGE:-}"
+}
+
 vless_link() { # $1 uuid $2 名称 $3 是否包含 pqv(1/0)
   local addr q
   addr=$(host_fmt "$(server_addr)")
-  q="encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=randomized&pbk=${PUB_KEY}&sid=${SHORT_ID}"
+  q="encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}"
   [[ ${3:-1} == 1 && -n $MLDSA_VERIFY ]] && q+="&pqv=${MLDSA_VERIFY}"
   q+="&type=tcp&headerType=none"
-  printf 'vless://%s@%s:%s?%s#%s' "$1" "$addr" "$XRAY_PORT" "$q" "$(urlencode "$2")"
+  printf 'vless://%s@%s:%s?%s#%s' "$1" "$addr" "$(pub_xray_port)" "$q" "$(urlencode "$2")"
 }
 
 hy2_link() {
   local addr q
   addr=$(host_fmt "$(server_addr)")
   q="sni=${SNI}&insecure=1&pinSHA256=${HY2_PIN}"
-  [[ -n $HOP_RANGE ]] && q+="&mport=${HOP_RANGE}"
-  printf 'hysteria2://%s@%s:%s/?%s#%s' "$(urlencode "$HY2_PASS")" "$addr" "$HY2_PORT" "$q" "$(urlencode "${NODE_NAME}-Hy2")"
+  [[ -n $(pub_hop) ]] && q+="&mport=$(pub_hop)"
+  printf 'hysteria2://%s@%s:%s/?%s#%s' "$(urlencode "$HY2_PASS")" "$addr" "$(pub_hy2_port)" "$q" "$(urlencode "${NODE_NAME}-Hy2")"
 }
 
 mihomo_yaml() {
@@ -1388,14 +2093,14 @@ mihomo_yaml() {
   - name: "${NODE_NAME}-Reality"
     type: vless
     server: ${addr}
-    port: ${XRAY_PORT}
+    port: $(pub_xray_port)
     uuid: ${UUID}
     network: tcp
     udp: true
     tls: true
     flow: xtls-rprx-vision
     servername: ${SNI}
-    client-fingerprint: random
+    client-fingerprint: chrome
     reality-opts:
       public-key: ${PUB_KEY}
       short-id: ${SHORT_ID}
@@ -1408,14 +2113,14 @@ Y
   - name: "${NODE_NAME}-Reality-${r}"
     type: vless
     server: ${addr}
-    port: ${XRAY_PORT}
+    port: $(pub_xray_port)
     uuid: ${u}
     network: tcp
     udp: true
     tls: true
     flow: xtls-rprx-vision
     servername: ${SNI}
-    client-fingerprint: random
+    client-fingerprint: chrome
     reality-opts:
       public-key: ${PUB_KEY}
       short-id: ${SHORT_ID}
@@ -1427,9 +2132,12 @@ Y
   - name: "${NODE_NAME}-Hy2"
     type: hysteria2
     server: ${addr}
-    port: ${HY2_PORT}
+    port: $(pub_hy2_port)
 Y
-    [[ -n $HOP_RANGE ]] && printf '    ports: %s\n    hop-interval: 30\n' "$HOP_RANGE"
+    if [[ -n $(pub_hop) ]]; then
+      if [[ $(pub_hop) == *,* ]]; then printf '    ports: "%s"\n    hop-interval: 30\n' "$(pub_hop)"
+      else printf '    ports: %s\n    hop-interval: 30\n' "$(pub_hop)"; fi
+    fi
     cat <<Y
     password: "${HY2_PASS}"
     sni: ${SNI}
@@ -1455,12 +2163,15 @@ build_info() { # 输出完整信息（无颜色），用于保存文件
   echo "生成时间: $(date '+%F %T %Z')"
   echo "服务器:   $(server_addr)"
   echo "SNI:      ${SNI}"
+  if (( NAT_MODE )); then
+    echo "NAT 模式: 映射端口 ${NAT_PORTS}（外部[:内部]）   虚拟化: ${VIRT:-未知}"
+  fi
   echo
   echo "---------- VLESS + REALITY + Vision ----------"
-  echo "地址: $(server_addr)   端口: ${XRAY_PORT} (TCP)"
+  echo "地址: $(server_addr)   端口: $(pub_xray_port) (TCP)$( ((NAT_MODE)) && echo "   本机监听: ${XRAY_PORT}")"
   echo "UUID: ${UUID}"
   echo "流控: xtls-rprx-vision    传输: tcp    安全: reality"
-  echo "SNI:  ${SNI}    指纹(fp): randomized"
+  echo "SNI:  ${SNI}    指纹(fp): chrome"
   echo "公钥(pbk): ${PUB_KEY}"
   echo "ShortId(sid): ${SHORT_ID}"
   [[ -n $MLDSA_VERIFY ]] && echo "ML-DSA-65 验证公钥(pqv): 已包含在链接中（很长，可选，客户端不支持时可删除 &pqv=... 部分）"
@@ -1486,16 +2197,17 @@ build_info() { # 输出完整信息（无颜色），用于保存文件
     hy=$(hy2_link)
     echo
     echo "---------- Hysteria2 ----------"
-    echo "地址: $(server_addr)   端口: ${HY2_PORT} (UDP)${HOP_RANGE:+   端口跳跃: ${HOP_RANGE}}"
+    echo "地址: $(server_addr)   端口: $(pub_hy2_port) (UDP)$(hp=$(pub_hop); [[ -n $hp ]] && echo "   端口跳跃: $hp")$( ((NAT_MODE)) && echo "   本机监听: ${HY2_PORT}")"
+    (( NAT_MODE )) && [[ -z $(pub_hop) ]] && echo "（NAT 模式：端口跳跃未启用）"
     echo "密码: ${HY2_PASS}"
     echo "SNI:  ${SNI}   (自签证书，insecure=1 + pinSHA256 证书指纹校验)"
     echo "pinSHA256: ${HY2_PIN}"
     echo
     echo "$hy"
-    if [[ -n $HOP_RANGE ]]; then
+    if [[ -n $(pub_hop) ]]; then
       echo
       echo "官方 Hysteria2 客户端 / sing-box 多端口写法（端口跳跃写在地址里）:"
-      hy2_link | sed -E "s#@([^/]+):${HY2_PORT}/#@\\1:${HY2_PORT},${HOP_RANGE}/#; s#&mport=[0-9-]+##"
+      hy2_link | sed -E "s#@([^/]+):$(pub_hy2_port)/#@\\1:$(pub_hy2_port),$(pub_hop)/#; s#&mport=[0-9,-]+##"
       echo
     fi
   fi
@@ -1520,8 +2232,8 @@ show_info() {
   vl_qr=$(vless_link "$UUID" "${NODE_NAME}-Reality" 0)
   echo
   hr; _green "  VLESS + REALITY + Vision   (${SNI})"; hr
-  printf '  地址: %s  端口: %s  UUID: %s\n' "$(server_addr)" "$XRAY_PORT" "$UUID"
-  printf '  pbk: %s  sid: %s  fp: randomized\n' "$PUB_KEY" "$SHORT_ID"
+  printf '  地址: %s  端口: %s  UUID: %s\n' "$(server_addr)" "$(pub_xray_port)" "$UUID"
+  printf '  pbk: %s  sid: %s  fp: chrome\n' "$PUB_KEY" "$SHORT_ID"
   echo
   _cyan "  链接（含 pqv）："
   echo "$vl"
@@ -1532,7 +2244,7 @@ show_info() {
   print_qr "$vl_qr"
   if (( HY2_ENABLED )); then
     local hy; hy=$(hy2_link)
-    echo; hr; _green "  Hysteria2   (UDP ${HY2_PORT}${HOP_RANGE:+，跳跃 ${HOP_RANGE}})"; hr
+    echo; hr; _green "  Hysteria2   (UDP $(pub_hy2_port)$(hp=$(pub_hop); [[ -n $hp ]] && echo "，跳跃 $hp"))"; hr
     echo "$hy"
     echo; print_qr "$hy"
   fi
@@ -1611,9 +2323,385 @@ choose_ports() {
   done
 }
 
+# ============================================================
+#            NAT 模式：公网地址 / 映射端口
+# ============================================================
+# 映射端口列表 NAT_PORTS（逗号分隔），每项:
+#   52430            外部 52430 → 内部 52430（TCP+UDP 或仅 TCP，取决于服务商）
+#   52430:443        外部 52430 → 内部 443
+#   50000-50100      整段 1:1 转发
+#   50000-50100:20000-20100  整段按偏移转发（长度必须相同）
+is_ipv4() { [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; }
+valid_addr() {
+  local a=$1
+  is_ipv4 "$a" && return 0
+  [[ $a == *:* && $a =~ ^[0-9A-Fa-f:.]+$ ]] && return 0
+  [[ ${#a} -le 253 && $a =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
+}
+is_private_v4() { [[ $1 =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|127\.|169\.254\.) ]]; }
+# 接受 "a-b" 或单个端口，输出 "a b"
+parse_port_span() {
+  local r=$1
+  if is_port "$r"; then printf '%s %s' "$r" "$r"; return 0; fi
+  [[ $r =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
+  local a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
+  is_port "$a" && is_port "$b" && (( a <= b )) || return 1
+  printf '%s %s' "$a" "$b"
+}
+# 单项 → "外部起 外部止 内部起"
+nat_parse_item() {
+  local it=${1// /} e i e1 e2 i1 i2
+  [[ -n $it ]] || return 1
+  e=${it%%:*}; i=$e; [[ $it == *:* ]] && i=${it#*:}
+  local ps
+  ps=$(parse_port_span "$e") || return 1
+  read -r e1 e2 <<<"$ps"
+  ps=$(parse_port_span "$i") || return 1
+  read -r i1 i2 <<<"$ps"
+  [[ -n $e1 && -n $i1 ]] || return 1
+  (( e2 - e1 == i2 - i1 )) || return 1
+  printf '%s %s %s' "$e1" "$e2" "$i1"
+}
+nat_fmt_item() { # $1 e1 $2 e2 $3 i1
+  local e=$1 i=$3
+  (( $2 > $1 )) && e="$1-$2" && i="$3-$(( $3 + $2 - $1 ))"
+  if [[ $e == "$i" ]]; then printf '%s' "$e"; else printf '%s:%s' "$e" "$i"; fi
+}
+# 规范化用户输入的列表（逗号/空格分隔），失败返回 1
+nat_norm_list() {
+  local it out="" e1 e2 i1 f
+  for it in ${1//,/ }; do
+    f=$(nat_parse_item "$it") || return 1
+    read -r e1 e2 i1 <<<"$f"
+    [[ -n $e1 ]] || return 1
+    f=$(nat_fmt_item "$e1" "$e2" "$i1")
+    [[ ",$out," == *",$f,"* ]] || out+="${out:+,}$f"
+  done
+  [[ -n $out ]] || return 1
+  printf '%s' "$out"
+}
+# 解析结果缓存在数组中（端口段很大时避免反复 fork）
+NI_KEY="" NI_E1=() NI_E2=() NI_I1=()
+nat_items() {
+  [[ -n $NI_KEY && $NI_KEY == "$NAT_PORTS" ]] && return 0
+  NI_E1=() NI_E2=() NI_I1=()
+  local it e1 e2 i1 f
+  for it in ${NAT_PORTS//,/ }; do
+    f=$(nat_parse_item "$it") || continue
+    read -r e1 e2 i1 <<<"$f"
+    [[ -n $e1 ]] || continue
+    NI_E1+=("$e1") NI_E2+=("$e2") NI_I1+=("$i1")
+  done
+  NI_KEY=$NAT_PORTS
+}
+ext2int() { # 外部端口 → 内部端口；未映射返回 1
+  nat_items
+  local k
+  for k in "${!NI_E1[@]}"; do
+    (( $1 >= NI_E1[k] && $1 <= NI_E2[k] )) && { echo $(( NI_I1[k] + $1 - NI_E1[k] )); return 0; }
+  done
+  return 1
+}
+int2ext() {
+  nat_items
+  local k
+  for k in "${!NI_E1[@]}"; do
+    (( $1 >= NI_I1[k] && $1 <= NI_I1[k] + NI_E2[k] - NI_E1[k] )) && { echo $(( NI_E1[k] + $1 - NI_I1[k] )); return 0; }
+  done
+  return 1
+}
+nat_all_ext() { # 逐个输出全部外部端口
+  nat_items
+  local k q
+  for k in "${!NI_E1[@]}"; do for (( q = NI_E1[k]; q <= NI_E2[k]; q++ )); do echo "$q"; done; done
+}
+nat_has_span() { # 是否包含整段转发（≥2 个端口的项）
+  nat_items
+  local k
+  for k in "${!NI_E1[@]}"; do (( NI_E2[k] > NI_E1[k] )) && return 0; done
+  return 1
+}
+nat_excluded() { [[ " ${NAT_EXCLUDE} " == *" $1 "* ]]; }
+nat_usable() { is_port "$1" && ! nat_excluded "$1" && ext2int "$1" >/dev/null; }
+nat_first_usable() { # 第一个可用外部端口（跳过参数中列出的端口）
+  local p
+  while read -r p; do
+    nat_excluded "$p" && continue
+    [[ " $* " == *" $p "* ]] && continue
+    echo "$p"; return 0
+  done < <(nat_all_ext)
+  return 1
+}
+# 本机其它程序已监听的内部端口（转换为外部端口输出）
+nat_busy_ext_ports() {
+  local p e out=""
+  for p in $( { ss -Htlnp 2>/dev/null | awk '!/"xray"/{n=split($4,a,":"); print a[n]}'
+               ss -Hulnp 2>/dev/null | awk '!/"hysteria"/{n=split($4,a,":"); print a[n]}'; } | sort -un); do
+    [[ $p =~ ^[0-9]+$ ]] || continue
+    # 本脚本自己的服务（ss 看不到进程名时也要识别出来）
+    if [[ $p == "$XRAY_PORT" || $p == "$HY2_PORT" ]] && { svc_active xray || svc_active hysteria-server; }; then continue; fi
+    e=$(int2ext "$p") && out+="$e "
+  done
+  printf '%s' "${out% }"
+}
+# 端口段 "a-b,c"：逐个输出 / 压缩 / 计数
+segs_expand() {
+  local seg a b q
+  for seg in ${1//,/ }; do
+    a=${seg%-*} b=${seg#*-}
+    for (( q = a; q <= b; q++ )); do echo "$q"; done
+  done
+}
+segs_compress() {
+  awk 'NF{ if (s == "") { s = $1; e = $1 } else if ($1 == e + 1) { e = $1 } else { out = out (out ? "," : "") (s == e ? s : s "-" e); s = $1; e = $1 } }
+       END{ if (s != "") out = out (out ? "," : "") (s == e ? s : s "-" e); print out }'
+}
+segs_count() { [[ -n $1 ]] || { echo 0; return; }; segs_expand "$1" | wc -l; }
+valid_segs() {
+  local seg
+  [[ -n $1 && $1 =~ ^[0-9,-]+$ ]] || return 1
+  for seg in ${1//,/ }; do parse_port_span "$seg" >/dev/null || return 1; done
+}
+# 端口跳跃可用的外部端口：已映射、未排除、不是 Reality 独占的端口
+nat_hop_ok() { nat_usable "$1" && { (( $1 != XRAY_EXT_PORT )) || (( $1 == HY2_EXT_PORT )); }; }
+nat_hop_filter() { # 输出过滤后的外部端口段（自动拆分）
+  local q
+  segs_expand "$1" | sort -un | while read -r q; do nat_hop_ok "$q" && echo "$q"; done | segs_compress
+}
+nat_segs_ext2int() { # 外部端口段 → 内部端口段
+  local q
+  segs_expand "$1" | while read -r q; do ext2int "$q"; done | sort -un | segs_compress
+}
+
+choose_nat_addr() {
+  local a def=${OPT_NAT_ADDR:-${SERVER_ADDR:-${PUBLIC_IP4:-$PUBLIC_IP6}}}
+  while :; do
+    if [[ -n $OPT_NAT_ADDR ]]; then a=$OPT_NAT_ADDR; else ask a "公网地址（服务商提供的 IP 或解析到该 IP 的域名，用于分享链接）" "$def"; fi
+    a=${a#[}; a=${a%]}; a=${a// /}
+    if [[ -n $a ]] && valid_addr "$a"; then SERVER_ADDR=$a; break; fi
+    { [[ -n $OPT_NAT_ADDR ]] || (( OPT_AUTO )); } && die "公网地址无效: ${a:-空}（请用 --nat-addr 指定 IP 或域名）"
+    warn "地址格式无效，请输入 IPv4 / IPv6 / 域名。"
+  done
+  if is_ipv4 "$SERVER_ADDR" && is_private_v4 "$SERVER_ADDR"; then
+    warn "${SERVER_ADDR} 是内网地址，客户端通常无法直接连接；请确认填写的是服务商提供的公网 IP / 域名。"
+  fi
+  [[ $SERVER_ADDR == *:* ]] && info "公网地址为 IPv6，链接中将写成 [${SERVER_ADDR}] 形式。"
+  ok "公网地址: ${SERVER_ADDR}"
+}
+
+# 交互：为没有写 ":内部" 的每一项询问内部端口（默认沿用已保存的映射，否则与公网端口相同）
+nat_ask_internal() {
+  local it out="" in def m
+  for it in ${1//,/ }; do
+    if [[ $it == *:* ]] || ! parse_port_span "$it" >/dev/null; then out+="${out:+,}$it"; continue; fi
+    def=$it
+    for m in ${NAT_PORTS//,/ }; do [[ $m == "${it}:"* ]] && def=${m#*:}; done
+    ask in "公网端口 ${it} 对应的内部端口（本机监听端口，相同直接回车）" "$def" >&2
+    in=${in// /}
+    if [[ -z $in || $in == "$it" ]]; then out+="${out:+,}$it"; else out+="${out:+,}${it}:${in}"; fi
+  done
+  printf '%s' "$out"
+}
+
+# 从 --port / --hy2-port（外部[:内部]）推导映射列表
+nat_ports_from_opts() {
+  local l=""
+  [[ -n $OPT_PORT ]] && l=$OPT_PORT
+  [[ -n $OPT_HY2_PORT && $OPT_HY2_PORT != "$OPT_PORT" ]] && l+="${l:+,}$OPT_HY2_PORT"
+  printf '%s' "$l"
+}
+opt_ext() { printf '%s' "${1%%:*}"; }   # "52430:443" → 52430
+
+choose_nat_ports() {
+  local r p def
+  # 1) 服务商映射给本机的端口
+  def=${OPT_NAT_EXT:-$(nat_ports_from_opts)}
+  local from_opt=0; [[ -n $def ]] && from_opt=1
+  [[ -n $def ]] || def=$NAT_PORTS
+  while :; do
+    if (( from_opt )); then r=$def
+    else
+      echo "   NAT 机器只有服务商映射过的端口能从外部访问。常见两种："
+      echo "     · 逐条映射（例如面板里只能加 5 条规则）：填写公网端口，如 59221 或 52430,52431"
+      echo "     · 整段转发：填写范围，如 10001-10020"
+      echo "   随后会逐个询问对应的内部端口（与公网端口相同直接回车）；也可直接写 公网:内部，如 59221:443"
+      ask r "已映射的公网端口（逗号分隔）" "$def"
+      r=$(nat_ask_internal "$r")
+    fi
+    if r=$(nat_norm_list "$r"); then NAT_PORTS=$r; nat_items; break; fi
+    { (( from_opt )) || (( OPT_AUTO )); } && die "NAT 映射端口无效或未指定。请使用 --nat-ports 52430,52431（外部[:内部]，或整段 a-b）或 --port 外部端口。"
+    warn "格式无效。例如 52430,52431 或 52430:8443 或 10001-10020。"
+  done
+  info "映射端口: ${NAT_PORTS}"
+  # 2) 排除端口（整段转发时范围内可能含 SSH 映射等）
+  local busy x list=""
+  busy=$(nat_busy_ext_ports)
+  if nat_has_span; then
+    detect_ssh_ports
+    if [[ -z $OPT_NAT_EXCLUDE && -z $NAT_EXCLUDE ]]; then
+      warn "本机 SSH 监听内部端口 ${SSH_PORTS}；若服务商把端口段内某个外部端口映射给了 SSH，请务必排除（--nat-exclude 端口）。"
+    fi
+  fi
+  if [[ -n $OPT_NAT_EXCLUDE ]]; then def=$OPT_NAT_EXCLUDE
+  else
+    # 保存的排除项只对整段转发有意义；逐条映射时只按当前占用情况排除
+    local keep=""; nat_has_span && keep=$NAT_EXCLUDE
+    def=$(tr ' ' '\n' <<<"$keep $busy" | awk 'NF' | sort -un | tr '\n' ' '); def=${def% }
+  fi
+  [[ -n $busy ]] && info "映射端口中已被本机其它程序占用的（外部端口）: ${busy}（默认排除）"
+  if [[ -n $OPT_NAT_EXCLUDE ]] || (( OPT_AUTO )) || ! nat_has_span; then r=$def
+  else ask r "端口段内需要排除的外部端口（如映射给 SSH 的端口，空格/逗号分隔；没有请回车，none 清空）" "$def"; fi
+  [[ ${r,,} == none || $r == 无 ]] && r=""
+  for x in ${r//,/ }; do
+    if is_port "$x" && ext2int "$x" >/dev/null; then [[ " $list " == *" $x "* ]] || list+="$x "
+    else warn "忽略不在映射端口内的排除项: ${x}"; fi
+  done
+  NAT_EXCLUDE=${list% }
+  [[ -n $NAT_EXCLUDE ]] && info "排除的外部端口: ${NAT_EXCLUDE}"
+  nat_first_usable >/dev/null || die "映射端口 ${NAT_PORTS} 中没有可用端口（全部被排除）。"
+
+  # 3) VLESS-REALITY（TCP）
+  def=$(opt_ext "${OPT_PORT:-}")
+  if [[ -z $def ]]; then
+    if nat_usable "${XRAY_EXT_PORT:-0}"; then def=$XRAY_EXT_PORT; else def=$(nat_first_usable); fi
+  fi
+  while :; do
+    if [[ -n $OPT_PORT ]]; then p=$(opt_ext "$OPT_PORT"); else ask p "VLESS-REALITY 使用的外部端口（TCP，可选: ${NAT_PORTS}）" "$def"; fi
+    if nat_usable "$p"; then
+      if check_port_free tcp "$(ext2int "$p")" "xray"; then XRAY_EXT_PORT=$p; XRAY_PORT=$(ext2int "$p"); break; fi
+    else
+      warn "端口 ${p} 不在映射端口中或已被排除。"
+    fi
+    { [[ -n $OPT_PORT ]] || (( OPT_AUTO )); } && die "无法使用外部端口 ${p} 作为 VLESS-REALITY 端口（NAT 模式下 --port 表示外部端口，需包含在 --nat-ports 中）。"
+    def=$(nat_first_usable "$p") || def=""
+  done
+
+  # 4) Hysteria2（UDP）：可与 Reality 共用同一个端口号（服务商同时映射 TCP+UDP 时，节省映射名额）
+  if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
+  elif (( ! OPT_AUTO )); then
+    if confirm "是否同时安装 Hysteria2（UDP；需要服务商映射 UDP）？" "$([[ $HY2_ENABLED == 1 ]] && echo y || echo n)"; then HY2_ENABLED=1; else HY2_ENABLED=0; fi
+  fi
+  (( HY2_ENABLED )) || { HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT=""; return 0; }
+  local other share
+  other=$(nat_first_usable "$XRAY_EXT_PORT") || other=""
+  if [[ -n $OPT_HY2_PORT ]]; then share=0; [[ $(opt_ext "$OPT_HY2_PORT") == "$XRAY_EXT_PORT" ]] && share=1
+  elif [[ -n $OPT_NAT_SHARE ]]; then share=$OPT_NAT_SHARE
+  elif [[ -z $other ]] || (( OPT_AUTO )); then share=1
+  else
+    local sdef=y; [[ -n $HY2_EXT_PORT && $HY2_EXT_PORT != "$XRAY_EXT_PORT" ]] && sdef=n
+    if confirm "服务商的映射是否同时转发 TCP 和 UDP？是则 Hysteria2 与 Reality 共用外部端口 ${XRAY_EXT_PORT}（节省映射名额）" "$sdef"; then share=1; else share=0; fi
+  fi
+  if (( share )); then
+    def=$XRAY_EXT_PORT
+    [[ -z $OPT_NAT_SHARE && -z $OPT_HY2_PORT ]] && info "默认 Hysteria2 与 Reality 共用外部端口 ${XRAY_EXT_PORT}（需服务商同时映射 TCP+UDP；如只映射 TCP，请加 --nat-no-share 并提供第二个端口）。"
+  else
+    if [[ -z $other ]]; then
+      warn "没有第二个可用映射端口，且未确认 TCP+UDP 共用，已关闭 Hysteria2。"
+      HY2_ENABLED=0 HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT=""; return 0
+    fi
+    def=$other
+    nat_usable "${HY2_EXT_PORT:-0}" && [[ $HY2_EXT_PORT != "$XRAY_EXT_PORT" ]] && def=$HY2_EXT_PORT
+  fi
+  [[ -n $OPT_HY2_PORT ]] && def=$(opt_ext "$OPT_HY2_PORT")
+  while :; do
+    if [[ -n $OPT_HY2_PORT ]] || (( OPT_AUTO )); then p=$def
+    else ask p "Hysteria2 使用的外部端口（UDP，可选: ${NAT_PORTS}）" "$def"; fi
+    if nat_usable "$p"; then
+      if check_port_free udp "$(ext2int "$p")" "hysteria"; then HY2_EXT_PORT=$p; HY2_PORT=$(ext2int "$p"); break; fi
+    else
+      warn "端口 ${p} 不在映射端口中或已被排除。"
+    fi
+    { [[ -n $OPT_HY2_PORT ]] || (( OPT_AUTO )); } && die "无法使用外部端口 ${p} 作为 Hysteria2 端口。"
+  done
+  [[ $HY2_EXT_PORT == "$XRAY_EXT_PORT" ]] && info "Reality (TCP) 与 Hysteria2 (UDP) 共用外部端口 ${HY2_EXT_PORT}，请确认该映射同时包含 TCP 和 UDP。"
+
+  # 5) 端口跳跃：NAT 模式默认关闭；只有整段转发时才可开启（自动跳过 Reality / 排除端口，必要时拆分为多段）
+  local hop be="" filtered
+  if [[ -n $OPT_HOP ]]; then hop=$OPT_HOP
+  elif (( OPT_AUTO )) || ! nat_has_span; then hop=${HOP_EXT_RANGE:-none}
+  else
+    hop=${HOP_EXT_RANGE:-none}
+    ask hop "Hysteria2 端口跳跃范围（外部端口，须是服务商整段转发的端口，如 10002-10020；默认关闭）" "$hop"
+  fi
+  hop=${hop// /}
+  HOP_RANGE="" HOP_EXT_RANGE=""
+  if [[ -n $hop && $hop != none && $hop != no ]]; then
+    if valid_segs "$hop"; then
+      filtered=$(nat_hop_filter "$hop")
+      if (( $(segs_count "$filtered") >= 2 )); then
+        [[ $filtered != "$hop" ]] && info "已去掉未映射 / Reality 独占 / 排除的端口，跳跃范围调整为: ${filtered}"
+        HOP_EXT_RANGE=$filtered; HOP_RANGE=$(nat_segs_ext2int "$filtered")
+      else
+        warn "跳跃范围 ${hop} 中已映射且可用的端口不足 2 个，端口跳跃保持关闭。"
+      fi
+    else
+      warn "跳跃范围格式无效: ${hop}（例如 10002-10020 或 10002-10010,10012-10020），端口跳跃保持关闭。"
+    fi
+  fi
+  if [[ -n $HOP_RANGE ]]; then
+    have nft || have iptables || { info "安装 nftables（端口跳跃需要）..."; pkg_try nftables; }
+    if be=$(nat_hop_probe); then
+      HOP_BACKEND=$be
+      info "可以添加 NAT 转发规则（${be}），启用端口跳跃：外部 UDP ${HOP_EXT_RANGE} → 内部 ${HOP_RANGE} → ${HY2_PORT}"
+    else
+      warn "当前环境（${VIRT:-未知}）无法添加 NAT 转发规则（LXC/OpenVZ 容器通常没有 CAP_NET_ADMIN），端口跳跃已关闭，Hysteria2 仅使用单端口 ${HY2_EXT_PORT}。"
+      warn "（Hysteria2 服务端只能监听一个端口，端口跳跃必须依靠 DNAT 规则实现。）"
+      HOP_RANGE="" HOP_EXT_RANGE="" HOP_BACKEND=""
+    fi
+  else
+    HOP_BACKEND=""
+  fi
+}
+
+# NAT 模式说明：为什么跳过调优 / 防火墙 / fail2ban / Swap
+nat_skip_notice() {
+  step "NAT 精简模式"
+  info "已跳过：sysctl/BBR 调优$( ((OPT_TUNE)) && echo '（已用 --tune 强制启用，见下文）')、nftables 防火墙、fail2ban、Swap、$( ((OPT_UPGRADE)) || echo '系统升级、')RealiTLScanner。"
+  echo "   原因：NAT 小鸡多为 LXC / OpenVZ 容器（当前: ${VIRT:-未知}），内核参数与 Swap 由宿主机控制，修改通常无权限或无效；"
+  echo "         入站只能经过服务商的端口映射，本机防火墙意义不大；fail2ban 常驻约 30~50MB 内存，对 64~256MB 的小鸡负担过重。"
+  echo "   Xray 日志级别 warning 且关闭访问日志；Hysteria2 日志级别 warn。"
+  local envs; envs=$(go_mem_env)
+  envs=${envs//$'\n'/ }
+  [[ -n $envs ]] && echo "   内存 $(mem_limit_mb)MB < 256MB：为 xray$( ((HY2_ENABLED)) && echo ' / hysteria') 设置 ${envs}（软限制，降低内存峰值）。"
+  return 0
+}
+
+# IPv6-only / NAT64：GitHub 没有 IPv6，需要 DNS64 才能下载
+nat_net_check() {
+  (( NO_V4 )) || return 0
+  warn "未检测到 IPv4 出口（IPv6-only 或 NAT64 环境），下载将优先使用 IPv6。"
+  if curl -6 -fsSI --connect-timeout 6 -m 10 -o /dev/null https://github.com 2>/dev/null; then
+    ok "可以通过 IPv6 访问 GitHub（DNS64/NAT64 可用）。"; return 0
+  fi
+  warn "无法通过 IPv6 访问 GitHub（GitHub 不支持 IPv6，需要 DNS64 + NAT64）。"
+  echo "   可将 /etc/resolv.conf 改为公共 DNS64 服务器: ${DNS64_SERVERS}"
+  if (( OPT_DNS64 )) || { (( ! OPT_AUTO )) && confirm "是否现在写入公共 DNS64 服务器（原文件备份到 ${RESOLV_BAK}，卸载时可恢复）？" y; }; then
+    mkdir -p "$STATE_DIR"
+    [[ -f $RESOLV_BAK ]] || cp -a /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null || true
+    local d; { echo "# 由 proxy-oneclick 写入（DNS64），原文件: ${RESOLV_BAK}"; for d in $DNS64_SERVERS; do echo "nameserver $d"; done; } >/etc/resolv.conf.proxytmp
+    if cat /etc/resolv.conf.proxytmp >/etc/resolv.conf 2>/dev/null; then DNS64_SET=1; ok "已写入 DNS64 服务器。"; else warn "无法写入 /etc/resolv.conf（可能由宿主机管理）。"; fi
+    rm -f /etc/resolv.conf.proxytmp
+    if curl -6 -fsSI --connect-timeout 6 -m 10 -o /dev/null https://github.com 2>/dev/null; then ok "现在可以访问 GitHub。"
+    else warn "仍无法访问 GitHub，后续下载可能失败。"; fi
+  else
+    warn "未配置 DNS64，后续从 GitHub 下载可能失败（可加 --dns64 重新运行）。"
+  fi
+}
+
+# 确定运行模式：命令行 --nat / --no-nat 优先，否则沿用已安装的模式
+resolve_mode() {
+  [[ -n $OPT_NAT ]] && NAT_MODE=$OPT_NAT
+  [[ $NAT_MODE == 1 ]] || NAT_MODE=0
+  if [[ -z $OPT_UPGRADE ]]; then if (( NAT_MODE )); then OPT_UPGRADE=0; else OPT_UPGRADE=1; fi; fi
+  if [[ -z $OPT_TUNE ]]; then if (( NAT_MODE )); then OPT_TUNE=0; else OPT_TUNE=1; fi; fi
+  return 0
+}
+
 do_install() {
-  preflight
   load_state
+  [[ -n $OPT_NAT ]] && NAT_MODE=$OPT_NAT
+  preflight      # Alpine 可能在此切换为 NAT 模式
+  resolve_mode
   take_lock
   if (( INSTALLED )) && (( ! OPT_AUTO )); then
     warn "检测到已安装。重新安装将保留现有密钥/UUID/密码，仅更新组件与配置。"
@@ -1622,23 +2710,42 @@ do_install() {
 
   pkg_update_upgrade
   install_deps
+  detect_virt
   ensure_time_sync
   mktmp
   step "获取服务器信息"
   detect_ip; detect_geo; show_sysinfo
-  SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
-  ensure_swap
-  (( OPT_TUNE )) && apply_tuning
+  if (( NAT_MODE )); then
+    nat_net_check
+    nat_skip_notice
+    (( OPT_TUNE )) && apply_tuning
+  else
+    SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
+    ensure_swap
+    (( OPT_TUNE )) && apply_tuning
+  fi
 
   step "端口设置"
-  choose_ports
+  if (( NAT_MODE )); then
+    choose_nat_addr
+    choose_nat_ports
+  else
+    choose_ports
+    NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE="" HOP_BACKEND=""
+    remove_nat_hop
+  fi
   [[ -n $OPT_NAME ]] && NODE_NAME=$OPT_NAME
   [[ -n $NODE_NAME ]] || NODE_NAME=$(default_node_name)
-  (( OPT_FIREWALL )) || FW_ENABLED=0
-  if (( OPT_FIREWALL )); then
-    FW_ENABLED=1
-    handle_other_firewalls
-    (( FW_ENABLED )) && ask_extra_ports
+  if (( NAT_MODE )); then
+    if [[ -f $FW_FILE || -f $FW_UNIT ]]; then info "NAT 模式不管理防火墙，移除之前安装的本脚本 nftables 规则 ..."; remove_firewall; fi
+    FW_ENABLED=0
+  else
+    (( OPT_FIREWALL )) || FW_ENABLED=0
+    if (( OPT_FIREWALL )); then
+      FW_ENABLED=1
+      handle_other_firewalls
+      (( FW_ENABLED )) && ask_extra_ports
+    fi
   fi
 
   install_xray
@@ -1654,7 +2761,12 @@ do_install() {
   fi
   save_state
 
-  if [[ -z $SNI || -n $OPT_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新优选 SNI（当前: ${SNI}）？" n; }; then
+  local pqrc=0
+  [[ -n $SNI && -z $OPT_SNI ]] && { sni_pq_check "$SNI" || pqrc=$?; }
+  if (( pqrc == 1 )); then
+    warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），新版 Xray 客户端会握手失败，重新优选。"
+    select_sni
+  elif [[ -z $SNI || -n $OPT_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新优选 SNI（当前: ${SNI}）？" n; }; then
     select_sni
   fi
   SNI_TARGET="${SNI}:443"
@@ -1674,7 +2786,7 @@ do_install() {
   fi
 
   apply_firewall
-  setup_fail2ban
+  (( NAT_MODE )) || setup_fail2ban
   INSTALLED=1
   save_state
   self_install
@@ -1690,11 +2802,16 @@ do_install() {
 need_installed() {
   load_state
   (( INSTALLED )) || die "尚未安装，请先选择「安装」。"
+  [[ -n $INIT_SYS ]] || detect_init
   [[ -x $XRAY_BIN ]] || die "未找到 Xray，请重新安装。"
 }
 
 apply_all() { # 重新生成配置并重启（在修改参数后调用）
   save_state
+  if direct_mode; then
+    write_xray_service
+    (( HY2_ENABLED )) && [[ -x $HY_BIN ]] && write_hy2_service
+  fi
   write_xray_config
   restart_xray
   if (( HY2_ENABLED )); then write_hy2_config; restart_hy2; fi
@@ -1706,7 +2823,7 @@ apply_all() { # 重新生成配置并重启（在修改参数后调用）
 menu_change_sni() {
   need_installed; mktmp
   detect_ip; detect_geo
-  SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
+  (( NAT_MODE )) || SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
   local old=$SNI
   select_sni
   [[ $SNI == "$old" ]] && { info "SNI 未变化。"; return 0; }
@@ -1730,12 +2847,27 @@ menu_regen_keys() {
 
 menu_change_ports() {
   need_installed
+  if (( NAT_MODE )); then menu_change_ports_nat; return; fi
   local oldx=$XRAY_PORT oldh=$HY2_PORT
   choose_ports_interactive
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
   apply_all
   ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}$( ((HY2_ENABLED)) && echo "，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}")"
+  cloud_fw_reminder
+}
+menu_change_ports_nat() {
+  local oldx=$XRAY_EXT_PORT oldh=$HY2_EXT_PORT
+  detect_os; detect_virt
+  local s1=$OPT_PORT s2=$OPT_HY2_PORT s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
+  OPT_PORT="" OPT_HY2_PORT="" OPT_NAT_EXT="" OPT_NAT_ADDR=""
+  choose_nat_addr
+  choose_nat_ports
+  OPT_PORT=$s1 OPT_HY2_PORT=$s2 OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
+  if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
+  if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
+  apply_all
+  ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}$( ((HY2_ENABLED)) && echo "，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}")"
   cloud_fw_reminder
 }
 choose_ports_interactive() {
@@ -1810,9 +2942,19 @@ menu_update() {
 }
 
 update_script() {
+  load_state
   mktmp
   if [[ $SCRIPT_URL == *YOUR_GITHUB* ]]; then warn "脚本中 SCRIPT_URL 仍为占位符，无法在线更新脚本。"; return 0; fi
   if fetch -o "${TMP_DIR}/proxy.sh" "$SCRIPT_URL" && bash -n "${TMP_DIR}/proxy.sh"; then
+    local newv; newv=$(grep -m1 '^readonly SCRIPT_VERSION=' "${TMP_DIR}/proxy.sh" | cut -d'"' -f2)
+    if [[ -n $newv ]] && ! ver_ge "$newv" "$SCRIPT_VERSION"; then
+      warn "在线版本 ${newv} 低于当前版本 ${SCRIPT_VERSION}。"
+      if (( NAT_MODE )) && ! grep -q 'NAT_MODE' "${TMP_DIR}/proxy.sh"; then
+        warn "在线版本不支持 NAT 模式，更新后将无法管理当前安装，已取消。"; return 0
+      fi
+      (( OPT_AUTO )) && { warn "自动模式下不降级，已取消。"; return 0; }
+      confirm "仍要降级吗？" n || return 0
+    fi
     install -m 755 "${TMP_DIR}/proxy.sh" "$BIN_PATH"
     ok "脚本已更新为 $(grep -m1 '^readonly SCRIPT_VERSION=' "$BIN_PATH" | cut -d'"' -f2)"
   else
@@ -1822,42 +2964,102 @@ update_script() {
 
 menu_status() {
   load_state
-  echo; hr; _green "  服务状态"; hr
-  local s
-  for s in xray hysteria-server proxy-oneclick-fw fail2ban; do
-    local st; st=$(systemctl is-active "$s" 2>/dev/null || true)
+  [[ -n $INIT_SYS ]] || detect_init
+  echo; hr; _green "  服务状态$( ((NAT_MODE)) && echo '（NAT 模式）')"; hr
+  local s svcs="xray hysteria-server proxy-oneclick-fw fail2ban"
+  if (( NAT_MODE )); then svcs="xray hysteria-server"; [[ -n $HOP_RANGE ]] && svcs+=" proxy-oneclick-hop"; fi
+  for s in $svcs; do
+    local st; st=$(svc_state "$s")
     [[ -z $st ]] && st="unknown"
     if [[ $st == active ]]; then printf '  %-22s %s\n' "$s" "${C_GREEN}运行中${C_NONE}"
-    elif systemctl cat "$s" >/dev/null 2>&1; then printf '  %-22s %s\n' "$s" "${C_RED}${st}${C_NONE}"
+    elif [[ $st != none ]]; then printf '  %-22s %s\n' "$s" "${C_RED}${st}${C_NONE}"
     else printf '  %-22s %s\n' "$s" "未安装"; fi
   done
-  [[ -x $XRAY_BIN ]] && printf '  Xray 版本:      %s\n' "$("$XRAY_BIN" version | head -n1 | awk '{print $2}')"
+  [[ -x $XRAY_BIN ]] && printf '  Xray 版本:      %s\n' "$("$XRAY_BIN" version | awk 'NR==1{print $2}')"
   [[ -x $HY_BIN ]] && printf '  Hysteria2 版本: %s\n' "$("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
-  printf '  拥塞控制:       %s / %s\n' "$(sysval net.ipv4.tcp_congestion_control)" "$(sysval net.core.default_qdisc)"
+  if (( NAT_MODE )); then
+    nat_status_lines
+  else
+    printf '  拥塞控制:       %s / %s\n' "$(sysval net.ipv4.tcp_congestion_control)" "$(sysval net.core.default_qdisc)"
+  fi
   printf '  时间同步:       %s\n' "$(time_sync_status)"
   echo; _cyan "  监听端口："
-  ss -Htlnp 2>/dev/null | awk '/xray/{print "   TCP "$4"  xray"}' || true
-  ss -Hulnp 2>/dev/null | awk '/hysteria/{print "   UDP "$4"  hysteria"}' || true
-  if have fail2ban-client && svc_active fail2ban; then
+  local lx lh
+  lx=$(ss -Htlnp 2>/dev/null | awk '/xray/{print "   TCP "$4"  xray"}') || true
+  lh=$(ss -Hulnp 2>/dev/null | awk '/hysteria/{print "   UDP "$4"  hysteria"}') || true
+  # 看不到进程名时（容器权限受限）按配置端口显示
+  if [[ -z $lx ]]; then lx=$(ss -Htln "sport = :${XRAY_PORT}" 2>/dev/null | awk '{print "   TCP "$4"  (xray)"}') || true; fi
+  (( HY2_ENABLED )) && [[ -z $lh ]] && { lh=$(ss -Huln "sport = :${HY2_PORT}" 2>/dev/null | awk '{print "   UDP "$4"  (hysteria)"}') || true; }
+  [[ -n $lx ]] && echo "$lx"
+  [[ -n $lh ]] && echo "$lh"
+  if (( ! NAT_MODE )) && have fail2ban-client && svc_active fail2ban; then
     echo; _cyan "  fail2ban (sshd)："
     fail2ban-client status sshd 2>/dev/null | sed 's/^/   /' || true
   fi
   echo
-  echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看防火墙规则   4) 实时跟踪 Xray 日志   0) 返回"
+  if (( NAT_MODE )); then
+    echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看端口跳跃规则   4) 实时跟踪 Xray 日志   0) 返回"
+  else
+    echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看防火墙规则   4) 实时跟踪 Xray 日志   0) 返回"
+  fi
   local c; ask c "请选择" "0"
   case $c in
-    1) journalctl -u xray -n 80 --no-pager ;;
-    2) journalctl -u hysteria-server -n 80 --no-pager ;;
-    3) nft list table inet "$NFT_TABLE" 2>/dev/null || warn "未找到本脚本的防火墙表。"
-       nft list table ip "${NFT_TABLE}_nat" 2>/dev/null || true ;;
-    4) journalctl -u xray -f ;;
+    1) svc_logs xray 80 ;;
+    2) svc_logs hysteria-server 80 ;;
+    3) if (( NAT_MODE )); then show_hop_rules
+       else
+         nft list table inet "$NFT_TABLE" 2>/dev/null || warn "未找到本脚本的防火墙表。"
+         nft list table ip "${NFT_TABLE}_nat" 2>/dev/null || true
+       fi ;;
+    4) svc_follow xray ;;
+    *) return 0 ;;
+  esac
+}
+
+nat_status_lines() {
+  printf '  公网地址:       %s\n' "${SERVER_ADDR:-未设置}"
+  printf '  映射端口:       %s%s\n' "${NAT_PORTS:-未设置}" "${NAT_EXCLUDE:+（排除 ${NAT_EXCLUDE}）}"
+  printf '  Reality:        外部 TCP %s → 本机 %s\n' "${XRAY_EXT_PORT:-?}" "$XRAY_PORT"
+  if (( HY2_ENABLED )); then
+    printf '  Hysteria2:      外部 UDP %s → 本机 %s%s\n' "${HY2_EXT_PORT:-?}" "$HY2_PORT" "$([[ $HY2_EXT_PORT == "$XRAY_EXT_PORT" ]] && echo '（与 Reality 共用端口）')"
+    if [[ -n $HOP_RANGE ]]; then printf '  端口跳跃:       外部 UDP %s → 本机 %s（%s）\n' "$HOP_EXT_RANGE" "$HOP_RANGE" "${HOP_BACKEND:-?}"
+    else printf '  端口跳跃:       关闭\n'; fi
+  fi
+  printf '  虚拟化 / init:  %s / %s\n' "${VIRT:-未知}" "${INIT_SYS:-未知}"
+  local envs; envs=$(go_mem_env); envs=${envs//$'\n'/ }
+  printf '  内存:           %s MB%s\n' "$(mem_limit_mb)" "${envs:+（${envs}）}"
+}
+
+show_hop_rules() {
+  if [[ -z $HOP_RANGE ]]; then info "端口跳跃未启用。"; return 0; fi
+  case $HOP_BACKEND in
+    nft-inet) nft list table inet "$HOP_TABLE" 2>/dev/null || warn "未找到端口跳跃规则表。" ;;
+    nft-ip) nft list table ip "$HOP_TABLE" 2>/dev/null || warn "未找到端口跳跃规则表。"; nft list table ip6 "$HOP_TABLE" 2>/dev/null || true ;;
+    iptables) iptables -t nat -S PROXY_OC_HOP 2>/dev/null || warn "未找到端口跳跃规则链。" ;;
+    *) warn "未知后端: ${HOP_BACKEND}" ;;
+  esac
+}
+
+menu_nat() {
+  need_installed
+  (( NAT_MODE )) || { warn "当前不是 NAT 模式。"; return 0; }
+  detect_virt
+  echo; hr; _green "  NAT 信息 / 端口跳跃"; hr
+  nat_status_lines
+  hr
+  echo "  1) 修改公网地址 / 映射端口 / 端口跳跃   2) 重新加载端口跳跃规则   3) 查看端口跳跃规则   0) 返回"
+  local c; ask c "请选择" "0"
+  case $c in
+    1) menu_change_ports_nat ;;
+    2) apply_nat_hop; save_state; save_info ;;
+    3) show_hop_rules ;;
     *) return 0 ;;
   esac
 }
 
 speed_try() { # $1 URL；成功时输出 "Mbps 已下载MB 秒数"，失败返回 1
   local out rc=0 code size t
-  out=$(curl -4 -so /dev/null --connect-timeout 8 -m 20 -w '%{http_code} %{size_download} %{time_total}' "$1" 2>/dev/null) || rc=$?
+  out=$(curl "-${IPFAM}" -so /dev/null --connect-timeout 8 -m 20 -w '%{http_code} %{size_download} %{time_total}' "$1" 2>/dev/null) || rc=$?
   read -r code size t <<<"$out"
   # 必须是 HTTP 200；正常结束 (0) 或到达 20 秒上限 (28) 都可以，只要下载量 ≥ 10MB
   [[ $code == 200 ]] || return 1
@@ -1868,10 +3070,13 @@ speed_try() { # $1 URL；成功时输出 "Mbps 已下载MB 秒数"，失败返�
 menu_speed() {
   load_state
   echo; hr; _green "  网络测速 / 延迟提示"; hr
+  if (( NAT_MODE )) && ! curl -4 -fsS --connect-timeout 4 -m 6 -o /dev/null https://api.ipify.org 2>/dev/null; then
+    IPFAM=6; info "无 IPv4 出口，使用 IPv6 测试。"
+  fi
   printf '  拥塞控制: %s   队列: %s\n' "$(sysval net.ipv4.tcp_congestion_control)" "$(sysval net.core.default_qdisc)"
   if [[ -n $SNI ]]; then
     local w a="" b="" rc=0
-    w=$(curl -4 -so /dev/null --connect-timeout 5 -m 10 -w '%{time_connect} %{time_appconnect}' "https://${SNI}/" 2>/dev/null) || rc=$?
+    w=$(curl "-${IPFAM}" -so /dev/null --connect-timeout 5 -m 10 -w '%{time_connect} %{time_appconnect}' "https://${SNI}/" 2>/dev/null) || rc=$?
     read -r a b <<<"$w"
     if (( rc == 0 )) && awk -v t="${b:-0}" 'BEGIN{exit !(t > 0)}'; then
       printf '  到 SNI 目标 %s：TCP %s ms，TLS 握手完成 %s ms（越低越好，建议 < 50ms）\n' "$SNI" \
@@ -1895,7 +3100,7 @@ menu_speed() {
   cat <<TIP
 
   提示：
-   · 在本地电脑上测试到 VPS 的延迟：tcping $(server_addr) ${XRAY_PORT}（ICMP ping 可能被运营商限速，仅供参考）
+   · 在本地电脑上测试到 VPS 的延迟：tcping $(server_addr) $(pub_xray_port)（ICMP ping 可能被运营商限速，仅供参考）
    · 查看回程路由：在 VPS 上运行 nexttrace（https://github.com/nxtrace/NTrace-core）
    · 晚高峰丢包严重时优先使用 Hysteria2；TCP 稳定时 REALITY 延迟更低
    · SNI 目标延迟过高（> 100ms）时，可在菜单中「更换 SNI」重新优选
@@ -1904,6 +3109,7 @@ TIP
 
 menu_firewall() {
   need_installed
+  if (( NAT_MODE )); then warn "NAT 模式不管理防火墙（入站由服务商端口映射控制）。"; menu_nat; return; fi
   echo; hr; _green "  防火墙管理"; hr
   echo "  当前状态: $( ((FW_ENABLED)) && echo 由本脚本管理 || echo 未启用)   SSH 端口: ${SSH_PORTS:-未检测}"
   echo "  额外放行: TCP [${EXTRA_TCP}]  UDP [${EXTRA_UDP}]"
@@ -1926,23 +3132,39 @@ menu_firewall() {
 do_uninstall() {
   require_root
   load_state
-  warn "将卸载 Xray、Hysteria2、本脚本防火墙规则、调优配置、fail2ban 规则及管理命令。"
+  [[ -n $INIT_SYS ]] || detect_init
+  if (( NAT_MODE )); then
+    warn "将卸载 Xray、Hysteria2、端口跳跃规则、服务脚本及管理命令（NAT 模式）。"
+  else
+    warn "将卸载 Xray、Hysteria2、本脚本防火墙规则、调优配置、fail2ban 规则及管理命令。"
+  fi
   (( OPT_AUTO )) || confirm "确认卸载？" n || return 0
   step "卸载"
-  systemctl disable --now xray >/dev/null 2>&1 || true
-  systemctl disable --now 'xray@*' >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
+  svc_disable_stop xray
+  if have systemctl; then systemctl disable --now 'xray@*' >/dev/null 2>&1 || true; fi
+  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service "$XRAY_RC"
   rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
   rm -f "$XRAY_BIN"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+  sd_reload
   ok "Xray 已移除"
   remove_hysteria; ok "Hysteria2 已移除"
-  remove_firewall; ok "防火墙规则已移除"
+  remove_nat_hop
+  remove_firewall; ok "防火墙 / 端口跳跃规则已移除"
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; ok "fail2ban 规则已移除（fail2ban 软件包保留）"; fi
-  rm -f "$SYSCTL_FILE" "$LIMITS_FILE" "$SYSTEMD_LIMITS_FILE" "$JOURNALD_FILE"
-  sysctl --system >/dev/null 2>&1 || true
-  systemctl daemon-reexec >/dev/null 2>&1 || true
-  systemctl restart systemd-journald >/dev/null 2>&1 || true
-  ok "调优配置已移除（BBR 等将在重启后恢复系统默认）"
+  if [[ -f $SYSCTL_FILE || -f $LIMITS_FILE || -f $SYSTEMD_LIMITS_FILE || -f $JOURNALD_FILE ]]; then
+    rm -f "$SYSCTL_FILE" "$LIMITS_FILE" "$SYSTEMD_LIMITS_FILE" "$JOURNALD_FILE"
+    sysctl --system >/dev/null 2>&1 || true
+    if [[ $INIT_SYS == systemd ]]; then
+      systemctl daemon-reexec >/dev/null 2>&1 || true
+      systemctl restart systemd-journald >/dev/null 2>&1 || true
+    fi
+    ok "调优配置已移除（BBR 等将在重启后恢复系统默认）"
+  fi
+  if (( DNS64_SET )) && [[ -f $RESOLV_BAK ]]; then
+    if confirm "安装时写入了 DNS64 服务器，是否恢复原来的 /etc/resolv.conf？" y; then
+      if cat "$RESOLV_BAK" >/etc/resolv.conf 2>/dev/null; then ok "已恢复 /etc/resolv.conf"; else warn "恢复 /etc/resolv.conf 失败，备份在 ${RESOLV_BAK}"; fi
+    fi
+  fi
   local fw
   for fw in $DISABLED_FW; do
     if confirm "安装时停用了 ${fw}，是否重新启用？" y; then
@@ -1966,6 +3188,8 @@ do_uninstall() {
 show_menu() {
   load_state
   clear 2>/dev/null || true
+  [[ -n $INIT_SYS ]] || detect_init
+  local menu10="防火墙管理"; (( NAT_MODE )) && menu10="NAT 信息 / 端口跳跃"
   local st="${C_RED}未安装${C_NONE}"
   if (( INSTALLED )); then
     if svc_active xray; then st="${C_GREEN}运行中${C_NONE}"; else st="${C_YELLOW}已安装 (Xray 未运行)${C_NONE}"; fi
@@ -1973,7 +3197,7 @@ show_menu() {
   cat <<MENU
 ${C_CYAN}============================================================${C_NONE}
    ${C_BOLD}proxy 一键脚本 v${SCRIPT_VERSION}${C_NONE}  VLESS-REALITY-Vision + Hysteria2
-   状态: ${st}${SNI:+   SNI: ${C_GREEN}${SNI}${C_NONE}}
+   状态: ${st}${SNI:+   SNI: ${C_GREEN}${SNI}${C_NONE}}$( ((NAT_MODE)) && printf '\n   %sNAT 模式%s  地址: %s  映射: %s' "$C_YELLOW" "$C_NONE" "${SERVER_ADDR:-?}" "${NAT_PORTS:-?}")
 ${C_CYAN}============================================================${C_NONE}
    ${C_GREEN}1)${C_NONE} 安装 / 重新安装
    ${C_GREEN}2)${C_NONE} 查看链接 / 二维码 / Clash 配置
@@ -1984,7 +3208,7 @@ ${C_CYAN}============================================================${C_NONE}
    ${C_GREEN}7)${C_NONE} 更新 Xray / Hysteria2 / 脚本
    ${C_GREEN}8)${C_NONE} 运行状态 / 日志
    ${C_GREEN}9)${C_NONE} 网络测速 / 延迟提示
-  ${C_GREEN}10)${C_NONE} 防火墙管理
+  ${C_GREEN}10)${C_NONE} ${menu10}
   ${C_GREEN}11)${C_NONE} 卸载
    ${C_GREEN}0)${C_NONE} 退出
 ${C_CYAN}------------------------------------------------------------${C_NONE}
@@ -2001,7 +3225,7 @@ MENU
     7) act=menu_update ;;
     8) act=menu_status ;;
     9) act=menu_speed ;;
-    10) act=menu_firewall ;;
+    10) if (( NAT_MODE )); then act=menu_nat; else act=menu_firewall; fi ;;
     11) act=do_uninstall ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
@@ -2038,6 +3262,24 @@ proxy 一键脚本 v${SCRIPT_VERSION} —— VLESS + REALITY + Vision (ML-DSA-65
   --no-tune           跳过 sysctl 网络调优
   -h, --help          显示帮助
 
+NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过调优·防火墙·fail2ban·Swap）:
+  --nat               启用 NAT 模式（Alpine 必须使用；之后 proxy 命令自动沿用）
+  --no-nat            切换回普通模式
+  --nat-addr <地址>   链接中使用的公网 IP 或域名（默认自动检测，IPv4 优先）
+  --nat-ports <列表>  服务商已映射的端口，逗号分隔，每项 外部[:内部]
+                      例: 52430,52431   52430:8443   整段转发: 10001-10020 或 10001-10020:20001-20020
+  --port <外部[:内部]>      NAT 模式下为 Reality 外部端口（未给 --nat-ports 时自动加入映射列表）
+  --hy2-port <外部[:内部]>  NAT 模式下为 Hysteria2 外部端口（可与 --port 相同 = TCP+UDP 共用）
+  --nat-share         Reality(TCP) 与 Hysteria2(UDP) 共用一个外部端口（需服务商同时映射 TCP+UDP）
+  --nat-no-share      Reality 与 Hysteria2 使用不同端口
+  --nat-exclude <端口> 整段转发时需要排除的外部端口（如映射给 SSH 的端口），逗号分隔
+  --hop <段>          NAT 模式默认关闭；仅整段转发时可用，例如 10003-10020（自动跳过 Reality/排除端口）
+  --dns64             IPv6-only 机器无法访问 GitHub 时写入公共 DNS64 服务器
+  --tune / --upgrade  NAT 模式下仍执行 sysctl 调优 / 系统升级（默认跳过）
+  例: bash proxy.sh --nat --auto --nat-addr 1.2.3.4 --nat-ports 52430,52431
+      bash proxy.sh --nat --auto --port 52430 --nat-share      # 只有一个 TCP+UDP 映射端口
+      bash proxy.sh --nat --auto --nat-port 59221:443        # 公网 59221 → 内部 443（TCP+UDP 同一条映射）
+
 管理命令:
   proxy               打开交互菜单
   proxy info          查看链接 / 二维码 / mihomo 配置
@@ -2049,7 +3291,8 @@ proxy 一键脚本 v${SCRIPT_VERSION} —— VLESS + REALITY + Vision (ML-DSA-65
   proxy update-script 只更新本脚本
   proxy status        运行状态 / 日志
   proxy speed         测速 / 延迟提示
-  proxy firewall      防火墙管理
+  proxy firewall      防火墙管理（NAT 模式为 NAT 信息 / 端口跳跃）
+  proxy nat           NAT 信息 / 修改映射端口 / 端口跳跃
   proxy uninstall     卸载
 USAGE
 }
@@ -2062,17 +3305,27 @@ parse_args() {
       --sni=*) OPT_SNI=${1#*=} ;;
       --force-sni) OPT_FORCE_SNI=1 ;;
       --scan) OPT_SCAN=1 ;;
-      --port) is_port "${2-}" || die "--port 参数无效"; OPT_PORT=$2; shift ;;
-      --port=*) OPT_PORT=${1#*=}; is_port "$OPT_PORT" || die "--port 参数无效" ;;
+      --port) is_port_opt "${2-}" || die "--port 参数无效"; OPT_PORT=$2; shift ;;
+      --port=*) OPT_PORT=${1#*=}; is_port_opt "$OPT_PORT" || die "--port 参数无效" ;;
       --no-hy2) OPT_HY2=0 ;;
       --hy2) OPT_HY2=1 ;;
-      --hy2-port) is_port "${2-}" || die "--hy2-port 参数无效"; OPT_HY2_PORT=$2; shift ;;
-      --hop) [[ ${2-} == none ]] || is_range "${2-}" || die "--hop 参数无效（例如 20000-50000 或 none）"; OPT_HOP=$2; shift ;;
+      --hy2-port) is_port_opt "${2-}" || die "--hy2-port 参数无效"; OPT_HY2_PORT=$2; shift ;;
+      --hop) [[ ${2-} == none ]] || is_range "${2-}" || valid_segs "${2-}" || die "--hop 参数无效（例如 20000-50000 或 none）"; OPT_HOP=$2; shift ;;
       --no-hop) OPT_HOP=none ;;
       --name) [[ -n ${2-} ]] || die "--name 需要参数"; OPT_NAME=$(tr -cd 'A-Za-z0-9_.-' <<<"$2"); shift ;;
       --no-firewall) OPT_FIREWALL=0 ;;
       --no-upgrade) OPT_UPGRADE=0 ;;
       --no-tune) OPT_TUNE=0 ;;
+      --tune) OPT_TUNE=1 ;;
+      --upgrade) OPT_UPGRADE=1 ;;
+      --nat) OPT_NAT=1 ;;
+      --no-nat) OPT_NAT=0 ;;
+      --nat-addr|--addr) [[ -n ${2-} ]] || die "$1 需要参数"; OPT_NAT_ADDR=$2; shift ;;
+      --nat-ports|--nat-port) [[ -n ${2-} ]] || die "--nat-ports 需要参数（例如 52430,52431）"; nat_norm_list "$2" >/dev/null || die "--nat-ports 参数无效: $2"; OPT_NAT_EXT=$2; shift ;;
+      --nat-exclude) [[ -n ${2-} ]] || die "--nat-exclude 需要参数"; OPT_NAT_EXCLUDE=$2; shift ;;
+      --nat-share) OPT_NAT_SHARE=1 ;;
+      --nat-no-share) OPT_NAT_SHARE=0 ;;
+      --dns64) OPT_DNS64=1 ;;
       -h|--help|help) usage; exit 0 ;;
       -v|--version|version) echo "$SCRIPT_VERSION"; exit 0 ;;
       install) OPT_ACTION=install ;;
@@ -2086,20 +3339,33 @@ parse_args() {
       status|log|logs) OPT_ACTION=status ;;
       speed) OPT_ACTION=speed ;;
       firewall|fw) OPT_ACTION=firewall ;;
+      nat) OPT_ACTION=nat ;;
       uninstall|remove) OPT_ACTION=uninstall ;;
       *) usage; die "未知参数: $1" ;;
     esac
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT ]]; }; then
     OPT_ACTION=install
   fi
+  # 普通模式下 --port / --hy2-port 只接受单个端口；NAT 模式的 外部:内部 写法在安装时再校验
+  if [[ $OPT_NAT != 1 ]]; then
+    [[ -z $OPT_PORT || $OPT_PORT != *:* || -f $STATE_FILE ]] || die "--port 的 外部:内部 写法仅用于 NAT 模式（--nat）。"
+  fi
+  return 0
+}
+is_port_opt() { # 端口，或 NAT 模式的 公网:内部（例如 59221:443）
+  is_port "$1" && return 0
+  [[ $1 =~ ^([0-9]+):([0-9]+)$ ]] || return 1
+  local e=${BASH_REMATCH[1]} i=${BASH_REMATCH[2]} # is_port 内部的 =~ 会覆盖 BASH_REMATCH，先保存
+  is_port "$e" && is_port "$i"
 }
 
 main() {
   parse_args "$@"
   require_root
+  detect_init
   mktmp
   case $OPT_ACTION in
     install) do_install ;;
@@ -2113,6 +3379,7 @@ main() {
     status) menu_status ;;
     speed) menu_speed ;;
     firewall) menu_firewall ;;
+    nat) menu_nat ;;
     uninstall) do_uninstall ;;
     "")
       if [[ ! -t 0 && ! -r /dev/tty ]]; then usage; die "非交互环境请使用 --auto。"; fi
