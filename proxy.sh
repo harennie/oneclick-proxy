@@ -20,7 +20,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.1.1"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -267,12 +267,12 @@ take_lock() {
 
 # ----------------------------- 状态持久化 -----------------------------
 # 持久化的键
-STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY SNI SNI_TARGET
+STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY MLDSA_ON SNI SNI_TARGET
             HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED SSH_PORTS
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
             HOP_BACKEND VIRT DNS64_SET)
-INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" SNI="" SNI_TARGET=""
+INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
 EXTRA_TCP="" EXTRA_UDP="" DISABLED_FW="" SWAP_CREATED=0 SERVER_ADDR=""
 NAT_MODE=0 NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE=""
@@ -727,56 +727,58 @@ SYSCTL
 #                 REALITY 目标网站 (SNI) 自动优选
 # ============================================================
 # 规则：与 VPS 同国家/地区（最好同城/同 ASN）；TLS1.3 + X25519 + ALPN h2 + HSTS；
-#       证书链有效；不在 Cloudflare 后面；不是被墙网站/大厂默认域名。
+#       证书链有效；不在 CDN / WAF 后面（Cloudflare、Imperva、Fastly、Akamai、CloudFront、Azure Front Door 等）；
+#       不是被墙网站/大厂默认域名。支持 X25519MLKEM768（后量子）的目标优先，但不是硬性要求。
 # 候选列表按地区组织（以大学及本地中型网站为主），运行时在 VPS 上逐一实测。
+# v1.1.1：已剔除响应头显示使用 CDN/WAF 的候选；SG / PH 本地自建站点很少，合格数不足时自动扩大到邻近地区。
 sni_candidates() { # $1 = 地区键
   case $1 in
-    US-CA)  echo "www.usc.edu www.ucla.edu www.caltech.edu www.csulb.edu www.csun.edu www.calstatela.edu www.cpp.edu www.ucr.edu www.uci.edu www.ucsd.edu www.sdsu.edu www.stanford.edu www.berkeley.edu www.sjsu.edu www.ucsf.edu www.ucdavis.edu www.ucsb.edu www.chapman.edu www.lmu.edu www.pepperdine.edu" ;;
-    US-NW)  echo "www.washington.edu www.uw.edu www.wsu.edu www.pdx.edu www.oregonstate.edu www.uoregon.edu www.seattleu.edu www.gonzaga.edu www.unlv.edu www.unr.edu www.utah.edu www.byu.edu www.boisestate.edu" ;;
-    US-SW)  echo "www.asu.edu www.arizona.edu www.nau.edu www.unm.edu www.utah.edu www.unlv.edu www.colorado.edu www.du.edu www.colostate.edu" ;;
-    US-TX)  echo "www.utexas.edu www.rice.edu www.tamu.edu www.uh.edu www.smu.edu www.tcu.edu www.baylor.edu www.utdallas.edu www.unt.edu www.utsa.edu www.ou.edu www.okstate.edu" ;;
-    US-OH)  echo "www.case.edu www.ohio.edu www.osu.edu www.uc.edu www.kent.edu www.miamioh.edu www.bgsu.edu www.utoledo.edu www.wright.edu www.umich.edu www.msu.edu www.wayne.edu www.purdue.edu www.iu.edu www.pitt.edu www.cmu.edu www.louisville.edu" ;;
-    US-IL)  echo "www.uchicago.edu www.northwestern.edu www.uic.edu www.luc.edu www.depaul.edu www.iit.edu www.wisc.edu www.umn.edu www.wustl.edu www.slu.edu www.uiowa.edu www.ku.edu www.unl.edu" ;;
-    US-EAST) echo "www.virginia.edu www.vt.edu www.gmu.edu www.jhu.edu www.umd.edu www.georgetown.edu www.gwu.edu www.american.edu www.vcu.edu www.odu.edu www.jmu.edu www.udel.edu www.unc.edu www.duke.edu www.ncsu.edu www.wm.edu" ;;
-    US-NE)  echo "www.nyu.edu www.columbia.edu www.cornell.edu www.rutgers.edu www.princeton.edu www.fordham.edu www.stonybrook.edu www.rochester.edu www.syracuse.edu www.upenn.edu www.temple.edu www.drexel.edu www.bu.edu www.northeastern.edu www.tufts.edu www.brown.edu www.yale.edu www.umass.edu" ;;
-    US-SE)  echo "www.gatech.edu www.emory.edu www.gsu.edu www.uga.edu www.ufl.edu www.fsu.edu www.miami.edu www.usf.edu www.ucf.edu www.fiu.edu www.vanderbilt.edu www.utk.edu www.sc.edu www.clemson.edu www.ua.edu www.tulane.edu www.lsu.edu" ;;
-    CA)     echo "www.utoronto.ca www.yorku.ca www.torontomu.ca www.mcmaster.ca www.uwaterloo.ca www.queensu.ca www.uottawa.ca www.carleton.ca www.mcgill.ca www.concordia.ca www.umontreal.ca www.ulaval.ca www.ubc.ca www.sfu.ca www.uvic.ca www.ualberta.ca www.ucalgary.ca www.umanitoba.ca www.usask.ca www.dal.ca" ;;
-    MX)     echo "www.unam.mx www.tec.mx www.ipn.mx www.udg.mx www.uanl.mx www.ibero.mx" ;;
-    BR)     echo "www.usp.br www.unicamp.br www.ufrj.br www.unesp.br www.ufmg.br www.puc-rio.br www.ufsc.br" ;;
-    JP)     echo "www.u-tokyo.ac.jp www.kyoto-u.ac.jp www.osaka-u.ac.jp www.titech.ac.jp www.isct.ac.jp www.keio.ac.jp www.waseda.jp www.tohoku.ac.jp www.nagoya-u.ac.jp www.kyushu-u.ac.jp www.hokudai.ac.jp www.tsukuba.ac.jp www.hit-u.ac.jp www.sophia.ac.jp www.meiji.ac.jp www.ritsumei.ac.jp www.doshisha.ac.jp www.kobe-u.ac.jp www.chiba-u.ac.jp www.ynu.ac.jp" ;;
+    US-CA)  echo "www.csun.edu www.cpp.edu www.uci.edu www.ucsd.edu www.stanford.edu www.sjsu.edu www.chapman.edu www.lmu.edu" ;;
+    US-NW)  echo "www.washington.edu www.uw.edu www.wsu.edu www.unr.edu www.utah.edu" ;;
+    US-SW)  echo "www.nau.edu www.unm.edu www.utah.edu www.colorado.edu" ;;
+    US-TX)  echo "www.uh.edu www.smu.edu www.tcu.edu www.utdallas.edu www.unt.edu www.utsa.edu www.ou.edu" ;;
+    US-OH)  echo "www.miamioh.edu www.bgsu.edu www.utoledo.edu www.wayne.edu www.purdue.edu www.iu.edu www.pitt.edu www.cmu.edu www.louisville.edu" ;;
+    US-IL)  echo "www.uchicago.edu www.northwestern.edu www.uic.edu www.depaul.edu www.slu.edu www.ku.edu www.unl.edu" ;;
+    US-EAST) echo "www.virginia.edu www.vcu.edu www.jmu.edu www.udel.edu www.duke.edu" ;;
+    US-NE)  echo "www.cornell.edu www.rutgers.edu www.rochester.edu www.temple.edu www.drexel.edu www.bu.edu www.northeastern.edu www.tufts.edu www.yale.edu" ;;
+    US-SE)  echo "www.emory.edu www.ufl.edu www.miami.edu www.usf.edu www.fiu.edu www.sc.edu www.clemson.edu www.lsu.edu" ;;
+    CA)     echo "www.yorku.ca www.torontomu.ca www.mcmaster.ca www.queensu.ca www.carleton.ca www.mcgill.ca www.concordia.ca www.umontreal.ca www.ulaval.ca www.sfu.ca www.uvic.ca www.ucalgary.ca www.umanitoba.ca www.usask.ca" ;;
+    MX)     echo "www.tec.mx www.ipn.mx www.udg.mx www.uanl.mx www.ibero.mx" ;;
+    BR)     echo "www.usp.br www.ufrj.br www.unesp.br www.ufmg.br www.puc-rio.br www.ufsc.br" ;;
+    JP)     echo "www.u-tokyo.ac.jp www.osaka-u.ac.jp www.titech.ac.jp www.isct.ac.jp www.tohoku.ac.jp www.nagoya-u.ac.jp www.kyushu-u.ac.jp www.hokudai.ac.jp www.hit-u.ac.jp www.ritsumei.ac.jp www.kobe-u.ac.jp www.chiba-u.ac.jp www.ynu.ac.jp" ;;
     KR)     echo "www.snu.ac.kr www.kaist.ac.kr www.yonsei.ac.kr www.korea.ac.kr www.postech.ac.kr www.skku.edu www.hanyang.ac.kr www.kyunghee.ac.kr www.ewha.ac.kr www.sogang.ac.kr www.cau.ac.kr www.pusan.ac.kr www.unist.ac.kr" ;;
-    HK)     echo "www.hku.hk www.cuhk.edu.hk www.hkust.edu.hk www.polyu.edu.hk www.cityu.edu.hk www.hkbu.edu.hk www.eduhk.hk www.ln.edu.hk www.hkmu.edu.hk www.hsu.edu.hk" ;;
-    TW)     echo "www.ntu.edu.tw www.nthu.edu.tw www.nycu.edu.tw www.ncku.edu.tw www.nccu.edu.tw www.ntnu.edu.tw www.ncu.edu.tw www.ntust.edu.tw www.fju.edu.tw www.tku.edu.tw" ;;
-    SG)     echo "www.nus.edu.sg www.ntu.edu.sg www.smu.edu.sg www.sutd.edu.sg www.suss.edu.sg www.singaporetech.edu.sg www.np.edu.sg www.sp.edu.sg www.tp.edu.sg www.rp.edu.sg" ;;
+    HK)     echo "my.hkust.edu.hk factsfigures.cuhk.edu.hk dsbs.cuhk.edu.hk rmda.cuhk.edu.hk" ;; # 后两个 HSTS 仅 300s，放最后
+    TW)     echo "www.ntu.edu.tw www.nthu.edu.tw www.ncku.edu.tw www.nccu.edu.tw www.ntnu.edu.tw www.ncu.edu.tw www.ntust.edu.tw www.fju.edu.tw www.tku.edu.tw" ;;
+    SG)     echo "www.ntuc.org.sg www.uob.com.sg www.sgnog.org www.curtin.edu.sg" ;;
     MY)     echo "www.um.edu.my www.ukm.my www.upm.edu.my www.usm.my www.utm.my www.taylors.edu.my www.sunway.edu.my" ;;
-    TH)     echo "www.chula.ac.th www.mahidol.ac.th www.ku.ac.th www.tu.ac.th www.cmu.ac.th www.kmutt.ac.th" ;;
-    VN)     echo "www.hust.edu.vn www.vnu.edu.vn www.hcmus.edu.vn www.ueh.edu.vn www.fpt.edu.vn" ;;
+    TH)     echo "www.mahidol.ac.th www.ku.ac.th www.tu.ac.th www.cmu.ac.th www.kmutt.ac.th" ;;
+    VN)     echo "www.hust.edu.vn www.vnu.edu.vn www.hcmus.edu.vn www.ueh.edu.vn" ;;
     ID)     echo "www.ui.ac.id www.itb.ac.id www.ugm.ac.id www.binus.ac.id www.its.ac.id www.unair.ac.id" ;;
-    PH)     echo "www.up.edu.ph www.ateneo.edu www.dlsu.edu.ph www.ust.edu.ph www.mapua.edu.ph" ;;
+    PH)     echo "www.pup.edu.ph www.upd.edu.ph www.feu.edu.ph" ;;
     IN)     echo "www.iitb.ac.in www.iitd.ac.in www.iitm.ac.in www.iisc.ac.in www.iitk.ac.in www.du.ac.in www.jnu.ac.in www.bits-pilani.ac.in www.amity.edu" ;;
-    AU)     echo "www.sydney.edu.au www.unsw.edu.au www.uts.edu.au www.mq.edu.au www.unimelb.edu.au www.monash.edu www.rmit.edu.au www.deakin.edu.au www.anu.edu.au www.uq.edu.au www.qut.edu.au www.adelaide.edu.au www.uwa.edu.au www.griffith.edu.au" ;;
-    NZ)     echo "www.auckland.ac.nz www.aut.ac.nz www.otago.ac.nz www.canterbury.ac.nz www.wgtn.ac.nz www.massey.ac.nz www.waikato.ac.nz" ;;
-    DE)     echo "www.tum.de www.lmu.de www.uni-heidelberg.de www.fu-berlin.de www.hu-berlin.de www.tu-berlin.de www.kit.edu www.rwth-aachen.de www.uni-frankfurt.de www.goethe-university-frankfurt.de www.tu-darmstadt.de www.uni-mainz.de www.uni-koeln.de www.uni-bonn.de www.uni-hamburg.de www.uni-stuttgart.de www.tu-dresden.de www.uni-muenster.de www.uni-freiburg.de www.uni-goettingen.de" ;;
-    NL)     echo "www.uva.nl www.vu.nl www.tudelft.nl www.uu.nl www.universiteitleiden.nl www.rug.nl www.ru.nl www.tue.nl www.utwente.nl www.eur.nl www.maastrichtuniversity.nl www.wur.nl www.tilburguniversity.edu" ;;
-    GB)     echo "www.ucl.ac.uk www.imperial.ac.uk www.kcl.ac.uk www.lse.ac.uk www.qmul.ac.uk www.city.ac.uk www.westminster.ac.uk www.gre.ac.uk www.ox.ac.uk www.cam.ac.uk www.ed.ac.uk www.gla.ac.uk www.manchester.ac.uk www.leeds.ac.uk www.sheffield.ac.uk www.bristol.ac.uk www.birmingham.ac.uk www.nottingham.ac.uk www.warwick.ac.uk www.soton.ac.uk" ;;
-    FR)     echo "www.sorbonne-universite.fr www.u-paris.fr www.universite-paris-saclay.fr www.psl.eu www.ens.psl.eu www.polytechnique.edu www.sciencespo.fr www.univ-lyon1.fr www.univ-grenoble-alpes.fr www.unistra.fr www.univ-amu.fr www.u-bordeaux.fr www.univ-lille.fr www.univ-tlse3.fr www.insa-lyon.fr www.centralesupelec.fr" ;;
-    IE)     echo "www.tcd.ie www.ucd.ie www.dcu.ie www.tudublin.ie www.universityofgalway.ie www.ucc.ie www.ul.ie" ;;
-    BE)     echo "www.kuleuven.be www.ugent.be www.uantwerpen.be www.ulb.be www.uclouvain.be www.vub.be www.uliege.be" ;;
-    CH)     echo "www.ethz.ch www.epfl.ch www.uzh.ch www.unibe.ch www.unibas.ch www.unige.ch www.unil.ch www.zhaw.ch" ;;
+    AU)     echo "www.rmit.edu.au www.anu.edu.au www.uq.edu.au" ;;
+    NZ)     echo "www.wgtn.ac.nz" ;;
+    DE)     echo "www.tum.de www.lmu.de www.uni-heidelberg.de www.fu-berlin.de www.hu-berlin.de www.tu-berlin.de www.kit.edu www.rwth-aachen.de www.goethe-university-frankfurt.de www.tu-darmstadt.de www.uni-mainz.de www.uni-koeln.de www.uni-bonn.de www.uni-hamburg.de www.tu-dresden.de www.uni-muenster.de www.uni-goettingen.de" ;;
+    NL)     echo "www.uva.nl www.vu.nl www.uu.nl www.universiteitleiden.nl www.rug.nl www.ru.nl www.utwente.nl www.eur.nl www.maastrichtuniversity.nl" ;;
+    GB)     echo "www.imperial.ac.uk www.kcl.ac.uk www.lse.ac.uk www.gre.ac.uk www.gla.ac.uk www.leeds.ac.uk www.sheffield.ac.uk www.bristol.ac.uk www.birmingham.ac.uk www.nottingham.ac.uk www.warwick.ac.uk www.soton.ac.uk" ;;
+    FR)     echo "www.u-paris.fr www.universite-paris-saclay.fr www.psl.eu www.ens.psl.eu www.polytechnique.edu www.sciencespo.fr www.univ-lyon1.fr www.univ-grenoble-alpes.fr www.unistra.fr www.univ-amu.fr www.u-bordeaux.fr www.univ-lille.fr www.univ-tlse3.fr www.insa-lyon.fr www.centralesupelec.fr" ;;
+    IE)     echo "www.tudublin.ie www.ucc.ie" ;;
+    BE)     echo "www.kuleuven.be www.uantwerpen.be www.ulb.be www.uclouvain.be www.vub.be www.uliege.be" ;;
+    CH)     echo "www.ethz.ch www.uzh.ch www.unibe.ch www.unibas.ch www.unige.ch www.unil.ch www.zhaw.ch" ;;
     AT)     echo "www.univie.ac.at www.tuwien.at www.meduniwien.ac.at www.uibk.ac.at www.tugraz.at www.uni-graz.at www.jku.at" ;;
-    IT)     echo "www.unimi.it www.polimi.it www.unibocconi.it www.uniroma1.it www.unibo.it www.unipd.it www.unito.it www.polito.it www.unina.it www.unifi.it" ;;
-    ES)     echo "www.uam.es www.ucm.es www.upm.es www.uc3m.es www.ub.edu www.uab.cat www.upc.edu www.upf.edu www.uv.es www.us.es" ;;
+    IT)     echo "www.polimi.it www.uniroma1.it www.unibo.it www.polito.it www.unina.it" ;;
+    ES)     echo "www.uam.es www.ucm.es www.upm.es www.uc3m.es www.ub.edu www.uab.cat www.upc.edu www.uv.es www.us.es" ;;
     PL)     echo "www.uw.edu.pl www.pw.edu.pl www.uj.edu.pl www.agh.edu.pl www.put.poznan.pl www.pwr.edu.pl www.umk.pl" ;;
-    SE)     echo "www.kth.se www.su.se www.ki.se www.uu.se www.lu.se www.chalmers.se www.gu.se www.liu.se" ;;
-    FI)     echo "www.helsinki.fi www.aalto.fi www.tuni.fi www.utu.fi www.oulu.fi www.jyu.fi" ;;
+    SE)     echo "www.kth.se www.su.se www.ki.se www.uu.se www.lu.se www.gu.se www.liu.se" ;;
+    FI)     echo "www.tuni.fi www.utu.fi www.oulu.fi www.jyu.fi" ;;
     NO)     echo "www.uio.no www.ntnu.no www.uib.no www.oslomet.no www.uit.no" ;;
-    DK)     echo "www.ku.dk www.dtu.dk www.au.dk www.sdu.dk www.aau.dk www.cbs.dk" ;;
+    DK)     echo "www.dtu.dk www.sdu.dk www.aau.dk www.cbs.dk" ;;
     CZ)     echo "www.cuni.cz www.cvut.cz www.muni.cz www.vutbr.cz www.vse.cz" ;;
     RU)     echo "www.msu.ru www.hse.ru www.spbu.ru www.itmo.ru www.mipt.ru www.bmstu.ru" ;;
-    TR)     echo "www.boun.edu.tr www.metu.edu.tr www.itu.edu.tr www.bilkent.edu.tr www.sabanciuniv.edu www.ku.edu.tr" ;;
-    AE)     echo "www.uaeu.ac.ae www.ku.ac.ae www.aus.edu www.zu.ac.ae www.hct.ac.ae" ;;
+    TR)     echo "www.boun.edu.tr www.metu.edu.tr www.itu.edu.tr www.bilkent.edu.tr www.sabanciuniv.edu" ;;
+    AE)     echo "www.uaeu.ac.ae www.ku.ac.ae www.zu.ac.ae www.hct.ac.ae" ;;
     IL)     echo "www.tau.ac.il www.huji.ac.il www.technion.ac.il www.weizmann.ac.il www.bgu.ac.il" ;;
-    ZA)     echo "www.uct.ac.za www.wits.ac.za www.up.ac.za www.sun.ac.za www.uj.ac.za" ;;
+    ZA)     echo "www.wits.ac.za www.sun.ac.za" ;;
     *)      echo "" ;;
   esac
 }
@@ -878,21 +880,64 @@ in_cf_v6() {
   return 1
 }
 
-# 目标是否支持后量子密钥交换 X25519MLKEM768（新版 Xray 客户端的 uTLS 指纹默认携带；
-# 目标不支持时 REALITY 握手会失败："handshake did not complete successfully"）。
-# 用已安装的 xray 自带的 `xray tls ping` 检测；返回 0=支持 1=明确不支持 2=无法判断（xray 未安装/网络失败，放行）
+# 根据响应头识别 CDN / WAF（$1 = curl -D 保存的响应头文件，可含多次跳转）。
+# 命中时输出 CDN 名称并返回 0。只用 tr + grep -iE，兼容 busybox（Alpine / NAT 模式）。
+SNI_CDN_RULES=(
+  'Cloudflare|^(server:[[:space:]]*cloudflare|cf-ray:|cf-cache-status:|cf-mitigated:)'
+  'Imperva/Incapsula|^(x-iinfo:|x-cdn:[[:space:]]*(imperva|incapsula)|set-cookie:.*(incap_ses|visid_incap))'
+  'Fastly|^(x-served-by:.*cache-|x-fastly-|fastly-|via:.*varnish)'
+  'Akamai|^(server:[[:space:]]*akamai|x-akamai-|akamai-)'
+  'CloudFront|^(via:.*cloudfront|x-amz-cf-|x-cache:.*cloudfront)'
+  'Azure Front Door|^(x-azure-ref|x-msedge-ref)'
+  'Sucuri|^(server:[[:space:]]*sucuri|x-sucuri-)'
+  'BunnyCDN|^(server:[[:space:]]*bunnycdn|cdn-pullzone:)'
+)
+sni_cdn_detect() { # $1 响应头文件
+  [[ -s $1 ]] || return 1
+  local h rule
+  h=$(tr -d '\r' <"$1" 2>/dev/null) || return 1
+  for rule in "${SNI_CDN_RULES[@]}"; do
+    if printf '%s\n' "$h" | grep -qiE "${rule#*|}"; then echo "${rule%%|*}"; return 0; fi
+  done
+  return 1
+}
+
+# 目标是否支持后量子密钥交换 X25519MLKEM768（新版 Xray 客户端的 uTLS 指纹默认携带）。
+# 这是「优先」条件而非硬性要求：支持的目标排在前面；不支持的目标只给出警告，仍可使用。
+# 用已安装的 xray 自带的 `xray tls ping` 检测；返回 0=支持 1=明确不支持 2=无法判断（xray 未安装/网络失败）
+# 同时记录证书链总长度到全局 SNI_CHAIN_LEN（ML-DSA-65 需要 ≥ 3500 字节，见 mldsa_decide）。
+SNI_CHAIN_LEN=""
 sni_pq_check() { # $1 域名 [$2 IP]
+  SNI_CHAIN_LEN=""
   [[ -x $XRAY_BIN ]] || return 2
   local out pq
   out=$(timeout 12 "$XRAY_BIN" tls ping ${2:+-ip "$2"} "$1" 2>&1) || true
+  SNI_CHAIN_LEN=$(awk '/Pinging with SNI/{f=1} f && /total length:/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/){print $i; exit}}' <<<"$out")
   pq=$(awk '/Pinging with SNI/{f=1} f && /Post-Quantum key exchange:/{print; exit}' <<<"$out")
   [[ -n $pq ]] || return 2
   [[ $pq == *true* ]] && return 0
   return 1
 }
 
+# ML-DSA-65 (pqv) 要求目标证书链总长度 ≥ 3500 字节，否则服务端 REALITY 握手失败（所有客户端都连不上，
+# 与客户端是否填写 pqv 无关）。按当前 SNI 决定是否启用：不满足时仅对该目标关闭 pqv，REALITY 本身照常。
+MLDSA_MIN_CHAIN=3500
+mldsa_decide() {
+  MLDSA_ON=1
+  [[ -n $MLDSA_SEED && -n $SNI ]] || return 0
+  sni_pq_check "$SNI" || true
+  if [[ $SNI_CHAIN_LEN =~ ^[0-9]+$ ]] && (( SNI_CHAIN_LEN < MLDSA_MIN_CHAIN )); then
+    MLDSA_ON=0
+    warn "目标 ${SNI} 证书链总长度 ${SNI_CHAIN_LEN} 字节 < ${MLDSA_MIN_CHAIN}，无法使用 ML-DSA-65 后量子签名，已对该目标关闭 pqv（REALITY 本身不受影响）。"
+  fi
+  return 0
+}
+# 当前是否在链接 / 配置中使用 pqv
+pqv_active() { [[ -n $MLDSA_VERIFY && -n $MLDSA_SEED && ${MLDSA_ON:-1} != 0 ]]; }
+
 # 探测单个候选域名。输出一行:
-#   PASS|域名|TCP延迟ms|TLS握手完成ms|IP|国家|城市|ASN
+#   PASS|域名|TCP延迟ms|TLS握手完成ms|IP|国家|城市|ASN|PQ|证书链长度
+#   （PQ: Y=支持 X25519MLKEM768 N=不支持 ?=无法判断；证书链长度 ≥ 3500 才能启用 ML-DSA-65 pqv，?=无法判断）
 #   FAIL|域名|原因
 sni_probe() {
   local host=${1,,} ip4s ip6s ip first out hdr w ver tconn tapp code best=999999 tls_ms geo cc="" city="" org=""
@@ -917,19 +962,23 @@ sni_probe() {
   grep -q 'TLSv1.3' <<<"$out" || { echo "FAIL|$host|不支持 TLS1.3 / X25519"; return; }
   grep -q 'ALPN protocol: h2' <<<"$out" || { echo "FAIL|$host|不支持 ALPN h2"; return; }
   grep -q 'Verify return code: 0 (ok)' <<<"$out" || { echo "FAIL|$host|证书链/域名校验失败"; return; }
-  local pqrc=0
-  sni_pq_check "$host" "$first" || pqrc=$?
-  (( pqrc == 1 )) && { echo "FAIL|$host|不支持后量子密钥交换 X25519MLKEM768（新版 Xray 客户端 REALITY 握手会失败）"; return; }
 
   hdr=$(mktemp)
   w=$(curl "-${IPFAM}" -sS -o /dev/null -D "$hdr" --http2 -L --max-redirs 3 --connect-timeout 5 -m 15 -A "$UA" \
         -w '%{http_version} %{time_connect} %{time_appconnect} %{http_code}' "https://${host}/" 2>/dev/null) || true
   read -r ver tconn tapp code <<<"$w"
   if [[ -z $code || $code == 000 ]]; then rm -f "$hdr"; echo "FAIL|$host|HTTPS 请求失败"; return; fi
-  if grep -qiE '^(server:[[:space:]]*cloudflare|cf-ray:)' "$hdr"; then rm -f "$hdr"; echo "FAIL|$host|响应头显示使用 Cloudflare"; return; fi
+  local cdn=""
+  cdn=$(sni_cdn_detect "$hdr") || cdn=""
+  if [[ -n $cdn ]]; then rm -f "$hdr"; echo "FAIL|$host|响应头显示使用 CDN/WAF（${cdn}）"; return; fi
   if ! grep -qi '^strict-transport-security:' "$hdr"; then rm -f "$hdr"; echo "FAIL|$host|无 HSTS 响应头"; return; fi
   rm -f "$hdr"
   [[ $ver == 2 ]] || { echo "FAIL|$host|HTTP/2 协商失败 (HTTP/$ver)"; return; }
+
+  # 后量子 X25519MLKEM768：仅作排序偏好，不再因此淘汰
+  local pqrc=0 pq="?"
+  sni_pq_check "$host" "$first" || pqrc=$?
+  case $pqrc in 0) pq=Y ;; 1) pq=N ;; esac
 
   # 延迟：TCP 建连 (≈1 RTT) 与 TLS 握手完成时间，各取 3 次中的最小值
   local i best_tls=999999 t_ms a_ms
@@ -953,7 +1002,7 @@ sni_probe() {
     city=$(jq -r '.city // ""' <<<"$geo" 2>/dev/null) || city=""
     org=$(jq -r '.org // ""' <<<"$geo" 2>/dev/null | tr '|' ' ') || org=""
   fi
-  echo "PASS|$host|$best|$tls_ms|$first|$cc|$city|$org"
+  echo "PASS|$host|$best|$tls_ms|$first|$cc|$city|$org|$pq|${SNI_CHAIN_LEN:-?}"
 }
 
 # NAT 模式（小内存）降低并发并减少候选数量
@@ -979,18 +1028,29 @@ sni_test_list() {
   cat "${dir}"/*.res 2>/dev/null >"$outfile" || : >"$outfile"
 }
 
-# 排序：同国家优先，其次延迟
+# 排序：同国家优先，其次支持 X25519MLKEM768 优先（Y > ? > N），再证书链 ≥ 3500（可用 pqv）优先，最后按 TLS 握手 / TCP 延迟
 sni_sorted_pass() { # $1 结果文件
-  awk -F'|' -v cc="$GEO_CC" '$1=="PASS"{s=($6==cc || cc=="")?0:1; print s"|"$0}' "$1" | sort -t'|' -k1,1n -k5,5n -k4,4n | cut -d'|' -f2-
+  awk -F'|' -v cc="$GEO_CC" -v min="$MLDSA_MIN_CHAIN" '$1=="PASS"{s=($6==cc || cc=="")?0:1; p=($9=="Y")?0:(($9=="N")?2:1)
+      c=($10 ~ /^[0-9]+$/ && $10+0 < min+0)?1:0; print s"|"p"|"c"|"$0}' "$1" |
+    sort -t'|' -k1,1n -k2,2n -k3,3n -k7,7n -k6,6n | cut -d'|' -f4-
+}
+# PQ 字段显示文字
+sni_pq_label() { case $1 in Y) echo "支持" ;; N) echo "不支持" ;; *) echo "未知" ;; esac; }
+# 选定的 SNI 不支持 X25519MLKEM768 时的提示（$1 域名 $2 PQ 字段）
+sni_pq_warn() {
+  [[ $2 == N ]] || return 0
+  warn "${1} 不支持后量子密钥交换 X25519MLKEM768：其余检测均通过，REALITY 可正常使用，只是没有后量子密钥交换保护。"
+  warn "  以后可用 proxy sni 换成支持 MLKEM 的目标（安装后的 REALITY 自检会验证实际可用性）。"
 }
 
 sni_print_table() { # $1 = 已排序 PASS 列表文件, $2 = 显示条数
-  local i=0 line host rtt tls ip cc city org
-  printf '  %-4s %-30s %-9s %-9s %-16s %s\n' "No." "Domain(域名)" "TCP-RTT" "TLS-HS" "IP" "位置 / ASN"
-  while IFS='|' read -r _ host rtt tls ip cc city org; do
+  local i=0 line host rtt tls ip cc city org pq chain
+  printf '  %-4s %-30s %-9s %-9s %-6s %-6s %-16s %s\n' "No." "Domain(域名)" "TCP-RTT" "TLS-HS" "MLKEM" "Chain" "IP" "位置 / ASN"
+  while IFS='|' read -r _ host rtt tls ip cc city org pq chain; do
     i=$((i + 1)); (( i > $2 )) && break
-    local mark=""; [[ -n $GEO_CC && $cc != "$GEO_CC" ]] && mark="${C_YELLOW}(异国)${C_NONE}"
-    printf '  %-4s %-30s %-9s %-9s %-16s %s %s %s\n' "$i)" "$host" "${rtt}ms" "${tls}ms" "$ip" "${cc}/${city}" "${org:0:28}" "$mark"
+    local mark=""; [[ -n $GEO_CC && -n $cc && $cc != "$GEO_CC" ]] && mark="${C_YELLOW}(异国)${C_NONE}"
+    local pqm="?"; [[ $pq == Y ]] && pqm="yes"; [[ $pq == N ]] && pqm="no"
+    printf '  %-4s %-30s %-9s %-9s %-6s %-6s %-16s %s %s %s\n' "$i)" "$host" "${rtt}ms" "${tls}ms" "$pqm" "${chain:-?}" "$ip" "${cc}/${city}" "${org:0:28}" "$mark"
   done <"$1"
 }
 
@@ -1035,7 +1095,9 @@ select_sni() {
     load_cf_ranges
     local r; r=$( ( trap - ERR; set +e; sni_probe "$OPT_SNI" ) )
     if [[ $r == PASS* ]]; then
-      SNI=${OPT_SNI,,}; ok "SNI ${SNI} 通过检测（TLS 握手 $(cut -d'|' -f4 <<<"$r")ms）。"; return 0
+      SNI=${OPT_SNI,,}; ok "SNI ${SNI} 通过检测（TLS 握手 $(cut -d'|' -f4 <<<"$r")ms，X25519MLKEM768: $(sni_pq_label "$(cut -d'|' -f9 <<<"$r")")）。"
+      sni_pq_warn "$SNI" "$(cut -d'|' -f9 <<<"$r")"
+      return 0
     fi
     warn "SNI ${OPT_SNI} 未通过检测：$(cut -d'|' -f3 <<<"$r")"
     if (( OPT_FORCE_SNI )); then warn "已指定 --force-sni，仍然使用。"; SNI=${OPT_SNI,,}; return 0; fi
@@ -1051,7 +1113,7 @@ select_sni() {
     info "NAT 精简模式：每个地区最多测试 12 个候选，并发 3。"
   fi
   info "VPS 位置: ${GEO_CC:-未知} ${GEO_REGION} ${GEO_CITY}  ${GEO_ORG}"
-  info "筛选规则: 同地区 · TLS1.3+X25519 · X25519MLKEM768 · ALPN h2 · HSTS · 证书有效 · 非 Cloudflare · 非大厂/被墙域名"
+  info "筛选规则: 同地区 · TLS1.3+X25519 · ALPN h2 · HSTS · 证书有效 · 非 CDN/WAF · 非大厂/被墙域名（支持 X25519MLKEM768 者优先）"
 
   if (( OPT_SCAN )); then
     local scanned="${TMP_DIR}/scan.list"
@@ -1089,17 +1151,26 @@ select_sni() {
     die "未选择 SNI。"
   fi
   echo
-  _green "通过检测的候选（按 同国家优先 + TLS 握手延迟 排序）："
+  _green "通过检测的候选（按 同国家优先 + 支持 MLKEM 优先 + TLS 握手延迟 排序）："
   sni_print_table "$sorted" 8
   local fails; fails=$(grep -c '^FAIL' "$res" || true)
   printf '  （另有 %s 个候选未通过，已排除）\n\n' "$fails"
+  if ! cut -d'|' -f9 "$sorted" | grep -q '^Y$'; then
+    warn "通过检测的候选均不支持（或无法确认支持）X25519MLKEM768，已放宽为偏好条件，仍从中选择。"
+  fi
   local best; best=$(head -n1 "$sorted" | cut -d'|' -f2)
-  if (( OPT_AUTO )); then SNI=$best; ok "自动选择: ${SNI}"; return 0; fi
+  if (( OPT_AUTO )); then
+    SNI=$best; ok "自动选择: ${SNI}"
+    sni_pq_warn "$SNI" "$(head -n1 "$sorted" | cut -d'|' -f9)"
+    return 0
+  fi
   local choice
   while :; do
     ask choice "请选择序号，或输入 m 手动填写域名" "1"
     if [[ $choice =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= npass && choice <= 8 )); then
-      SNI=$(sed -n "${choice}p" "$sorted" | cut -d'|' -f2); break
+      SNI=$(sed -n "${choice}p" "$sorted" | cut -d'|' -f2)
+      sni_pq_warn "$SNI" "$(sed -n "${choice}p" "$sorted" | cut -d'|' -f9)"
+      break
     elif [[ $choice == [mM] ]]; then
       manual_sni && break
     else
@@ -1119,9 +1190,11 @@ manual_sni() {
     load_cf_ranges
     r=$( ( trap - ERR; set +e; sni_probe "$d" ) )
     if [[ $r == PASS* ]]; then
-      IFS='|' read -r _ _ _ rtt ip cc city org <<<"$r"
-      ok "${d} 通过检测：TLS 握手 ${rtt}ms，IP ${ip} (${cc} ${city} ${org})"
+      local pq
+      IFS='|' read -r _ _ _ rtt ip cc city org pq _ <<<"$r"
+      ok "${d} 通过检测：TLS 握手 ${rtt}ms，IP ${ip} (${cc} ${city} ${org})，X25519MLKEM768: $(sni_pq_label "$pq")"
       [[ -n $GEO_CC && $cc != "$GEO_CC" ]] && warn "该网站 IP 与 VPS 不在同一国家，不推荐。"
+      sni_pq_warn "$d" "$pq"
       SNI=$d; return 0
     fi
     warn "${d} 未通过检测：$(cut -d'|' -f3 <<<"$r")"
@@ -1516,14 +1589,15 @@ xray_clients_json() {
 # NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
 PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
 write_xray_config() {
-  local clients tmp
+  local clients tmp seed=""
   clients=$(xray_clients_json)
+  pqv_active && seed=$MLDSA_SEED
   mkdir -p "$(dirname "$XRAY_CONF")"
   tmp=$(mktemp "$(dirname "$XRAY_CONF")/.config.XXXXXX"); mv -f "$tmp" "${tmp}.json"; tmp="${tmp}.json"
   jq -n \
     --argjson port "$XRAY_PORT" --argjson clients "$clients" \
     --arg target "${SNI_TARGET:-$SNI:443}" --arg sni "$SNI" \
-    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$MLDSA_SEED" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" '
+    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$seed" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" '
   {
     log: ({loglevel: "warning"} + (if $nat == 1 then {access: "none"} else {} end)),
     inbounds: [{
@@ -2071,7 +2145,7 @@ vless_link() { # $1 uuid $2 名称 $3 是否包含 pqv(1/0)
   local addr q
   addr=$(host_fmt "$(server_addr)")
   q="encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}"
-  [[ ${3:-1} == 1 && -n $MLDSA_VERIFY ]] && q+="&pqv=${MLDSA_VERIFY}"
+  [[ ${3:-1} == 1 ]] && pqv_active && q+="&pqv=${MLDSA_VERIFY}"
   q+="&type=tcp&headerType=none"
   printf 'vless://%s@%s:%s?%s#%s' "$1" "$addr" "$(pub_xray_port)" "$q" "$(urlencode "$2")"
 }
@@ -2174,11 +2248,12 @@ build_info() { # 输出完整信息（无颜色），用于保存文件
   echo "SNI:  ${SNI}    指纹(fp): chrome"
   echo "公钥(pbk): ${PUB_KEY}"
   echo "ShortId(sid): ${SHORT_ID}"
-  [[ -n $MLDSA_VERIFY ]] && echo "ML-DSA-65 验证公钥(pqv): 已包含在链接中（很长，可选，客户端不支持时可删除 &pqv=... 部分）"
+  if pqv_active; then echo "ML-DSA-65 验证公钥(pqv): 已包含在链接中（很长，可选，客户端不支持时可删除 &pqv=... 部分）"
+  elif [[ -n $MLDSA_VERIFY ]]; then echo "ML-DSA-65 (pqv): 已关闭（目标 ${SNI} 证书链不足 3500 字节）"; fi
   echo
-  echo "链接（含 pqv 后量子签名验证）:"
+  if pqv_active; then echo "链接（含 pqv 后量子签名验证）:"; else echo "链接:"; fi
   echo "$vl"
-  if [[ -n $MLDSA_VERIFY ]]; then
+  if pqv_active; then
     vl_short=$(vless_link "$UUID" "${NODE_NAME}-Reality" 0)
     echo
     echo "链接（不含 pqv，兼容性更好 / 二维码使用此链接）:"
@@ -2235,12 +2310,12 @@ show_info() {
   printf '  地址: %s  端口: %s  UUID: %s\n' "$(server_addr)" "$(pub_xray_port)" "$UUID"
   printf '  pbk: %s  sid: %s  fp: chrome\n' "$PUB_KEY" "$SHORT_ID"
   echo
-  _cyan "  链接（含 pqv）："
+  if pqv_active; then _cyan "  链接（含 pqv）："; else _cyan "  链接："; fi
   echo "$vl"
-  if [[ -n $MLDSA_VERIFY ]]; then
+  if pqv_active; then
     echo; _cyan "  链接（不含 pqv，兼容性更好）："; echo "$vl_qr"
   fi
-  echo; _cyan "  二维码（不含 pqv，pqv 太长无法放入终端二维码）："
+  if pqv_active; then echo; _cyan "  二维码（不含 pqv，pqv 太长无法放入终端二维码）："; else echo; _cyan "  二维码："; fi
   print_qr "$vl_qr"
   if (( HY2_ENABLED )); then
     local hy; hy=$(hy2_link)
@@ -2761,15 +2836,18 @@ do_install() {
   fi
   save_state
 
-  local pqrc=0
+  local pqrc=0 redo=n
   [[ -n $SNI && -z $OPT_SNI ]] && { sni_pq_check "$SNI" || pqrc=$?; }
   if (( pqrc == 1 )); then
-    warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），新版 Xray 客户端会握手失败，重新优选。"
-    select_sni
-  elif [[ -z $SNI || -n $OPT_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新优选 SNI（当前: ${SNI}）？" n; }; then
+    # 不支持 MLKEM 只是偏好问题：给出警告，交互模式默认建议重新优选，自动模式保留原 SNI
+    warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），可继续使用，但建议优先选择支持 MLKEM 的目标。"
+    redo=y
+  fi
+  if [[ -z $SNI || -n $OPT_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新优选 SNI（当前: ${SNI}）？" "$redo"; }; then
     select_sni
   fi
   SNI_TARGET="${SNI}:443"
+  mldsa_decide
   save_state
 
   write_xray_config
@@ -2790,10 +2868,77 @@ do_install() {
   INSTALLED=1
   save_state
   self_install
+  ( trap - ERR; set +e; reality_selftest ) || true
   show_info
   cloud_fw_reminder
   echo
   _green "安装完成！客户端配置方法见 README；管理菜单：proxy"
+}
+
+# ============================================================
+#               REALITY 自检（安装 / 更换 SNI 后）
+# ============================================================
+# 用已安装的 xray 在 127.0.0.1 的随机端口起一个临时 socks 客户端，按生成的链接参数
+# （VLESS + Vision + REALITY + pqv）连接本机 127.0.0.1:XRAY_PORT，再经它访问外网。
+# 只打印结果，不影响安装；客户端限制 GOMEMLIMIT，128MB 小鸡也可运行。
+reality_selftest() {
+  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XRAY_PORT ]] || { warn "跳过 REALITY 自检（缺少 xray 或参数）。"; return 0; }
+  mktmp
+  local dir port="" i pid code="" url ok_url="" rc=1
+  dir=$(mktemp -d "${TMP_DIR}/selftest.XXXXXX") || { warn "跳过 REALITY 自检（无法创建临时目录）。"; return 0; }
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    port=$(( 20000 + RANDOM % 40000 ))
+    [[ $port == "$XRAY_PORT" || $port == "${HY2_PORT:-}" ]] && continue
+    port_in_use tcp "$port" || break
+  done
+  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$XRAY_PORT" --arg sni "$SNI" \
+      --arg pbk "$PUB_KEY" --arg sid "$SHORT_ID" --arg pqv "$(pqv_active && printf '%s' "$MLDSA_VERIFY")" '
+    {
+      log: {loglevel: "warning"},
+      inbounds: [{listen: "127.0.0.1", port: $sport, protocol: "socks", settings: {udp: false}}],
+      outbounds: [{
+        protocol: "vless",
+        settings: {vnext: [{address: "127.0.0.1", port: $port, users: [{id: $id, encryption: "none", flow: "xtls-rprx-vision"}]}]},
+        streamSettings: {network: "raw", security: "reality",
+          realitySettings: ({serverName: $sni, fingerprint: "chrome", publicKey: $pbk, shortId: $sid}
+            + (if $pqv != "" then {mldsa65Verify: $pqv} else {} end))}
+      }]
+    }' >"${dir}/client.json" 2>/dev/null; then
+    rm -rf "$dir"; warn "跳过 REALITY 自检（生成临时配置失败）。"; return 0
+  fi
+  chmod 600 "${dir}/client.json"
+  info "REALITY 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${XRAY_PORT}（SNI ${SNI}）..."
+  env GOMEMLIMIT=24MiB GOGC=50 "$XRAY_BIN" run -config "${dir}/client.json" >"${dir}/client.log" 2>&1 &
+  pid=$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    kill -0 "$pid" 2>/dev/null || break
+    port_in_use tcp "$port" && break
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    for url in "https://www.gstatic.com/generate_204" "https://cp.cloudflare.com/generate_204" "https://www.apple.com/library/test/success.html"; do
+      code=$(curl -s -o /dev/null --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" -w '%{http_code}' "$url" 2>/dev/null) || true
+      if [[ $code =~ ^[23][0-9][0-9]$ ]]; then rc=0 ok_url=$url; break; fi
+    done
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if (( rc == 0 )); then
+    local h=${ok_url#https://}; h=${h%%/*}
+    ok "REALITY 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
+  else
+    local direct=""
+    direct=$(curl -s -o /dev/null --connect-timeout 8 -m 12 -w '%{http_code}' "https://www.gstatic.com/generate_204" 2>/dev/null) || true
+    if [[ ! $direct =~ ^[23][0-9][0-9]$ ]]; then
+      warn "REALITY 自检无法判断：服务器本身访问外网失败（直连也不通），请稍后检查网络。"
+    else
+      warn "REALITY 自检未通过（本机直连外网正常，经节点失败）。可能原因：目标网站 ${SNI} 暂时不可达 / 握手不兼容，或 Xray 未正常运行。"
+      warn "  可查看: proxy status（Xray 日志），或更换 SNI: proxy sni"
+      grep -vi 'privatekey\|seed' "${dir}/client.log" 2>/dev/null | tail -n 3 | sed 's/^/    /' || true
+    fi
+  fi
+  rm -rf "$dir"
+  return 0
 }
 
 # ============================================================
@@ -2828,7 +2973,9 @@ menu_change_sni() {
   select_sni
   [[ $SNI == "$old" ]] && { info "SNI 未变化。"; return 0; }
   SNI_TARGET="${SNI}:443"
+  mldsa_decide
   apply_all
+  ( trap - ERR; set +e; reality_selftest ) || true
   ok "SNI 已由 ${old} 更换为 ${SNI}。客户端需要更新链接（Hysteria2 证书指纹也已变化）。"
   show_info
 }
@@ -2997,7 +3144,9 @@ menu_status() {
     fail2ban-client status sshd 2>/dev/null | sed 's/^/   /' || true
   fi
   echo
-  if (( NAT_MODE )); then
+  if (( NAT_MODE )) && [[ -z $HOP_RANGE ]]; then
+    echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   4) 实时跟踪 Xray 日志   0) 返回"
+  elif (( NAT_MODE )); then
     echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看端口跳跃规则   4) 实时跟踪 Xray 日志   0) 返回"
   else
     echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看防火墙规则   4) 实时跟踪 Xray 日志   0) 返回"
@@ -3006,7 +3155,7 @@ menu_status() {
   case $c in
     1) svc_logs xray 80 ;;
     2) svc_logs hysteria-server 80 ;;
-    3) if (( NAT_MODE )); then show_hop_rules
+    3) if (( NAT_MODE )); then if [[ -n $HOP_RANGE ]]; then show_hop_rules; fi
        else
          nft list table inet "$NFT_TABLE" 2>/dev/null || warn "未找到本脚本的防火墙表。"
          nft list table ip "${NFT_TABLE}_nat" 2>/dev/null || true
@@ -3047,12 +3196,16 @@ menu_nat() {
   echo; hr; _green "  NAT 信息 / 端口跳跃"; hr
   nat_status_lines
   hr
-  echo "  1) 修改公网地址 / 映射端口 / 端口跳跃   2) 重新加载端口跳跃规则   3) 查看端口跳跃规则   0) 返回"
+  if [[ -n $HOP_RANGE ]]; then
+    echo "  1) 修改公网地址 / 映射端口 / 端口跳跃   2) 重新加载端口跳跃规则   3) 查看端口跳跃规则   0) 返回"
+  else
+    echo "  1) 修改公网地址 / 映射端口 / 端口跳跃   2) 重新加载端口跳跃规则   0) 返回"
+  fi
   local c; ask c "请选择" "0"
   case $c in
     1) menu_change_ports_nat ;;
     2) apply_nat_hop; save_state; save_info ;;
-    3) show_hop_rules ;;
+    3) if [[ -n $HOP_RANGE ]]; then show_hop_rules; fi ;;
     *) return 0 ;;
   esac
 }

@@ -1,6 +1,6 @@
 # proxy 一键脚本 · VLESS-REALITY-Vision (ML-DSA-65) + Hysteria2
 
-> 当前版本：**v1.1.0**（新增 NAT 小鸡 / Alpine / OpenRC 模式，见下文「NAT 小鸡模式」）
+> 当前版本：**v1.1.1**（SNI 优选改进：X25519MLKEM768 改为优先项、识别更多 CDN/WAF、更新香港候选；安装后自动做 REALITY 自检，见文末「更新日志」）
 
 单文件 Bash 脚本，一键部署 **VLESS + REALITY + XTLS-Vision**（含后量子签名 ML-DSA-65）和 **Hysteria2**（端口跳跃 + 证书指纹固定），自动优选 REALITY 目标网站（SNI），自带 nftables 防火墙、fail2ban 与保守的网络调优。交互风格参考 [233boy/v2ray](https://github.com/233boy/v2ray)：数字菜单、彩色输出、安装后可用 `proxy` 命令管理。
 
@@ -68,12 +68,13 @@ NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239
 - **系统调优（保守，不换内核）**：内核 ≥ 4.9 启用 BBR + fq；TCP/UDP 缓冲区（满足 Hysteria2 建议的 16MB）、文件句柄上限；journald 日志上限 100M。配置写入 `/etc/sysctl.d/99-proxy-tune.conf`，卸载时删除。
 - **Xray（官方 XTLS/Xray-install 安装最新版）**：
   - VLESS + REALITY + `xtls-rprx-vision`，默认 TCP 443；
-  - 自动生成 UUID、x25519 密钥、ShortId（`openssl rand -hex 4`）、**ML-DSA-65**（服务端 `mldsa65Seed`，客户端链接 `pqv=`）；
+  - 自动生成 UUID、x25519 密钥、ShortId（`openssl rand -hex 4`）、**ML-DSA-65**（服务端 `mldsa65Seed`，客户端链接 `pqv=`）；ML-DSA-65 要求目标网站证书链总长度 ≥ 3500 字节，不满足时脚本会自动对该目标关闭 pqv（REALITY 本身照常可用）；
   - 客户端指纹 `fp=chrome`（实测 `randomized` 生成的随机 ClientHello 会被部分目标网站拒绝，导致 REALITY 握手失败）；
   - 每次写配置前先 `xray run -test` 校验，失败不会覆盖旧配置；
   - 以 `nobody` 运行，配置文件 `root:nogroup 640`，私钥/种子只保存在 `/root/.proxy-oneclick/state.env`（600），不会在屏幕上显示；
   - 屏蔽访问服务器内网（geoip:private）与 BT。
   - 官方脚本遇到 GitHub API 限流（403）时，会自动改为“指定最新版本号”重试。
+  - **安装后 REALITY 自检**：用已安装的 xray 在 127.0.0.1 随机端口起一个临时客户端，按生成的链接参数连接本机节点并访问外网，打印通过 / 未通过（不影响安装；更换 SNI 后也会自动自检）。临时客户端限制 `GOMEMLIMIT`，128MB 的 NAT 小鸡也能跑。
 - **REALITY 目标网站自动优选**（见下文「为什么 SNI 规则很重要」）。
 - **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。
 - **防火墙（nftables）**：独立表 `inet proxy_oneclick`，入站默认拒绝；放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、Xray/Hysteria2 端口及跳跃范围；检测到其它对外服务时会询问是否一并放行。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时询问是否停用（卸载时可恢复）。不会关闭 SELinux（写入文件后执行 `restorecon`）。
@@ -169,12 +170,13 @@ bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239.14.191
 
 REALITY 会把未通过认证的连接原样转发给「目标网站」，同时借用它的 TLS 特征。选错目标会让节点更容易被识别或者干脆不可用。脚本按以下规则在 **VPS 上实时检测** 每个候选：
 
-1. **与 VPS 同国家/地区（最好同城、同 ASN）**：一台洛杉矶 VPS 却“访问”东京网站，流量路径和延迟都不自然。候选列表按地区组织（例如洛杉矶 → www.usc.edu、www.ucla.edu…；俄亥俄 → www.case.edu、www.ohio.edu…；另有 JP / KR / HK / TW / SG / DE / NL / GB / FR / CA / AU 等数十个地区），不足时自动扩展到邻近地区；结果同国家优先，再按 TLS 握手延迟排序。
+1. **与 VPS 同国家/地区（最好同城、同 ASN）**：一台洛杉矶 VPS 却“访问”东京网站，流量路径和延迟都不自然。候选列表按地区组织（例如洛杉矶 → www.csun.edu、www.cpp.edu…；香港 → my.hkust.edu.hk、factsfigures.cuhk.edu.hk…；另有 JP / KR / TW / SG / DE / NL / GB / FR / CA / AU 等数十个地区），不足时自动扩展到邻近地区；结果同国家优先，其次支持 X25519MLKEM768 的优先，再按 TLS 握手延迟排序。
 2. **TLS 1.3 + X25519 + ALPN h2**：REALITY 要求目标支持 TLS 1.3；h2 是现代浏览器的常态，缺失会显得异常。
-   另外要求目标支持**后量子密钥交换 X25519MLKEM768**（用已安装的 `xray tls ping` 检测）：新版 Xray 客户端的指纹默认带它，目标不支持时 REALITY 握手会失败（服务端日志 `handshake did not complete successfully`）。重新运行脚本时若发现已保存的 SNI 不满足此条，会自动重新优选。
+   **后量子密钥交换 X25519MLKEM768 为优先项（不是硬性要求）**：用已安装的 `xray tls ping` 检测，支持的目标排在前面；若本地区没有支持的候选，仍会选用其余检测全部通过的目标，并给出一行警告（REALITY 可正常使用，只是没有后量子密钥交换保护）。`--sni` / 手动输入的域名同样只警告不拒绝。
+   **ML-DSA-65（pqv）需要目标证书链总长度 ≥ 3500 字节**（同样由 `xray tls ping` 检测，列表中的 Chain 列）：不满足时服务端带 `mldsa65Seed` 会导致所有客户端 REALITY 握手失败（`handshake did not complete successfully`），因此脚本会自动对该目标关闭 pqv；满足的目标排序时也会优先。
 3. **HSTS**：说明是认真维护 HTTPS 的正规网站。
 4. **证书链有效**（`openssl s_client -verify_return_error -verify_hostname`）。
-5. **不在 Cloudflare 后面**：解析 IP 对照 <https://www.cloudflare.com/ips-v4>、ips-v6，并检查 `server: cloudflare` / `cf-ray` 响应头。Cloudflare 站点被大量滥用做 REALITY 目标，且 CF 的 IP 与你的 VPS 明显不属于同一网络。
+5. **不在 CDN / WAF 后面**：解析 IP 对照 <https://www.cloudflare.com/ips-v4>、ips-v6，并按响应头识别 Cloudflare（`server: cloudflare`、`cf-ray`）、Imperva/Incapsula（`x-iinfo`、`x-cdn: Imperva`、`incap_ses` / `visid_incap` Cookie）、Fastly（`x-served-by: cache-…`、`x-fastly-*`、`via: … varnish`）、Akamai（`server: AkamaiGHost`、`x-akamai-*`）、CloudFront（`via: … cloudfront`、`x-amz-cf-*`）、Azure Front Door（`x-azure-ref`）以及 Sucuri、BunnyCDN。CDN 节点与你的 VPS 明显不属于同一网络，且这类站点被大量滥用做 REALITY 目标（只用 `tr` + `grep -iE`，Alpine / busybox 下同样可用）。
 6. **不是被墙网站或大厂默认域名**：google / yahoo / apple / microsoft / amazon / cloudflare / github / 各大社交平台等被列入黑名单（这些域名要么被墙，要么是所有人都在用的“默认值”，特征明显）；`.cn` 域名也会被排除。
 
 检测通过的候选会列出前几名（TCP 延迟、TLS 握手时间、IP 归属），默认选第一名，也可以手动输入域名（同样会检测，不合格时需二次确认）。高级选项 `--scan` 会下载官方 RealiTLScanner，对 VPS 附近 IP 做 60 秒低并发扫描，找出同机房的 TLS1.3 + h2 站点后再走同样的检测流程；扫描可能被少数服务商视为端口扫描，请自行权衡。
@@ -267,9 +269,24 @@ proxy uninstall --auto   # 免确认
 
 ## 已知限制
 
-- 候选 SNI 列表是人工整理的，网站配置会变化；脚本每次都会实测，但某些地区可能全部不合格，此时请手动输入或使用 `--scan`。
+- 候选 SNI 列表是人工整理的，网站配置会变化；脚本每次都会实测，但某些地区可能全部不合格，此时请手动输入或使用 `--scan`。SG / PH 本地自建（非 CDN）的站点很少，通常会扩大到邻近地区。
 - 在容器 / OpenVZ 等环境中 BBR、Swap 及部分 sysctl 可能无法生效（脚本会提示并继续）。
 - Hysteria2 目前只有一个共享密码，「用户管理」仅针对 VLESS。
 - NAT 模式下端口跳跃需要整段转发 + DNAT 能力；只有零散几条映射或容器里没有 nftables/iptables 时无法跳跃（此时只用主端口）。
 - NAT 模式 Hysteria2 的逗号多段 `mport`（如 `10003-10009,10011-10020`）并非所有客户端都支持；不支持时可只使用主端口。
 - 服务商映射如果只转发 TCP，Hysteria2 必须另配一个 UDP 映射端口（`--nat-no-share`）。
+
+---
+
+## 更新日志
+
+### v1.1.1
+- SNI 优选：X25519MLKEM768 由硬性要求改为**优先项**——支持的候选排前面；本地区没有支持的候选时仍选用其余检测全部通过的目标，并打印警告。`--sni`、手动输入、重新安装时的检查同样只警告不拒绝（重新安装的交互确认默认改为「重新优选」）。
+- 修复：ML-DSA-65 要求目标证书链总长度 ≥ 3500 字节，否则服务端 REALITY 握手全部失败（此前被误认为是 MLKEM 不兼容）。现在按所选 SNI 自动判断，不满足时对该目标关闭 pqv（链接不再带 `pqv=`），候选列表新增 Chain 列并优先证书链够长的目标。已安装用户执行 `proxy sni` 或重新安装即可自动判断。
+- CDN / WAF 识别：除 Cloudflare 外，按响应头拒绝 Imperva/Incapsula、Fastly、Akamai、CloudFront、Azure Front Door、Sucuri、BunnyCDN（兼容 busybox）。
+- 香港候选替换为 `my.hkust.edu.hk factsfigures.cuhk.edu.hk dsbs.cuhk.edu.hk rmda.cuhk.edu.hk`（原列表全部不合格；后两个 HSTS 仅 300 秒，排在最后）；其它地区剔除了实测走 CDN 的候选，SG / PH 改为少量自建站点，不足时扩展到邻近地区。
+- 安装 / 更换 SNI 后自动进行 REALITY 自检（本机临时客户端 → 127.0.0.1 节点 → 外网），只打印结果，不影响安装。
+- 端口跳跃未启用时，菜单中不再显示「查看端口跳跃规则」。
+
+### v1.1.0
+- 新增 NAT 小鸡 / Alpine / OpenRC 模式（`--nat`）。
