@@ -18,7 +18,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 readonly SCRIPT_URL="https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh"
 
@@ -404,6 +404,48 @@ install_deps() {
     done
   fi
   ok "依赖安装完成。"
+}
+
+# ---------- 时间同步（REALITY 对时间误差敏感，全新 DD 镜像常常没有时间同步服务） ----------
+TIME_SYNC_SVCS=(systemd-timesyncd chronyd chrony ntpsec ntp ntpd openntpd)
+time_sync_svc() { # 输出正在运行的时间同步服务名，没有则返回 1
+  local s
+  for s in "${TIME_SYNC_SVCS[@]}"; do svc_active "$s" && { printf '%s' "$s"; return 0; }; done
+  return 1
+}
+time_synced() { [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; }
+time_sync_status() { # 供状态页显示
+  local svc; svc=$(time_sync_svc) || svc=""
+  if time_synced; then printf '%s已同步%s%s' "$C_GREEN" "$C_NONE" "${svc:+（${svc}）}"
+  elif [[ -n $svc ]]; then printf '%s同步中/未同步%s（%s）' "$C_YELLOW" "$C_NONE" "$svc"
+  else printf '%s未启用时间同步服务%s（重新运行安装可自动配置）' "$C_RED" "$C_NONE"; fi
+}
+ensure_time_sync() {
+  step "时间同步（REALITY 需要准确的系统时间）"
+  local svc
+  if svc=$(time_sync_svc); then ok "时间同步服务已在运行：${svc}"; return 0; fi
+  if systemd-detect-virt -cq 2>/dev/null; then
+    info "容器环境，系统时间由宿主机管理，跳过。"; return 0
+  fi
+  info "未检测到时间同步服务，正在安装并启用 ..."
+  if [[ $PKG == apt ]]; then
+    if pkg_install systemd-timesyncd 2>/dev/null; then
+      systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+    fi
+    if ! time_sync_svc >/dev/null; then
+      info "systemd-timesyncd 不可用，改用 chrony ..."
+      if pkg_install chrony 2>/dev/null; then systemctl enable --now chrony >/dev/null 2>&1 || true; fi
+    fi
+  else
+    if pkg_install chrony 2>/dev/null; then systemctl enable --now chronyd >/dev/null 2>&1 || true; fi
+  fi
+  timedatectl set-ntp true >/dev/null 2>&1 || true
+  if svc=$(time_sync_svc); then
+    ok "已启用时间同步服务：${svc}（当前时间 $(date '+%F %T %Z')）"
+  else
+    warn "时间同步服务启用失败，请手动安装 chrony 或 systemd-timesyncd；系统时间误差过大会导致 REALITY 连接失败。"
+  fi
+  return 0
 }
 
 preflight() {
@@ -1580,6 +1622,7 @@ do_install() {
 
   pkg_update_upgrade
   install_deps
+  ensure_time_sync
   mktmp
   step "获取服务器信息"
   detect_ip; detect_geo; show_sysinfo
@@ -1791,6 +1834,7 @@ menu_status() {
   [[ -x $XRAY_BIN ]] && printf '  Xray 版本:      %s\n' "$("$XRAY_BIN" version | head -n1 | awk '{print $2}')"
   [[ -x $HY_BIN ]] && printf '  Hysteria2 版本: %s\n' "$("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
   printf '  拥塞控制:       %s / %s\n' "$(sysval net.ipv4.tcp_congestion_control)" "$(sysval net.core.default_qdisc)"
+  printf '  时间同步:       %s\n' "$(time_sync_status)"
   echo; _cyan "  监听端口："
   ss -Htlnp 2>/dev/null | awk '/xray/{print "   TCP "$4"  xray"}' || true
   ss -Hulnp 2>/dev/null | awk '/hysteria/{print "   UDP "$4"  hysteria"}' || true
@@ -1811,28 +1855,42 @@ menu_status() {
   esac
 }
 
+speed_try() { # $1 URL；成功时输出 "Mbps 已下载MB 秒数"，失败返回 1
+  local out rc=0 code size t
+  out=$(curl -4 -so /dev/null --connect-timeout 8 -m 20 -w '%{http_code} %{size_download} %{time_total}' "$1" 2>/dev/null) || rc=$?
+  read -r code size t <<<"$out"
+  # 必须是 HTTP 200；正常结束 (0) 或到达 20 秒上限 (28) 都可以，只要下载量 ≥ 10MB
+  [[ $code == 200 ]] || return 1
+  (( rc == 0 || rc == 28 )) || return 1
+  awk -v s="${size:-0}" -v t="${t:-0}" 'BEGIN{ if (s < 10000000 || t <= 0) exit 1; printf "%.1f %.0f %.1f", s*8/t/1000000, s/1000000, t }'
+}
+
 menu_speed() {
   load_state
   echo; hr; _green "  网络测速 / 延迟提示"; hr
   printf '  拥塞控制: %s   队列: %s\n' "$(sysval net.ipv4.tcp_congestion_control)" "$(sysval net.core.default_qdisc)"
   if [[ -n $SNI ]]; then
-    local w
-    w=$(curl -4 -so /dev/null --connect-timeout 5 -m 10 -w '%{time_connect} %{time_appconnect}' "https://${SNI}/" 2>/dev/null) || true
+    local w a="" b="" rc=0
+    w=$(curl -4 -so /dev/null --connect-timeout 5 -m 10 -w '%{time_connect} %{time_appconnect}' "https://${SNI}/" 2>/dev/null) || rc=$?
     read -r a b <<<"$w"
-    printf '  到 SNI 目标 %s：TCP %s ms，TLS 握手完成 %s ms（越低越好，建议 < 50ms）\n' "$SNI" \
-      "$(awk -v t="${a:-0}" 'BEGIN{printf "%d", t*1000}')" "$(awk -v t="${b:-0}" 'BEGIN{printf "%d", t*1000}')"
+    if (( rc == 0 )) && awk -v t="${b:-0}" 'BEGIN{exit !(t > 0)}'; then
+      printf '  到 SNI 目标 %s：TCP %s ms，TLS 握手完成 %s ms（越低越好，建议 < 50ms）\n' "$SNI" \
+        "$(awk -v t="${a:-0}" 'BEGIN{printf "%d", t*1000}')" "$(awk -v t="${b:-0}" 'BEGIN{printf "%d", t*1000}')"
+    else
+      printf '  到 SNI 目标 %s：%s测试失败%s（curl 退出码 %s，目标不可达或 TLS 握手失败）\n' "$SNI" "$C_RED" "$C_NONE" "$rc"
+    fi
   fi
-  info "下载测速（Cloudflare，100MB，最长 20 秒）..."
-  local sp="" u
-  for u in "https://speed.cloudflare.com/__down?bytes=100000000" "http://cachefly.cachefly.net/100mb.test" "https://proof.ovh.net/files/100Mb.dat"; do
-    sp=$(curl -4 -so /dev/null -m 20 -w '%{speed_download}' "$u" 2>/dev/null) || true
-    [[ -n $sp ]] && awk -v s="$sp" 'BEGIN{exit !(s > 0)}' && break
-    sp=""
+  info "下载测速（约 100MB，最长 20 秒；Cloudflare → CacheFly → OVH 依次尝试）..."
+  local res="" u mbps mb sec
+  for u in "https://speed.cloudflare.com/__down?bytes=99000000" "http://cachefly.cachefly.net/100mb.test" "https://proof.ovh.net/files/100Mb.dat"; do
+    res=$(speed_try "$u") && break
+    res=""
   done
-  if [[ -n $sp ]]; then
-    printf '  下载速度: %s Mbps（%s）\n' "$(awk -v s="$sp" 'BEGIN{printf "%.1f", s*8/1000000}')" "$(cut -d/ -f3 <<<"$u")"
+  if [[ -n $res ]]; then
+    read -r mbps mb sec <<<"$res"
+    printf '  下载速度: %s Mbps（%s，%s MB / %s 秒）\n' "$mbps" "$(cut -d/ -f3 <<<"$u")" "$mb" "$sec"
   else
-    warn "下载测速失败（测速站点不可达）。"
+    warn "下载测速失败（测速站点均不可达或被限制）。"
   fi
   cat <<TIP
 
@@ -1988,6 +2046,7 @@ proxy 一键脚本 v${SCRIPT_VERSION} —— VLESS + REALITY + Vision (ML-DSA-65
   proxy port          修改端口
   proxy user          用户管理
   proxy update        更新组件
+  proxy update-script 只更新本脚本
   proxy status        运行状态 / 日志
   proxy speed         测速 / 延迟提示
   proxy firewall      防火墙管理
