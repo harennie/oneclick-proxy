@@ -10,9 +10,14 @@
 # 推荐：先下载再运行（可以看到交互菜单）
 curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh
 
+# 没有 curl 时用 wget
+wget -O proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh
+
 # 全自动（全部使用默认值，无任何交互）
 curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh --auto
 ```
+
+> 最小化安装的 Debian（例如 bin456789/reinstall 重装的系统）可能 curl 和 wget 都没有，请先执行 `apt-get update && apt-get install -y curl`（RHEL 系：`dnf install -y curl`）。脚本运行后会自动安装其余依赖，包括时间同步服务。
 
 安装完成后输入 `proxy` 即可打开管理菜单，`proxy info` 随时查看链接 / 二维码 / Clash 配置。
 节点信息同时保存在 `/root/proxy-info.txt`（权限 600）。
@@ -42,7 +47,7 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 
 ## 功能
 
-- **环境预检**：必须 root；识别发行版与架构（amd64 / arm64）；显示 IP、城市、ASN、内存；内存 < 1G 且无 Swap 时自动加 1G Swap；自动更新系统并安装依赖（RHEL 系自动启用 EPEL）。
+- **环境预检**：必须 root；识别发行版与架构（amd64 / arm64）；显示 IP、城市、ASN、内存；内存 < 1G 且无 Swap 时自动加 1G Swap；自动更新系统并安装依赖（RHEL 系自动启用 EPEL）；未检测到时间同步服务时自动安装并启用 systemd-timesyncd / chrony（REALITY 要求系统时间准确）。
 - **系统调优（保守，不换内核）**：内核 ≥ 4.9 启用 BBR + fq；TCP/UDP 缓冲区（满足 Hysteria2 建议的 16MB）、文件句柄上限；journald 日志上限 100M。配置写入 `/etc/sysctl.d/99-proxy-tune.conf`，卸载时删除。
 - **Xray（官方 XTLS/Xray-install 安装最新版）**：
   - VLESS + REALITY + `xtls-rprx-vision`，默认 TCP 443；
@@ -146,8 +151,9 @@ proxy info          # 链接 / 二维码 / mihomo 配置
 proxy sni           # 重新优选或手动更换 SNI（Hysteria2 证书与指纹会同步更新）
 proxy user          # 添加 / 删除额外用户（UUID + 备注）
 proxy update        # 更新 Xray / Hysteria2 / 脚本
-proxy status        # 服务状态、日志、防火墙规则、fail2ban
-proxy speed         # BBR 状态、到 SNI 的延迟、下载测速
+proxy update-script # 只更新本脚本（proxy 命令）
+proxy status        # 服务状态、时间同步、日志、防火墙规则、fail2ban
+proxy speed         # BBR 状态、到 SNI 的延迟、下载测速（Cloudflare / CacheFly / OVH 自动切换）
 ```
 
 主要文件：
