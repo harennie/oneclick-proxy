@@ -6,6 +6,9 @@
 #   bash proxy.sh                 # 交互式菜单
 #   bash proxy.sh --auto          # 全部默认值自动安装
 #   bash proxy.sh --nat           # NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine）
+#   bash proxy.sh tune            # 网络调优（BBR / 队列算法 / 缓冲区；可单独使用，NAT/容器也可用）
+#   bash proxy.sh --land          # 落地机：只运行 Shadowsocks 2022（给中转机做出口，可设来源 IP 白名单）
+#   proxy land-add 'ss://...'     # 中转机：把出口切换到落地机
 #   bash proxy.sh --help          # 查看全部参数
 # 安装完成后可直接使用命令: proxy
 #
@@ -20,7 +23,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.1.2"
+readonly SCRIPT_VERSION="1.2.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -45,6 +48,12 @@ readonly SYSCTL_FILE="/etc/sysctl.d/99-proxy-tune.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-proxy-tune.conf"
 readonly SYSTEMD_LIMITS_FILE="/etc/systemd/system.conf.d/99-proxy-tune.conf"
 readonly JOURNALD_FILE="/etc/systemd/journald.conf.d/99-proxy-tune.conf"
+readonly TUNE_DIR="${STATE_DIR}/tune"
+readonly TUNE_BACKUP="${TUNE_DIR}/backup.env"
+readonly TUNE_CUR="${TUNE_DIR}/current.env"
+readonly TUNE_BOOT="${TUNE_DIR}/boot.sh"
+readonly TUNE_UNIT="/etc/systemd/system/proxy-oneclick-tune.service"
+readonly TUNE_RC="/etc/init.d/proxy-oneclick-tune"
 readonly F2B_JAIL="/etc/fail2ban/jail.d/99-proxy-sshd.local"
 readonly SCANNER_BIN="/usr/local/share/proxy-oneclick/RealiTLScanner"
 readonly XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
@@ -63,6 +72,10 @@ readonly HOP_SCRIPT="${STATE_DIR}/nat-hop.sh"
 readonly HOP_UNIT="/etc/systemd/system/proxy-oneclick-hop.service"
 readonly HOP_RC="/etc/init.d/proxy-oneclick-hop"
 readonly HOP_TABLE="proxy_oneclick_hop"
+readonly LAND_NFT_TABLE="proxy_oneclick_land"
+readonly LAND_FW_FILE="${STATE_DIR}/land-fw.nft"
+readonly LAND_FW_UNIT="/etc/systemd/system/proxy-oneclick-land-fw.service"
+readonly LAND_FW_RC="/etc/init.d/proxy-oneclick-land-fw"
 readonly RESOLV_BAK="${STATE_DIR}/resolv.conf.bak"
 # 公共 DNS64 服务器（nat64.net / Trex），仅在 IPv6-only 且用户同意时写入 /etc/resolv.conf
 readonly DNS64_SERVERS="2a00:1098:2b::1 2a00:1098:2c::1 2a01:4f8:c2c:123f::1"
@@ -78,7 +91,14 @@ OPT_HY2_PORT=""
 OPT_HOP=""          # "20000-50000" 或 "none"
 OPT_FIREWALL=1
 OPT_UPGRADE=""      # 空=默认（普通模式 1，NAT 模式 0）
-OPT_TUNE=""         # 空=默认（普通模式 1，NAT 模式 0）
+OPT_TUNE=""         # 空=默认（普通模式 1；NAT 模式 2 = 交互询问，--auto 时跳过）
+OPT_TUNE_ACT=""     # proxy tune 子命令: status | preview | apply | restore
+OPT_TUNE_PRESET=""  # bbr-fq | bbr-fq_codel | bbr-cake | cubic-fq_codel | keep | custom
+OPT_TUNE_BUF=""     # auto | small | medium | large | bdp
+OPT_TUNE_CC=""      # 自定义拥塞控制
+OPT_TUNE_QDISC=""   # 自定义队列算法
+OPT_TUNE_BW=""      # BDP：带宽 Mbps
+OPT_TUNE_RTT=""     # BDP：延迟 ms
 OPT_SCAN=0
 OPT_NAME=""
 OPT_ACTION=""
@@ -88,6 +108,13 @@ OPT_NAT_EXT=""      # 映射端口列表 --nat-ports（外部[:内部]，逗号�
 OPT_NAT_EXCLUDE=""  # 端口段内需要排除的外部端口（例如 SSH 映射）
 OPT_NAT_SHARE=""    # 1 = Reality(TCP) 与 Hy2(UDP) 共用一个外部端口；0 = 分开
 OPT_DNS64=0
+OPT_LAND=""         # 1 = 安装为落地机（Shadowsocks 2022）；0 = 改回节点模式；空 = 沿用
+OPT_LAND_METHOD=""  # 落地机加密方式 aes-128 | aes-256 | chacha20
+OPT_LAND_ALLOW=""   # 落地机来源 IP 白名单（逗号分隔，none 清空）
+OPT_LAND_LINK=""    # 中转机 land-add 的 ss:// 链接
+OPT_LAND_ACT=""     # 中转机落地转发子命令: add | on | off | del | test
+OPT_FORCE=0         # land-add 测试不通过也强制启用
+XRAY_LABEL=""       # 端口提示中的协议名（落地机为 Shadowsocks 2022）
 
 # 运行时变量（部分持久化到 STATE_FILE）
 OS_ID="" OS_VER="" OS_NAME="" PKG="" ARCH=""
@@ -302,12 +329,14 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED SSH_PORTS
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
-            HOP_BACKEND VIRT DNS64_SET)
+            HOP_BACKEND VIRT DNS64_SET
+            LAND_MODE LAND_METHOD LAND_KEY LAND_ALLOW RELAY_LINK RELAY_ON RELAY_SOCKS)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
 EXTRA_TCP="" EXTRA_UDP="" DISABLED_FW="" SWAP_CREATED=0 SERVER_ADDR=""
 NAT_MODE=0 NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE=""
 HOP_BACKEND="" VIRT="" DNS64_SET=0
+LAND_MODE=0 LAND_METHOD="2022-blake3-aes-128-gcm" LAND_KEY="" LAND_ALLOW="" RELAY_LINK="" RELAY_ON=0 RELAY_SOCKS=""
 
 load_state() {
   [[ -f $STATE_FILE ]] || return 0
@@ -409,10 +438,10 @@ detect_os() {
 alpine_check() {
   ver_ge "$OS_VER" "3.18" || refuse_os "Alpine ${OS_VER} 版本过旧，NAT 模式需要 Alpine 3.18 及以上。"
   [[ $INIT_SYS == openrc ]] || refuse_os "Alpine 未检测到 OpenRC（缺少 openrc-run / rc-service），请先执行: apk add openrc"
-  if (( ! NAT_MODE )); then
-    warn "Alpine（musl + OpenRC）只支持 NAT / 精简模式（--nat）：直接下载官方二进制、使用 OpenRC 服务、跳过调优/防火墙/fail2ban。"
+  if (( ! NAT_MODE && ! LAND_MODE )); then
+    warn "Alpine（musl + OpenRC）只支持 NAT / 精简模式（--nat）：直接下载官方二进制、使用 OpenRC 服务、跳过防火墙/fail2ban（网络调优可选）。"
     if [[ $OPT_NAT == 0 ]] || (( OPT_AUTO )) || ! confirm "是否以 NAT 模式继续安装？" y; then
-      printf '%s[错误]%s Alpine 请使用: bash proxy.sh --nat（自动安装: bash proxy.sh --nat --auto --nat-ports 公网端口[:内部端口]）\n' "$C_RED" "$C_NONE" >&2
+      printf '%s[错误]%s Alpine 请使用: bash proxy.sh --nat（自动安装: bash proxy.sh --nat --auto --nat-ports 公网端口[:内部端口]）；或落地机: bash proxy.sh --land\n' "$C_RED" "$C_NONE" >&2
       exit 1
     fi
     NAT_MODE=1
@@ -420,7 +449,7 @@ alpine_check() {
 }
 
 # 直接从 GitHub Releases 下载二进制（NAT 模式或 Alpine）
-direct_mode() { (( NAT_MODE )) || [[ $OS_ID == alpine ]]; }
+direct_mode() { (( NAT_MODE )) || (( ${LAND_MODE:-0} )) || [[ $OS_ID == alpine ]]; }
 
 # 虚拟化类型：kvm / lxc / openvz / docker / podman / none ...
 detect_virt() {
@@ -651,7 +680,7 @@ time_sync_status() { # 供状态页显示
   else printf '%s未启用时间同步服务%s（重新运行安装可自动配置）' "$C_RED" "$C_NONE"; fi
 }
 ensure_time_sync() {
-  step "时间同步（REALITY 需要准确的系统时间）"
+  step "时间同步（$( ((LAND_MODE)) && echo 'Shadowsocks 2022' || echo 'REALITY') 需要准确的系统时间）"
   local svc
   if svc=$(time_sync_svc); then ok "时间同步服务已在运行：${svc}"; return 0; fi
   [[ -n $VIRT ]] || detect_virt
@@ -698,60 +727,788 @@ pkg_bootstrap_curl() {
 }
 
 # ============================================================
-#                        系统调优
+#              网络调优（v1.2.0 起为独立功能：proxy tune）
 # ============================================================
+# 设计要点：
+#  · 先探测：虚拟化 / init / 内核 / 可用拥塞控制与队列算法 / 内存 / 每个参数是否真的可写
+#    （把当前值原样写回去测试，不靠猜；容器里很多参数只读或按网络命名空间隔离）
+#  · 预设只决定 拥塞控制 + 队列算法；缓冲区按内存自动分档（可覆盖，或按带宽×延迟计算 BDP）
+#  · 先预览（当前值 → 目标值），确认后只写可写的参数，跳过的逐条说明原因
+#  · 只维护一个文件 ${SYSCTL_FILE}；首次应用前备份原值，restore 可完整还原
+# 管理的参数（顺序与 v1.1.x 写入的文件一致，保证普通模式默认结果不变）
+TUNE_KEYS=(net.core.default_qdisc net.ipv4.tcp_congestion_control
+  net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default
+  net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min
+  net.core.netdev_max_backlog net.core.somaxconn net.ipv4.tcp_max_syn_backlog
+  net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_notsent_lowat
+  net.ipv4.tcp_fin_timeout net.ipv4.tcp_keepalive_time fs.file-max fs.nr_open vm.swappiness)
+# 全局（不按网络命名空间隔离）的参数：容器里即使可写，修改的也是宿主机，默认跳过
+TUNE_GLOBAL_KEYS=" net.core.default_qdisc net.core.netdev_max_backlog fs.file-max fs.nr_open vm.swappiness "
+TUNE_PRESETS=(bbr-fq bbr-fq_codel bbr-cake cubic-fq_codel keep custom)
+TUNE_QDISC_CAND=(fq fq_codel cake fq_pie sfq pfifo_fast)
+declare -A TUNE_NOW=() TUNE_ST=() TUNE_WANT=() TUNE_RES=()
+TUNE_DETECTED=0 TUNE_IFACE="" TUNE_MEM=0 TUNE_CC_AVAIL="" TUNE_QD_AVAIL="" TUNE_BBR_VER=""
+TUNE_PRESET="" TUNE_CC="" TUNE_QD="" TUNE_BUF="" TUNE_BUF_EFF="" TUNE_BDP_NOTE=""
+TUNE_NOCONFIRM=0 TUNE_COMPACT=0
+
+tcol() { # 按显示宽度补齐（中文等宽字符算 2 列）：tcol 文本 宽度
+  local s=$1 a; a=${s//[ -~]/}
+  local pad=$(( $2 - ${#s} - ${#a} )); (( pad > 0 )) || pad=0
+  printf '%s%*s' "$s" "$pad" ''
+}
+trow() { # trow 文本1 文本2 文本3 状态   （34/22/22 列）
+  printf '  %s %s %s %s\n' "$(tcol "$1" 34)" "$(tcol "$2" 22)" "$(tcol "$3" 22)" "$4"
+}
+tune_path() { printf '/proc/sys/%s' "${1//.//}"; }
+tune_get() { # 读取当前值（多个数字统一用单个空格分隔）
+  local f v=""; f=$(tune_path "$1")
+  [[ -r $f ]] || return 1
+  read -r v 2>/dev/null <"$f" || [[ -n $v ]] || return 1
+  v=${v//$'\t'/ }
+  while [[ $v == *'  '* ]]; do v=${v//'  '/ }; done
+  printf '%s' "$v"
+}
+tune_write() { local f; f=$(tune_path "$1"); { printf '%s\n' "$2" >"$f"; } 2>/dev/null; }
+tune_probe() { # 把当前值原样写回，判断是否可写：ok / ro / absent
+  local k=$1 f v
+  f=$(tune_path "$k")
+  if [[ ! -e $f ]]; then TUNE_ST[$k]=absent; TUNE_NOW[$k]="-"; return 0; fi
+  v=$(tune_get "$k") || v=""
+  TUNE_NOW[$k]=${v:--}
+  if [[ -n $v ]] && tune_write "$k" "$v"; then TUNE_ST[$k]=ok; else TUNE_ST[$k]=ro; fi
+  # 特权容器里全局参数可能可写，但改的是宿主机（影响所有容器），不碰
+  if [[ ${TUNE_ST[$k]} == ok && $TUNE_GLOBAL_KEYS == *" $k "* ]] && is_container; then TUNE_ST[$k]=host; fi
+  return 0
+}
+tune_skip_reason() { # $1 key
+  case ${TUNE_ST[$1]-} in
+    absent) if is_container; then echo "跳过：容器内不可见（宿主机控制）"; else echo "跳过：内核无此参数"; fi ;;
+    ro) if is_container; then echo "跳过：容器内只读（宿主机控制）"; else echo "跳过：只读（无权限）"; fi ;;
+    host) echo "跳过：全局参数，容器内修改会影响宿主机" ;;
+    *) echo "跳过" ;;
+  esac
+}
+tune_iface() {
+  local d
+  d=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}') || d=""
+  [[ -n $d ]] || d=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}') || d=""
+  printf '%s' "$d"
+}
+tune_root_qdisc() { # $1 网卡 → 根队列类型；多队列网卡输出 mq(子队列类型)
+  local out root child
+  if ! have tc || [[ -z $1 ]]; then printf '%s' "-"; return 0; fi
+  out=$(tc qdisc show dev "$1" 2>/dev/null) || out=""
+  root=$(awk '/ root /{print $2; exit}' <<<"$out") || root=""
+  if [[ $root == mq || $root == mqprio ]]; then
+    child=$(awk -v r="$root" '$2 != r && / parent / && !s[$2]++ {printf "%s%s", (n++ ? "," : ""), $2}' <<<"$out") || child=""
+    printf '%s(%s)' "$root" "${child:-?}"
+  else
+    printf '%s' "${root:--}"
+  fi
+}
+tune_iface_uses() { # $1 网卡 $2 队列算法：根队列（或 mq 的全部子队列）已是该算法
+  local r; r=$(tune_root_qdisc "$1")
+  [[ $r == "$2" || $r == "mq($2)" || $r == "mqprio($2)" ]]
+}
+tune_qdisc_ok() { # 队列算法是否可用（已加载 / 内置 / 可加载 / 实测）
+  local q=$1 mdir
+  [[ $q == pfifo_fast ]] && return 0
+  [[ -d /sys/module/sch_$q ]] && return 0
+  mdir="/lib/modules/$(uname -r)"
+  [[ -r $mdir/modules.builtin ]] && grep -q "/sch_${q}\.ko" "$mdir/modules.builtin" 2>/dev/null && return 0
+  if ! is_container && have modprobe && modprobe -nq "sch_${q}" 2>/dev/null; then return 0; fi
+  if have tc && tc qdisc show 2>/dev/null | grep -q "^qdisc ${q} "; then return 0; fi
+  # 最后在临时网络命名空间里实测（需要 unshare；容器里通常无权限，失败即视为不可用）
+  if have unshare && have tc && unshare -n sh -c "ip link set lo up 2>/dev/null; tc qdisc add dev lo root ${q}" >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+tune_cc_ok() { [[ " ${TUNE_CC_AVAIL} " == *" $1 "* ]]; }
+tune_qd_ok() { [[ " ${TUNE_QD_AVAIL} " == *" $1 "* ]]; }
+tune_bbr_label() {
+  tune_cc_ok bbr || { echo "不可用"; return 0; }
+  case $TUNE_BBR_VER in
+    3*) echo "可用（BBRv3，第三方内核如 XanMod）" ;;
+    2*) echo "可用（BBRv2，第三方内核）" ;;
+    *) echo "可用（BBRv1，主线内核）" ;;
+  esac
+}
+tune_detect() {
+  (( TUNE_DETECTED )) && return 0
+  [[ -n $INIT_SYS ]] || detect_init
+  detect_virt
+  TUNE_MEM=$(mem_limit_mb)
+  TUNE_IFACE=$(tune_iface)
+  TUNE_CC_AVAIL=$(tune_get net.ipv4.tcp_available_congestion_control) || TUNE_CC_AVAIL=""
+  # 主机（非容器）上 tcp_bbr 未加载但模块存在时也视为可用（应用时再加载）；容器内只能用宿主机已加载的
+  if ! tune_cc_ok bbr && ! is_container && have modprobe && kernel_ge 4.9 && modprobe -nq tcp_bbr 2>/dev/null; then
+    TUNE_CC_AVAIL+="${TUNE_CC_AVAIL:+ }bbr"
+  fi
+  TUNE_BBR_VER=""
+  if [[ -r /sys/module/tcp_bbr/version ]]; then TUNE_BBR_VER=$(cat /sys/module/tcp_bbr/version 2>/dev/null) || TUNE_BBR_VER=""
+  elif have modinfo; then TUNE_BBR_VER=$(modinfo -F version tcp_bbr 2>/dev/null) || TUNE_BBR_VER=""; fi
+  local q; TUNE_QD_AVAIL=""
+  for q in "${TUNE_QDISC_CAND[@]}"; do tune_qdisc_ok "$q" && TUNE_QD_AVAIL+="${TUNE_QD_AVAIL:+ }$q"; done
+  local k; for k in "${TUNE_KEYS[@]}"; do tune_probe "$k"; done
+  TUNE_DETECTED=1
+}
+tune_writable_count() { local k n=0; for k in "${TUNE_KEYS[@]}"; do [[ ${TUNE_ST[$k]} == ok ]] && n=$((n + 1)); done; echo "$n"; }
+
+tune_env_lines() {
+  printf '  内核:       %s（%s）\n' "$(uname -r)" "$(uname -m)"
+  printf '  虚拟化:     %s   init: %s   内存: %s MB\n' "${VIRT:-未知}" "${INIT_SYS:-未知}" "$TUNE_MEM"
+  printf '  拥塞控制:   当前 %s   可用: %s   BBR: %s\n' "${TUNE_NOW[net.ipv4.tcp_congestion_control]}" "${TUNE_CC_AVAIL:-未知}" "$(tune_bbr_label)"
+  printf '  队列算法:   默认 %s   网卡 %s: %s   可用: %s\n' "${TUNE_NOW[net.core.default_qdisc]}" "${TUNE_IFACE:-?}" "$(tune_root_qdisc "$TUNE_IFACE")" "${TUNE_QD_AVAIL:-未知}"
+  printf '  可写参数:   %s / %s%s\n' "$(tune_writable_count)" "${#TUNE_KEYS[@]}" "$(is_container && echo "（容器环境：只读/不可见的参数会自动跳过）")"
+}
+
+# ---------- 预设 / 缓冲区档位 ----------
+tune_preset_desc() {
+  case $1 in
+    bbr-fq) echo "BBR + fq（默认，推荐；fq 为 BBR 提供高效 pacing）" ;;
+    bbr-fq_codel) echo "BBR + fq_codel（内核 4.20+ 由 TCP 自身 pacing；兼顾本机多业务/路由场景）" ;;
+    bbr-cake) echo "BBR + cake（需内核支持 sch_cake；CPU 开销略高）" ;;
+    cubic-fq_codel) echo "保守：cubic + fq_codel（不启用 BBR，与多数发行版默认接近）" ;;
+    keep) echo "只调缓冲区/连接参数（不改拥塞控制与队列算法）" ;;
+    custom) echo "自定义：分别选择拥塞控制与队列算法" ;;
+  esac
+}
+tune_preset_cc_qd() { # $1 预设 → "cc qdisc"（keep 表示不修改）
+  case $1 in
+    bbr-fq) echo "bbr fq" ;;
+    bbr-fq_codel) echo "bbr fq_codel" ;;
+    bbr-cake) echo "bbr cake" ;;
+    cubic-fq_codel) echo "cubic fq_codel" ;;
+    custom) echo "${OPT_TUNE_CC:-keep} ${OPT_TUNE_QDISC:-keep}" ;;
+    *) echo "keep keep" ;;
+  esac
+}
+tune_preset_missing() { # 输出预设缺少的组件（为空表示可用）
+  local cc qd m=""
+  read -r cc qd <<<"$(tune_preset_cc_qd "$1")"
+  [[ $cc == keep ]] || tune_cc_ok "$cc" || m+="${m:+、}拥塞控制 ${cc}"
+  [[ $qd == keep ]] || tune_qd_ok "$qd" || m+="${m:+、}队列 ${qd}"
+  printf '%s' "$m"
+}
+tune_auto_buf() { # 按内存自动分档
+  if (( TUNE_MEM > 0 && TUNE_MEM <= 300 )); then echo small
+  elif (( TUNE_MEM >= 1800 )); then echo large
+  else echo medium; fi
+}
+tune_buf_desc() {
+  case $1 in
+    small) echo "小（≤256MB 级：TCP 缓冲区上限 4MB，UDP/QUIC 8MB）" ;;
+    medium) echo "中（TCP/UDP 缓冲区上限 16MB，与 v1.1.x 一致）" ;;
+    large) echo "大（≥2GB：缓冲区上限 64MB，适合高带宽长距离线路）" ;;
+    bdp) echo "按带宽×延迟计算（BDP）" ;;
+    auto) echo "自动（按内存）" ;;
+  esac
+}
+tune_set_buffers() { # $1 档位 small|medium|large ；BDP 在其基础上覆盖上限
+  local p=$1
+  local core_max tcp_max def backlog somax syn rdef wdef
+  case $p in
+    small)  core_max=8388608  tcp_max=4194304  rdef="4096 87380 4194304"   wdef="4096 16384 4194304"  def=131072 backlog=4096  somax=4096 syn=4096 ;;
+    large)  core_max=67108864 tcp_max=67108864 rdef="4096 131072 67108864" wdef="4096 65536 67108864" def=262144 backlog=32768 somax=8192 syn=16384 ;;
+    *)      core_max=16777216 tcp_max=16777216 rdef="4096 131072 16777216" wdef="4096 65536 16777216" def=262144 backlog=16384 somax=4096 syn=8192 ;;
+  esac
+  TUNE_BDP_NOTE=""
+  if [[ $TUNE_BUF == bdp && -n $OPT_TUNE_BW && -n $OPT_TUNE_RTT ]]; then
+    # 目标 = 2 × BDP（接收窗口约占缓冲区一半），向上取整到 MB；下限 4MB，上限按内存
+    local bdp want cap
+    bdp=$(( OPT_TUNE_BW * OPT_TUNE_RTT * 125 ))
+    want=$(( (bdp * 2 + 1048575) / 1048576 * 1048576 ))
+    if (( TUNE_MEM <= 300 )); then cap=8388608; elif (( TUNE_MEM <= 1024 )); then cap=33554432
+    elif (( TUNE_MEM <= 4096 )); then cap=67108864; else cap=134217728; fi
+    (( want < 4194304 )) && want=4194304
+    (( want > cap )) && want=$cap
+    tcp_max=$want
+    core_max=$want; (( core_max < 8388608 )) && core_max=8388608   # quic-go(Hysteria2) 需要 ≥7MB 的 UDP 缓冲区
+    rdef="${rdef% *} ${tcp_max}" wdef="${wdef% *} ${tcp_max}"
+    TUNE_BDP_NOTE="带宽 ${OPT_TUNE_BW} Mbps × 延迟 ${OPT_TUNE_RTT} ms ≈ BDP $(( bdp / 1024 )) KB → 缓冲区上限 $(( tcp_max / 1048576 )) MB（2×BDP，受内存上限 $(( cap / 1048576 )) MB 约束）"
+  fi
+  TUNE_WANT[net.core.rmem_max]=$core_max TUNE_WANT[net.core.wmem_max]=$core_max
+  TUNE_WANT[net.core.rmem_default]=$def TUNE_WANT[net.core.wmem_default]=$def
+  TUNE_WANT[net.ipv4.tcp_rmem]=$rdef TUNE_WANT[net.ipv4.tcp_wmem]=$wdef
+  TUNE_WANT[net.ipv4.udp_rmem_min]=8192 TUNE_WANT[net.ipv4.udp_wmem_min]=8192
+  TUNE_WANT[net.core.netdev_max_backlog]=$backlog TUNE_WANT[net.core.somaxconn]=$somax TUNE_WANT[net.ipv4.tcp_max_syn_backlog]=$syn
+  return 0
+}
+# 生成计划：$1 预设 $2 缓冲区档位(auto|small|medium|large|bdp)
+tune_plan() {
+  local preset=$1 buf=${2:-auto} cc qd
+  TUNE_WANT=()
+  TUNE_PRESET=$preset
+  read -r cc qd <<<"$(tune_preset_cc_qd "$preset")"
+  if [[ $cc != keep ]] && ! tune_cc_ok "$cc"; then
+    if [[ $cc == bbr ]]; then
+      warn "内核 $(uname -r) 当前不可用 BBR（可用: ${TUNE_CC_AVAIL:-未知}$(is_container && echo '；容器内无法加载内核模块，需宿主机加载 tcp_bbr')），拥塞控制与队列算法保持不变，仅应用缓冲区等参数。"
+      cc=keep qd=keep
+    else
+      warn "拥塞控制 ${cc} 不可用（可用: ${TUNE_CC_AVAIL:-未知}），保持不变。"; cc=keep
+    fi
+  fi
+  if [[ $qd != keep ]] && ! tune_qd_ok "$qd"; then
+    warn "队列算法 ${qd} 不可用（可用: ${TUNE_QD_AVAIL:-未知}），保持不变。"; qd=keep
+  fi
+  TUNE_CC=$cc TUNE_QD=$qd
+  [[ $qd == keep ]] || TUNE_WANT[net.core.default_qdisc]=$qd
+  [[ $cc == keep ]] || TUNE_WANT[net.ipv4.tcp_congestion_control]=$cc
+  # 「保持不变」= 系统原来的设置：如果之前由本脚本改过，则改回备份的原值（否则重启后与当前运行值不一致）
+  local k0 v0 prev
+  for k0 in net.ipv4.tcp_congestion_control net.core.default_qdisc; do
+    [[ -z ${TUNE_WANT[$k0]-} ]] || continue
+    if [[ $k0 == net.core.default_qdisc ]]; then prev=$(tune_cur_get QDISC); else prev=$(tune_cur_get CC); fi
+    [[ -n $prev && $prev != keep ]] || continue
+    v0=$(tune_backup_get "$k0" 2>/dev/null) || continue
+    [[ $v0 == "@default" ]] && v0=$(tune_kernel_default "$k0")
+    [[ -n $v0 && $v0 != "${TUNE_NOW[$k0]}" ]] || continue
+    TUNE_WANT[$k0]=$v0
+    if [[ $k0 == net.core.default_qdisc ]]; then TUNE_QD=$v0; else TUNE_CC=$v0; fi
+    info "「保持不变」指系统原来的设置：${k0} 将恢复为调优前的 ${v0}。"
+  done
+  TUNE_BUF=$buf
+  if [[ $buf == bdp && ( -z $OPT_TUNE_BW || -z $OPT_TUNE_RTT ) ]]; then warn "BDP 需要同时给出带宽与延迟，改用自动档位。"; TUNE_BUF=auto; fi
+  case $TUNE_BUF in auto|bdp) TUNE_BUF_EFF=$(tune_auto_buf) ;; *) TUNE_BUF_EFF=$TUNE_BUF ;; esac
+  tune_set_buffers "$TUNE_BUF_EFF"
+  TUNE_WANT[net.ipv4.tcp_fastopen]=3
+  TUNE_WANT[net.ipv4.tcp_mtu_probing]=1
+  TUNE_WANT[net.ipv4.tcp_slow_start_after_idle]=0
+  TUNE_WANT[net.ipv4.tcp_notsent_lowat]=131072
+  TUNE_WANT[net.ipv4.tcp_fin_timeout]=30
+  TUNE_WANT[net.ipv4.tcp_keepalive_time]=600
+  TUNE_WANT[fs.file-max]=1048576
+  TUNE_WANT[fs.nr_open]=1048576
+  (( SWAP_CREATED )) && TUNE_WANT[vm.swappiness]=10
+  return 0
+}
+tune_status_of() { # 预览中的状态文字
+  local k=$1 w=${TUNE_WANT[$1]-}
+  if [[ -z $w ]]; then echo "保持"; return 0; fi
+  if [[ ${TUNE_ST[$k]} != ok && ${TUNE_NOW[$k]} == "$w" ]]; then echo "不变（只读）"; return 0; fi
+  [[ ${TUNE_ST[$k]} == ok ]] || { tune_skip_reason "$k"; return 0; }
+  if [[ ${TUNE_NOW[$k]} == "$w" ]]; then echo "不变"; else echo "${C_YELLOW}将修改${C_NONE}"; fi
+}
+tune_preview() {
+  local k w n_ch=0 n_skip=0
+  echo; hr
+  _green "  调优预览：$(tune_preset_desc "$TUNE_PRESET")"
+  printf '  缓冲区:   %s%s\n' "$(tune_buf_desc "$TUNE_BUF_EFF")" "$([[ $TUNE_BUF == auto || $TUNE_BUF == bdp ]] && echo "  ← 内存 ${TUNE_MEM}MB 自动选择")"
+  [[ -n $TUNE_BDP_NOTE ]] && printf '  BDP:      %s\n' "$TUNE_BDP_NOTE"
+  hr
+  trow "参数" "当前值" "目标值" "状态"
+  for k in "${TUNE_KEYS[@]}"; do
+    w=${TUNE_WANT[$k]-}
+    [[ -z $w && $k == vm.swappiness ]] && continue
+    [[ -n $w ]] || w="(不修改)"
+    trow "$k" "${TUNE_NOW[$k]}" "$w" "$(tune_status_of "$k")"
+    if [[ -n ${TUNE_WANT[$k]-} ]]; then
+      if [[ ${TUNE_NOW[$k]} == "${TUNE_WANT[$k]}" ]]; then :
+      elif [[ ${TUNE_ST[$k]} != ok ]]; then n_skip=$((n_skip + 1)); elif [[ ${TUNE_NOW[$k]} != "${TUNE_WANT[$k]}" ]]; then n_ch=$((n_ch + 1)); fi
+    fi
+  done
+  if [[ $TUNE_QD != keep ]]; then
+    local r; r=$(tune_root_qdisc "$TUNE_IFACE")
+    if [[ -z $TUNE_IFACE || $r == - ]]; then
+      trow "网卡队列(tc)" "-" "$TUNE_QD" "跳过：未找到默认网卡或 tc 命令（将在重启后按默认队列生效）"
+    elif tune_iface_uses "$TUNE_IFACE" "$TUNE_QD"; then
+      trow "网卡 ${TUNE_IFACE} 队列(tc)" "$r" "$TUNE_QD" "不变"
+    else
+      trow "网卡 ${TUNE_IFACE} 队列(tc)" "$r" "$TUNE_QD" "${C_YELLOW}将立即切换${C_NONE}"
+      n_ch=$((n_ch + 1))
+    fi
+  fi
+  hr
+  printf '  将修改 %s 项，跳过 %s 项（只读/不可见的参数不会写入配置文件）。\n' "$n_ch" "$n_skip"
+  printf '  配置文件: %s   原值备份: %s\n' "$SYSCTL_FILE" "$([[ -f $TUNE_BACKUP ]] && echo "已存在（保留首次应用前的原值）" || echo "首次应用时自动创建 ${TUNE_BACKUP}")"
+  return 0
+}
+
+# ---------- 备份 / 应用 / 持久化 ----------
+tune_backup_save() {
+  [[ -f $TUNE_BACKUP ]] && return 0
+  mkdir -p "$TUNE_DIR"; chmod 700 "$STATE_DIR" "$TUNE_DIR" 2>/dev/null || true
+  local k v legacy=0 tmp="${TUNE_BACKUP}.tmp"
+  # v1.1.x 安装时已写入过调优文件：其中的参数当前已是调优值，原值记为 @default（恢复时回退到系统默认）
+  [[ -f $SYSCTL_FILE ]] && legacy=1
+  {
+    echo "# proxy-oneclick 调优前的原始值（$(date '+%F %T')）"
+    echo "@time=$(date '+%F %T')"
+    echo "@legacy=${legacy}"
+    echo "@iface=${TUNE_IFACE}"
+    echo "@root_qdisc=$(tune_root_qdisc "$TUNE_IFACE")"
+    for k in "${TUNE_KEYS[@]}"; do
+      [[ ${TUNE_ST[$k]} == absent ]] && continue
+      v=${TUNE_NOW[$k]}
+      if (( legacy )) && grep -Eq "^[[:space:]]*${k//./\\.}[[:space:]]*=" "$SYSCTL_FILE" 2>/dev/null; then v="@default"; fi
+      echo "${k}=${v}"
+    done
+  } >"$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$TUNE_BACKUP"
+  ok "已备份调优前的原始值：${TUNE_BACKUP}"
+}
+tune_backup_get() { # $1 key → 备份值（没有返回 1）
+  [[ -f $TUNE_BACKUP ]] || return 1
+  local line
+  line=$(grep -m1 "^${1//./\\.}=" "$TUNE_BACKUP" 2>/dev/null) || return 1
+  printf '%s' "${line#*=}"
+}
+tune_boot_needed() { is_container || [[ $TUNE_QD != keep && ${TUNE_ST[net.core.default_qdisc]} != ok ]]; }
+tune_write_boot() { # 容器内 systemd-sysctl 常被跳过（/proc/sys 只读挂载），且网卡队列只能用 tc 设置：用开机服务补上
+  local qd_line=""
+  if [[ $TUNE_QD != keep && -n $TUNE_IFACE && ${TUNE_RES[qdisc]-} == ok ]]; then
+    qd_line="tc qdisc replace dev ${TUNE_IFACE} root ${TUNE_QD} 2>/dev/null || true"
+  fi
+  mkdir -p "$TUNE_DIR"
+  cat >"$TUNE_BOOT" <<BOOT
+#!/bin/sh
+# 由 proxy-oneclick 生成：开机时重新应用网络调优（容器内 sysctl 服务可能被跳过）
+[ -f ${SYSCTL_FILE} ] && sysctl -p ${SYSCTL_FILE} >/dev/null 2>&1
+${qd_line}
+exit 0
+BOOT
+  chmod 700 "$TUNE_BOOT"
+  if is_openrc; then
+    cat >"$TUNE_RC" <<RC
+#!/sbin/openrc-run
+# 由 proxy-oneclick 生成（网络调优）
+description="proxy-oneclick network tuning"
+depend() {
+  want net
+  after net sysctl
+}
+start() {
+  ebegin "Applying proxy-oneclick network tuning"
+  /bin/sh "${TUNE_BOOT}"
+  eend 0
+}
+RC
+    chmod 755 "$TUNE_RC"
+  elif [[ $INIT_SYS == systemd ]]; then
+    cat >"$TUNE_UNIT" <<UNIT
+[Unit]
+Description=proxy-oneclick network tuning (sysctl + qdisc)
+After=network.target systemd-sysctl.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh ${TUNE_BOOT}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  else
+    return 0
+  fi
+  svc_enable proxy-oneclick-tune
+  ok "已添加开机服务 proxy-oneclick-tune（容器/受限环境下开机重新应用）"
+}
+tune_remove_boot() {
+  if [[ -f $TUNE_UNIT || -f $TUNE_RC ]]; then svc_disable_stop proxy-oneclick-tune; fi
+  rm -f "$TUNE_UNIT" "$TUNE_RC" "$TUNE_BOOT"
+  sd_reload
+}
+tune_apply_qdisc() { # 立即把默认网卡切换到目标队列算法
+  TUNE_RES[qdisc]=skip
+  [[ $TUNE_QD != keep && -n $TUNE_IFACE ]] && have tc || return 0
+  if tune_iface_uses "$TUNE_IFACE" "$TUNE_QD"; then TUNE_RES[qdisc]=ok; return 0; fi
+  local r; r=$(tune_root_qdisc "$TUNE_IFACE")
+  if [[ $r == mq* && ${TUNE_NOW[net.core.default_qdisc]} == "$TUNE_QD" ]]; then
+    # 多队列网卡：删除根队列后内核会按新的 default_qdisc 重新挂 mq + 子队列
+    tc qdisc del dev "$TUNE_IFACE" root >/dev/null 2>&1 || true
+  fi
+  tune_iface_uses "$TUNE_IFACE" "$TUNE_QD" || tc qdisc replace dev "$TUNE_IFACE" root "$TUNE_QD" >/dev/null 2>&1 || true
+  if tune_iface_uses "$TUNE_IFACE" "$TUNE_QD"; then TUNE_RES[qdisc]=ok; else TUNE_RES[qdisc]=fail; fi
+  return 0
+}
+tune_write_extras() { # 文件句柄上限 / journald（与 v1.1.x 相同；仅 systemd 写 systemd 相关文件）
+  [[ -d /etc/security ]] && { mkdir -p "$(dirname "$LIMITS_FILE")"
+    printf '%s\n' "# proxy-oneclick" "* soft nofile 1048576" "* hard nofile 1048576" "root soft nofile 1048576" "root hard nofile 1048576" >"$LIMITS_FILE"; }
+  if [[ $INIT_SYS == systemd ]]; then
+    mkdir -p "$(dirname "$SYSTEMD_LIMITS_FILE")" "$(dirname "$JOURNALD_FILE")"
+    printf '%s\n' "# proxy-oneclick" "[Manager]" "DefaultLimitNOFILE=1048576" >"$SYSTEMD_LIMITS_FILE"
+    printf '%s\n' "# proxy-oneclick" "[Journal]" "SystemMaxUse=100M" "RuntimeMaxUse=50M" >"$JOURNALD_FILE"
+    systemctl daemon-reexec >/dev/null 2>&1 || true
+    systemctl restart systemd-journald >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+tune_commit() {
+  local k w n_ok=0 n_fail=0 n_skip=0 persist=()
+  tune_backup_save
+  TUNE_RES=()
+  if [[ $TUNE_CC != keep ]] && ! is_container && have modprobe; then modprobe -q "tcp_${TUNE_CC}" 2>/dev/null || true; fi
+  if [[ $TUNE_QD != keep && $TUNE_QD != pfifo_fast ]] && ! is_container && have modprobe; then modprobe -q "sch_${TUNE_QD}" 2>/dev/null || true; fi
+  for k in "${TUNE_KEYS[@]}"; do
+    w=${TUNE_WANT[$k]-}
+    [[ -n $w ]] || continue
+    if [[ ${TUNE_ST[$k]} != ok ]]; then
+      [[ ${TUNE_NOW[$k]} == "$w" ]] || { TUNE_RES[$k]=skip; n_skip=$((n_skip + 1)); }
+      continue
+    fi
+    if [[ ${TUNE_NOW[$k]} == "$w" ]] || tune_write "$k" "$w"; then
+      # 部分参数写入成功但被内核截断/拒绝，以回读为准
+      if [[ $(tune_get "$k" 2>/dev/null) == "$w" ]]; then TUNE_RES[$k]=ok; n_ok=$((n_ok + 1)); persist+=("$k"); TUNE_NOW[$k]=$w
+      else TUNE_RES[$k]=fail; n_fail=$((n_fail + 1)); TUNE_NOW[$k]=$(tune_get "$k" 2>/dev/null || echo "-"); fi
+    else
+      TUNE_RES[$k]=fail; n_fail=$((n_fail + 1))
+    fi
+  done
+  tune_apply_qdisc
+  # 写入唯一的配置文件（只包含成功应用的参数）
+  if (( ${#persist[@]} )); then
+    mkdir -p "$(dirname "$SYSCTL_FILE")"
+    {
+      echo "# 由 proxy-oneclick 生成，卸载时会删除"
+      echo "# v${SCRIPT_VERSION} 网络调优：预设 ${TUNE_PRESET} / 缓冲区 ${TUNE_BUF_EFF}$([[ $TUNE_BUF != "$TUNE_BUF_EFF" ]] && echo "（${TUNE_BUF}）") / $(date '+%F %T')"
+      echo "# 恢复原值: proxy tune restore"
+      for k in "${persist[@]}"; do echo "${k} = ${TUNE_WANT[$k]}"; done
+    } >"${SYSCTL_FILE}.tmp"
+    mv -f "${SYSCTL_FILE}.tmp" "$SYSCTL_FILE"
+  else
+    rm -f "$SYSCTL_FILE"
+  fi
+  # OpenRC：确保开机执行 sysctl 服务（Alpine 默认在 boot 运行级）
+  if is_openrc && [[ -x /etc/init.d/sysctl ]] && (( ${#persist[@]} )); then
+    rc-update add sysctl boot >/dev/null 2>&1 || true
+  fi
+  if tune_boot_needed && { (( ${#persist[@]} )) || [[ ${TUNE_RES[qdisc]} == ok ]]; }; then tune_write_boot; else tune_remove_boot; fi
+  if (( ! NAT_MODE )) || ! is_container; then tune_write_extras; fi
+  if (( ! ${#persist[@]} )) && [[ ${TUNE_RES[qdisc]} != ok ]]; then
+    # 什么都没改成：不留下备份/状态文件，避免显示为「已应用」
+    rm -rf "$TUNE_DIR"; tune_remove_boot
+    warn "没有任何参数被修改（$(is_container && echo '容器内内核参数由宿主机控制' || echo '无权限')）。"
+    return 0
+  fi
+  mkdir -p "$TUNE_DIR"
+  {
+    echo "PRESET=${TUNE_PRESET}"; echo "BUFFER=${TUNE_BUF}"; echo "BUFFER_EFF=${TUNE_BUF_EFF}"
+    echo "CC=${TUNE_CC}"; echo "QDISC=${TUNE_QD}"; echo "IFACE=${TUNE_IFACE}"
+    echo "QDISC_TC=$([[ ${TUNE_RES[qdisc]} == ok ]] && echo 1 || echo 0)"
+    echo "TIME=$(date '+%F %T')"; echo "VERSION=${SCRIPT_VERSION}"
+  } >"$TUNE_CUR"
+  # 结果
+  if (( ! TUNE_COMPACT )); then
+    echo; _cyan "  应用结果："
+    for k in "${TUNE_KEYS[@]}"; do
+      case ${TUNE_RES[$k]-} in
+        fail) printf '   %s✗%s %s 写入失败（值不被内核接受），当前 %s\n' "$C_RED" "$C_NONE" "$(tcol "$k" 34)" "${TUNE_NOW[$k]}" ;;
+        skip) printf '   %s-%s %s %s\n' "$C_YELLOW" "$C_NONE" "$(tcol "$k" 34)" "$(tune_skip_reason "$k")" ;;
+      esac
+    done
+  fi
+  case ${TUNE_RES[qdisc]} in
+    ok) [[ $TUNE_QD != keep ]] && info "网卡 ${TUNE_IFACE} 队列: $(tune_root_qdisc "$TUNE_IFACE")" ;;
+    fail) warn "网卡 ${TUNE_IFACE} 队列切换为 ${TUNE_QD} 失败（容器内通常无权限；default_qdisc 可写时重启后生效）。" ;;
+  esac
+  if (( n_skip )) && (( TUNE_COMPACT )); then
+    info "跳过 ${n_skip} 项只读/不可见参数（$(is_container && echo '容器内由宿主机控制' || echo '无权限')）。"
+  fi
+  ok "调优已应用：成功 ${n_ok} 项，跳过 ${n_skip} 项，失败 ${n_fail} 项。拥塞控制 $(tune_get net.ipv4.tcp_congestion_control || echo '-') / 队列 $(tune_get net.core.default_qdisc || echo '-')"
+  if (( ${#persist[@]} )); then ok "已写入 ${SYSCTL_FILE}（恢复: proxy tune restore）"; else warn "没有可写的参数，未写入配置文件（容器内内核参数由宿主机控制）。"; fi
+  return 0
+}
+
+# ---------- 恢复 ----------
+# 与系统无关的内核默认值（仅在没有精确备份时使用；与内存相关的参数重启后自然恢复）
+tune_kconf() { # 读取内核编译配置（/boot/config-* 或 /proc/config.gz），例如 CONFIG_DEFAULT_NET_SCH
+  local f line=""; f="/boot/config-$(uname -r)"
+  if [[ -r $f ]]; then line=$(grep -m1 "^${1}=" "$f" 2>/dev/null) || line=""
+  elif [[ -r /proc/config.gz ]] && have zcat; then line=$(zcat /proc/config.gz 2>/dev/null | grep -m1 "^${1}=") || line=""; fi
+  line=${line#*=}; line=${line//\"/}
+  printf '%s' "$line"
+}
+tune_kernel_default() {
+  local v
+  case $1 in
+    net.core.default_qdisc) v=$(tune_kconf CONFIG_DEFAULT_NET_SCH); echo "${v:-pfifo_fast}" ;;
+    net.ipv4.tcp_congestion_control) v=$(tune_kconf CONFIG_DEFAULT_TCP_CONG); v=${v:-cubic}; tune_cc_ok "$v" && echo "$v" ;;
+    net.core.rmem_max|net.core.wmem_max|net.core.rmem_default|net.core.wmem_default) echo 212992 ;;
+    net.ipv4.tcp_rmem) echo "4096 131072 6291456" ;;
+    net.ipv4.tcp_wmem) echo "4096 16384 4194304" ;;
+    net.ipv4.udp_rmem_min|net.ipv4.udp_wmem_min) echo 4096 ;;
+    net.core.netdev_max_backlog) echo 1000 ;;
+    net.core.somaxconn) if kernel_ge 5.4; then echo 4096; else echo 128; fi ;;
+    net.ipv4.tcp_fastopen) echo 1 ;;
+    net.ipv4.tcp_mtu_probing) echo 0 ;;
+    net.ipv4.tcp_slow_start_after_idle) echo 1 ;;
+    net.ipv4.tcp_notsent_lowat) echo 4294967295 ;;
+    net.ipv4.tcp_fin_timeout) echo 60 ;;
+    net.ipv4.tcp_keepalive_time) echo 7200 ;;
+    fs.nr_open) echo 1048576 ;;
+    vm.swappiness) echo 60 ;;
+  esac
+  return 0
+}
+tune_key_in_other_conf() { # 其它 sysctl 配置文件是否设置了该参数
+  local f
+  for f in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf; do
+    [[ -f $f && $f != "$SYSCTL_FILE" ]] || continue
+    grep -Eq "^[[:space:]]*-?${1//./[./]}[[:space:]]*=" "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+tune_sysctl_system() { # 重新加载系统 sysctl 配置（busybox sysctl 不支持 --system）
+  sysctl --system >/dev/null 2>&1 && return 0
+  local f
+  for f in /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf /run/sysctl.d/*.conf /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+    [[ -f $f ]] && { sysctl -p "$f" >/dev/null 2>&1 || true; }
+  done
+  return 0
+}
+tune_has_config() { [[ -f $SYSCTL_FILE || -f $TUNE_BACKUP || -f $TUNE_CUR || -f $TUNE_BOOT || -f $TUNE_UNIT || -f $TUNE_RC || -f $LIMITS_FILE || -f $SYSTEMD_LIMITS_FILE || -f $JOURNALD_FILE ]]; }
+tune_restore() { # $1 = quiet（卸载时调用，不询问）
+  local quiet=${1:-} k v cur legacy_keys=() n=0
+  tune_detect
+  if ! tune_has_config; then info "当前没有由本脚本应用的调优，无需恢复。"; return 0; fi
+  declare -A old=()
+  if [[ -f $TUNE_BACKUP ]]; then
+    for k in "${TUNE_KEYS[@]}"; do v=$(tune_backup_get "$k") && old[$k]=$v; done
+  elif [[ -f $SYSCTL_FILE ]]; then
+    # 旧版本（v1.1.x）写入的文件，没有备份：回退到系统默认
+    for k in "${TUNE_KEYS[@]}"; do grep -Eq "^[[:space:]]*${k//./\\.}[[:space:]]*=" "$SYSCTL_FILE" 2>/dev/null && old[$k]="@default"; done
+  fi
+  if [[ $quiet != quiet ]]; then
+    echo; hr; _green "  恢复调优前的设置"; hr
+    printf '  %s %s %s\n' "$(tcol "参数" 34)" "$(tcol "当前值" 22)" "恢复为"
+    for k in "${TUNE_KEYS[@]}"; do
+      [[ -n ${old[$k]-} ]] || continue
+      v=${old[$k]}; [[ $v == "@default" ]] && v="系统默认（sysctl --system）"
+      [[ ${TUNE_NOW[$k]} == "${old[$k]}" ]] && continue
+      printf '  %s %s %s\n' "$(tcol "$k" 34)" "$(tcol "${TUNE_NOW[$k]}" 22)" "$v"
+    done
+    hr
+    echo "  将删除: ${SYSCTL_FILE}、文件句柄/journald 调优文件、开机服务 proxy-oneclick-tune（如有）"
+    confirm "确认恢复？" y || return 0
+  fi
+  rm -f "$SYSCTL_FILE"
+  tune_remove_boot
+  for k in "${TUNE_KEYS[@]}"; do
+    v=${old[$k]-}; [[ -n $v ]] || continue
+    if [[ $v == "@default" ]]; then legacy_keys+=("$k"); continue; fi
+    [[ ${TUNE_ST[$k]} == ok ]] || continue
+    cur=$(tune_get "$k" 2>/dev/null) || cur=""
+    [[ $cur == "$v" ]] && continue
+    if tune_write "$k" "$v"; then n=$((n + 1)); else warn "恢复 ${k}=${v} 失败"; fi
+  done
+  if (( ${#legacy_keys[@]} )); then
+    tune_sysctl_system
+    for k in "${legacy_keys[@]}"; do
+      [[ ${TUNE_ST[$k]} == ok ]] || continue
+      tune_key_in_other_conf "$k" && continue
+      v=$(tune_kernel_default "$k"); [[ -n $v ]] || continue
+      cur=$(tune_get "$k" 2>/dev/null) || cur=""
+      [[ $cur == "$v" ]] && continue
+      tune_write "$k" "$v" && n=$((n + 1))
+    done
+  fi
+  # 网卡队列：恢复为（新的）默认队列
+  local iface root0 qd_now
+  iface=$(tune_backup_get "@iface" 2>/dev/null) || iface=""
+  [[ -n $iface ]] || iface=$TUNE_IFACE
+  root0=$(tune_backup_get "@root_qdisc" 2>/dev/null) || root0=""
+  qd_now=$(tune_get net.core.default_qdisc 2>/dev/null) || qd_now=""
+  if have tc && [[ -n $iface ]]; then
+    local r; r=$(tune_root_qdisc "$iface")
+    if [[ -n $root0 && $root0 != - && $r != "$root0" ]] || { [[ -z $root0 ]] && [[ $r == fq || $r == "mq(fq)" ]] && [[ $qd_now != fq ]]; }; then
+      tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
+      r=$(tune_root_qdisc "$iface")
+      if [[ -n $root0 && $root0 != - && $root0 != mq* && $root0 != noqueue && $r != "$root0" ]]; then
+        tc qdisc replace dev "$iface" root "$root0" >/dev/null 2>&1 || true
+      fi
+      info "网卡 ${iface} 队列: $(tune_root_qdisc "$iface")"
+    fi
+  fi
+  if [[ -f $LIMITS_FILE || -f $SYSTEMD_LIMITS_FILE || -f $JOURNALD_FILE ]]; then
+    rm -f "$LIMITS_FILE" "$SYSTEMD_LIMITS_FILE" "$JOURNALD_FILE"
+    if [[ $INIT_SYS == systemd ]]; then
+      systemctl daemon-reexec >/dev/null 2>&1 || true
+      systemctl restart systemd-journald >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -rf "$TUNE_DIR"
+  TUNE_DETECTED=0
+  ok "已恢复调优前的设置（还原 ${n} 项；拥塞控制 $(tune_get net.ipv4.tcp_congestion_control || echo '-') / 队列 $(tune_get net.core.default_qdisc || echo '-')）"
+  (( ${#legacy_keys[@]} )) && info "旧版本写入的参数已回退到系统默认；与内存相关的少数参数（如 tcp_max_syn_backlog、fs.file-max）重启后完全恢复。"
+  return 0
+}
+
+# ---------- 状态 ----------
+tune_cur_get() { [[ -f $TUNE_CUR ]] && awk -F= -v k="$1" '$1==k{print substr($0, index($0,"=")+1); exit}' "$TUNE_CUR"; return 0; }
+tune_status() {
+  tune_detect
+  echo; hr; _green "  网络调优状态"; hr
+  tune_env_lines
+  if [[ -f $TUNE_CUR ]]; then
+    printf '  本脚本调优: %s已应用%s（预设 %s，缓冲区 %s，%s）\n' "$C_GREEN" "$C_NONE" "$(tune_cur_get PRESET)" "$(tune_cur_get BUFFER_EFF)" "$(tune_cur_get TIME)"
+  elif [[ -f $SYSCTL_FILE ]]; then
+    printf '  本脚本调优: 已应用（v1.1.x 安装时写入：BBR + fq / 中档缓冲区）\n'
+  else
+    printf '  本脚本调优: 未应用\n'
+  fi
+  printf '  原值备份:   %s\n' "$([[ -f $TUNE_BACKUP ]] && echo "$TUNE_BACKUP" || echo 无)"
+  hr
+  local k
+  for k in "${TUNE_KEYS[@]}"; do
+    [[ $k == vm.swappiness ]] && continue
+    printf '  %s %s %s\n' "$(tcol "$k" 34)" "$(tcol "${TUNE_NOW[$k]}" 24)" "$(case ${TUNE_ST[$k]} in ok) echo 可写 ;; ro) echo "${C_YELLOW}只读${C_NONE}" ;; host) echo "${C_YELLOW}宿主机全局参数（不修改）${C_NONE}" ;; *) echo "${C_YELLOW}不可见${C_NONE}" ;; esac)"
+  done
+  local cnt max
+  cnt=$(tune_get net.netfilter.nf_conntrack_count 2>/dev/null) || cnt=""
+  max=$(tune_get net.netfilter.nf_conntrack_max 2>/dev/null) || max=""
+  if [[ $cnt =~ ^[0-9]+$ && $max =~ ^[0-9]+$ ]] && (( max > 0 )); then
+    printf '  %s %s / %s（%s%%）\n' "$(tcol "conntrack 连接跟踪" 34)" "$cnt" "$max" "$(( cnt * 100 / max ))"
+    (( cnt * 100 / max >= 80 )) && warn "conntrack 表使用率超过 80%，连接数很多时可能丢包（可调大 net.netfilter.nf_conntrack_max，宿主机控制时需联系服务商）。"
+  fi
+  hr
+  return 0
+}
+
+# ---------- 交互 ----------
+tune_ask_buffer() {
+  local c auto; auto=$(tune_auto_buf)
+  echo
+  echo "  缓冲区档位（当前内存 ${TUNE_MEM}MB）："
+  echo "   1) $(tune_buf_desc auto) → $(tune_buf_desc "$auto")"
+  echo "   2) $(tune_buf_desc small)"
+  echo "   3) $(tune_buf_desc medium)"
+  echo "   4) $(tune_buf_desc large)"
+  echo "   5) $(tune_buf_desc bdp)：输入 VPS 带宽与到客户端的延迟"
+  ask c "请选择" "1"
+  case $c in
+    2) OPT_TUNE_BUF=small ;; 3) OPT_TUNE_BUF=medium ;; 4) OPT_TUNE_BUF=large ;;
+    5) local bw rtt
+       ask bw "VPS 带宽（Mbps，例如 1000）" "${OPT_TUNE_BW:-1000}"
+       ask rtt "到客户端的往返延迟（ms，例如 180）" "${OPT_TUNE_RTT:-180}"
+       bw=$(sanitize_port_input "$bw"); rtt=$(sanitize_port_input "$rtt")
+       if [[ $bw =~ ^[0-9]{1,6}$ && $rtt =~ ^[0-9]{1,5}$ ]] && (( 10#$bw >= 1 && 10#$bw <= 100000 && 10#$rtt >= 1 && 10#$rtt <= 2000 )); then
+         OPT_TUNE_BW=$((10#$bw)) OPT_TUNE_RTT=$((10#$rtt)) OPT_TUNE_BUF=bdp
+       else warn "输入无效，改用自动档位。"; OPT_TUNE_BUF=auto; fi ;;
+    *) OPT_TUNE_BUF=auto ;;
+  esac
+}
+tune_pick() { # $1 类型 cc|qd → 从可用列表中选择（0 = 保持当前）
+  local list i=1 c item arr=()
+  if [[ $1 == cc ]]; then list=$TUNE_CC_AVAIL; else list=$TUNE_QD_AVAIL; fi
+  for item in $list; do arr+=("$item"); done
+  echo "   0) 保持当前（$( [[ $1 == cc ]] && echo "${TUNE_NOW[net.ipv4.tcp_congestion_control]}" || echo "${TUNE_NOW[net.core.default_qdisc]}")）" >&2
+  for item in "${arr[@]}"; do echo "   ${i}) ${item}" >&2; i=$((i + 1)); done
+  ask c "请选择" "0"
+  if [[ $c =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#arr[@]} )); then echo "${arr[c-1]}"; else echo keep; fi
+}
+tune_run() { # $1 预设 $2 缓冲区档位；按 TUNE_NOCONFIRM 决定是否询问
+  tune_detect
+  tune_plan "$1" "${2:-auto}"
+  if (( TUNE_COMPACT )); then
+    info "预设: $(tune_preset_desc "$TUNE_PRESET")；缓冲区: $(tune_buf_desc "$TUNE_BUF_EFF")"
+  else
+    tune_preview
+  fi
+  local k nw=0
+  for k in "${!TUNE_WANT[@]}"; do [[ ${TUNE_ST[$k]} == ok ]] && nw=$((nw + 1)); done
+  if (( nw == 0 )) && { [[ $TUNE_QD == keep || -z $TUNE_IFACE ]] || ! have tc; }; then
+    warn "当前环境没有可写的目标参数（$(is_container && echo "容器 ${VIRT}：内核参数由宿主机控制" || echo '无权限')），未做任何修改。"
+    return 0
+  fi
+  if (( ! TUNE_NOCONFIRM )); then
+    confirm "确认应用以上调优？" y || { info "已取消，未做任何修改。"; return 0; }
+  fi
+  tune_commit
+}
+menu_tune() {
+  local c p miss i=2 map=()
+  tune_detect
+  echo; hr; _green "  网络调优（独立功能，NAT / 容器也可使用）"; hr
+  tune_env_lines
+  if [[ -f $TUNE_CUR ]]; then printf '  已应用:     预设 %s / 缓冲区 %s（%s）\n' "$(tune_cur_get PRESET)" "$(tune_cur_get BUFFER_EFF)" "$(tune_cur_get TIME)"
+  elif [[ -f $SYSCTL_FILE ]]; then printf '  已应用:     v1.1.x 安装时的默认调优（BBR + fq）\n'; fi
+  hr
+  echo "   1) 查看当前状态 / 全部参数"
+  for p in bbr-fq bbr-fq_codel bbr-cake cubic-fq_codel custom keep; do
+    miss=""; [[ $p == custom || $p == keep ]] || miss=$(tune_preset_missing "$p")
+    printf '   %s) %s%s\n' "$i" "$(tune_preset_desc "$p")" "${miss:+  ${C_YELLOW}[不可用：缺少 ${miss}]${C_NONE}}"
+    map[i]=$p; i=$((i + 1))
+  done
+  echo "   ${i}) 恢复调优前的设置（删除 ${SYSCTL_FILE}）"
+  echo "   0) 返回"
+  ask c "请选择" "0"
+  [[ $c =~ ^[0-9]+$ ]] || return 0
+  if (( c == 1 )); then tune_status; return 0; fi
+  if (( c == i )); then tune_restore; return 0; fi
+  p=${map[c]-}; [[ -n $p ]] || return 0
+  if [[ $p != custom && $p != keep ]]; then
+    miss=$(tune_preset_missing "$p")
+    if [[ -n $miss ]]; then warn "当前内核/环境缺少 ${miss}，无法使用该预设（请选择其它预设或「自定义」）。"; return 0; fi
+  fi
+  if [[ $p == custom ]]; then
+    echo; echo "  拥塞控制算法（仅列出内核当前可用的）："; OPT_TUNE_CC=$(tune_pick cc)
+    echo; echo "  队列算法（qdisc）："; OPT_TUNE_QDISC=$(tune_pick qd)
+  fi
+  tune_ask_buffer
+  TUNE_NOCONFIRM=0
+  tune_run "$p" "$OPT_TUNE_BUF"
+}
+tune_opt_preset() { # 命令行指定的预设；给了 --tune-cc / --tune-qdisc 时为 custom；否则用 $1
+  if [[ -n $OPT_TUNE_CC || -n $OPT_TUNE_QDISC ]]; then echo custom; else echo "${OPT_TUNE_PRESET:-$1}"; fi
+}
+# proxy tune [status|preview|apply|restore]
+do_tune() {
+  require_root
+  load_state
+  local preset; preset=$(tune_opt_preset bbr-fq)
+  [[ -n $OPT_TUNE_BW && -n $OPT_TUNE_RTT && -z $OPT_TUNE_BUF ]] && OPT_TUNE_BUF=bdp
+  case ${OPT_TUNE_ACT:-} in
+    status) tune_status ;;
+    restore) tune_restore ;;
+    preview) tune_detect; tune_plan "$preset" "${OPT_TUNE_BUF:-auto}"; tune_preview ;;
+    apply) TUNE_NOCONFIRM=$OPT_AUTO; tune_run "$preset" "${OPT_TUNE_BUF:-auto}" ;;
+    *)
+      if [[ -n $OPT_TUNE_PRESET$OPT_TUNE_CC$OPT_TUNE_QDISC$OPT_TUNE_BUF ]]; then
+        TUNE_NOCONFIRM=$OPT_AUTO; tune_run "$preset" "${OPT_TUNE_BUF:-auto}"
+      elif [[ -t 0 || -r /dev/tty ]] && (( ! OPT_AUTO )); then
+        menu_tune
+      else
+        tune_status
+      fi ;;
+  esac
+}
+
+# 安装流程调用：普通模式 = 默认预设 BBR + fq、中档缓冲区（与 v1.1.x 结果一致），不询问
 apply_tuning() {
   step "系统网络调优（保守参数，不更换内核）"
-  local bbr=0
-  if kernel_ge 4.9; then
-    modprobe tcp_bbr 2>/dev/null || true
-    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || [[ -d /sys/module/tcp_bbr ]]; then bbr=1; fi
+  TUNE_NOCONFIRM=1 TUNE_COMPACT=1
+  [[ -n $OPT_TUNE_BW && -n $OPT_TUNE_RTT && -z $OPT_TUNE_BUF ]] && OPT_TUNE_BUF=bdp
+  tune_run "$(tune_opt_preset bbr-fq)" "${OPT_TUNE_BUF:-medium}"
+  TUNE_COMPACT=0
+  [[ $INIT_SYS == systemd ]] && ok "journald 日志上限 100M。"
+  return 0
+}
+# NAT 模式：默认询问（只应用可写参数）；--auto 时仅在给了 --tune / --tune-preset 等参数时执行
+nat_tune() {
+  local preset
+  case ${OPT_TUNE:-2} in
+    0) return 0 ;;
+    1) : ;;
+    *) (( OPT_AUTO )) && return 0 ;;
+  esac
+  step "网络调优（可选，只应用本机/容器内可写的参数）"
+  tune_detect
+  tune_env_lines
+  if (( $(tune_writable_count) == 0 )); then
+    info "当前环境没有可写的内核网络参数（容器内由宿主机控制），跳过。"; return 0
   fi
-  mkdir -p "$(dirname "$SYSCTL_FILE")"
-  {
-    echo "# 由 proxy-oneclick 生成，卸载时会删除"
-    if (( bbr )); then
-      echo "net.core.default_qdisc = fq"
-      echo "net.ipv4.tcp_congestion_control = bbr"
-    fi
-    cat <<'SYSCTL'
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.ipv4.tcp_rmem = 4096 131072 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-net.core.netdev_max_backlog = 16384
-net.core.somaxconn = 4096
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 131072
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_keepalive_time = 600
-fs.file-max = 1048576
-fs.nr_open = 1048576
-SYSCTL
-  } >"$SYSCTL_FILE"
-  if (( SWAP_CREATED )); then echo "vm.swappiness = 10" >>"$SYSCTL_FILE"; fi
-  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || warn "部分 sysctl 参数未能生效（容器/受限虚拟化中属正常）。"
-
-  mkdir -p "$(dirname "$LIMITS_FILE")" "$(dirname "$SYSTEMD_LIMITS_FILE")" "$(dirname "$JOURNALD_FILE")"
-  printf '%s\n' "# proxy-oneclick" "* soft nofile 1048576" "* hard nofile 1048576" "root soft nofile 1048576" "root hard nofile 1048576" >"$LIMITS_FILE"
-  printf '%s\n' "# proxy-oneclick" "[Manager]" "DefaultLimitNOFILE=1048576" >"$SYSTEMD_LIMITS_FILE"
-  printf '%s\n' "# proxy-oneclick" "[Journal]" "SystemMaxUse=100M" "RuntimeMaxUse=50M" >"$JOURNALD_FILE"
-  systemctl daemon-reexec >/dev/null 2>&1 || true
-  systemctl restart systemd-journald >/dev/null 2>&1 || true
-
-  if (( bbr )); then
-    ok "已启用 BBR + fq（当前: $(sysval net.ipv4.tcp_congestion_control) / $(sysval net.core.default_qdisc)）"
-  else
-    warn "内核 $(uname -r) 不支持 BBR，已跳过（仅应用缓冲区等参数）。"
+  if [[ ${OPT_TUNE:-2} != 1 ]] && ! confirm "是否进行网络调优？（不可写的参数自动跳过；之后可随时用 proxy tune 调整或恢复）" y; then
+    info "已跳过网络调优（之后可运行: proxy tune）。"; return 0
   fi
-  ok "调优配置已写入 ${SYSCTL_FILE}，journald 日志上限 100M。"
+  preset=$(tune_opt_preset "")
+  [[ -n $OPT_TUNE_BW && -n $OPT_TUNE_RTT && -z $OPT_TUNE_BUF ]] && OPT_TUNE_BUF=bdp
+  if [[ -z $preset ]]; then
+    if tune_cc_ok bbr && [[ ${TUNE_ST[net.ipv4.tcp_congestion_control]} == ok ]]; then preset=bbr-fq
+    else preset=keep; fi
+  fi
+  TUNE_NOCONFIRM=$(( OPT_TUNE == 1 || OPT_AUTO ))
+  tune_run "$preset" "${OPT_TUNE_BUF:-auto}"
 }
 
 # ============================================================
@@ -1253,6 +2010,7 @@ check_port_free() { # $1 proto $2 port $3 允许的进程名(正则)
   if [[ -z $owner ]]; then
     [[ $1 == tcp && $2 == "$XRAY_PORT" && xray =~ ^($3)$ ]] && svc_active xray && return 0
     [[ $1 == udp && $2 == "$HY2_PORT" && hysteria =~ ^($3)$ ]] && svc_active hysteria-server && return 0
+    [[ $1 == udp && $2 == "$XRAY_PORT" && ${LAND_MODE:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
   fi
   warn "${1^^} 端口 $2 已被占用（进程: ${owner:-未知}）。"
   return 1
@@ -1282,8 +2040,12 @@ detect_ssh_ports() {
 # 列出除本脚本服务 / SSH 外其它对外监听的端口
 other_listen_ports() { # $1 = tcp|udp
   local flag=-Htlnp; [[ $1 == udp ]] && flag=-Hulnp
+  local elo=32768 ehi=60999
+  read -r elo ehi </proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || true
   ss "$flag" 2>/dev/null | awk '{print $4, $NF}' | while read -r addr users; do
     local port=${addr##*:} ip=${addr%:*}
+    # 看不到进程名（容器内缺少权限）的临时端口 UDP 套接字多为客户端连接（如 Hysteria2 经 socks5 转发落地的 UDP 会话），不是服务
+    [[ $1 == udp && $users != *users:* && $port =~ ^[0-9]+$ ]] && (( port >= elo && port <= ehi )) && continue
     [[ $ip =~ ^(127\.|\[::1\]|::1|\[?fe80) ]] && continue
     [[ $ip == "127.0.0.53%lo" || $ip == 127.0.0.54 ]] && continue
     [[ $users =~ \"(xray|hysteria|sshd|systemd-resolve|chronyd|dhclient|systemd-network)\" ]] && continue
@@ -1299,14 +2061,23 @@ install_xray() {
   if direct_mode; then install_xray_direct; return; fi
   step "安装 / 更新 Xray-core（官方 XTLS/Xray-install 脚本）"
   mktmp
+  # 之前以 NAT / 落地机模式安装过：删除本脚本自建的服务文件，让官方脚本重新安装它的 xray.service
+  # （自建服务只在端口 < 1024 时才有 CAP_NET_BIND_SERVICE，官方脚本不会覆盖已存在的服务文件）
+  local force=()
+  if [[ -f $XRAY_UNIT ]] && grep -q '由 proxy-oneclick 生成' "$XRAY_UNIT"; then
+    systemctl stop xray >/dev/null 2>&1 || true
+    rm -f "$XRAY_UNIT"; systemctl daemon-reload
+  fi
+  # 已有 xray 但没有服务文件时，官方脚本会因「版本相同」直接退出而不安装服务：强制重装
+  [[ ! -f $XRAY_UNIT && -x $XRAY_BIN ]] && force=(--force)
   fetch -o "${TMP_DIR}/xray-install.sh" "$XRAY_INSTALL_URL" || die "下载 Xray 安装脚本失败，请检查网络（GitHub 可达性）。"
-  if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install >"${TMP_DIR}/xray-install.log" 2>&1; then
+  if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1; then
     # GitHub API 限流(403)时：通过 releases/latest 跳转获取版本号后重试
     local tag
     tag=$(latest_tag XTLS/Xray-core)
     if [[ -n $tag ]]; then
       warn "官方脚本获取版本列表失败（可能是 GitHub API 限流），改为指定版本 ${tag} 重试 ..."
-      TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install --version "$tag" >"${TMP_DIR}/xray-install.log" 2>&1 || {
+      TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install --version "$tag" "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1 || {
         tail -n 20 "${TMP_DIR}/xray-install.log" >&2; die "Xray 安装失败。"; }
     else
       tail -n 20 "${TMP_DIR}/xray-install.log" >&2; die "Xray 安装失败。"
@@ -1358,7 +2129,7 @@ install_xray_direct() {
   tag=$(gh_latest_tag XTLS/Xray-core)
   [[ -n $tag ]] || { github_hint; die "获取 Xray 最新版本号失败。"; }
   [[ -x $XRAY_BIN ]] && cur=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}')
-  if [[ -n $cur && "v${cur#v}" == "$tag" ]] && { (( NAT_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
+  if [[ -n $cur && "v${cur#v}" == "$tag" ]] && { (( NAT_MODE || LAND_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
     ok "Xray 已是最新版本 ${tag}，跳过下载。"
   else
     asset=$(xray_asset_name)
@@ -1378,8 +2149,8 @@ install_xray_direct() {
       warn "未能下载 .dgst 校验文件，跳过 SHA256 校验。"
     fi
     dg="${TMP_DIR}/xray-unzip"; rm -rf "$dg"; mkdir -p "$dg"
-    # NAT 小鸡磁盘很小：只解压 xray 本体（配置不使用 geoip/geosite，内网段直接写 CIDR），解压后立即删除压缩包
-    if (( NAT_MODE )); then
+    # NAT 小鸡 / 落地机：只解压 xray 本体（配置不使用 geoip/geosite，内网段直接写 CIDR），解压后立即删除压缩包
+    if (( NAT_MODE || LAND_MODE )); then
       unzip -qo "${TMP_DIR}/${asset}" xray -d "$dg" || die "解压 Xray 失败。"
     else
       unzip -qo "${TMP_DIR}/${asset}" -d "$dg" || die "解压 Xray 失败。"
@@ -1625,6 +2396,9 @@ write_xray_config() {
   pqv_active && seed=$MLDSA_SEED
   mkdir -p "$(dirname "$XRAY_CONF")"
   tmp=$(mktemp "$(dirname "$XRAY_CONF")/.config.XXXXXX"); mv -f "$tmp" "${tmp}.json"; tmp="${tmp}.json"
+  if (( LAND_MODE )); then
+    land_xray_json >"$tmp"
+  else
   jq -n \
     --argjson port "$XRAY_PORT" --argjson clients "$clients" \
     --arg target "${SNI_TARGET:-$SNI:443}" --arg sni "$SNI" \
@@ -1662,6 +2436,8 @@ write_xray_config() {
       ]
     }
   }' >"$tmp"
+    relay_inject "$tmp"   # 中转机：落地出站（保存在状态文件中，每次重新生成配置都会重新加入）
+  fi
   if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2; rm -f "$tmp" "${tmp}.log"
     die "Xray 配置校验失败（xray run -test），未应用新配置。"
@@ -1685,7 +2461,7 @@ restart_xray() {
     svc_logs xray 20 >&2 || true
     die "Xray 启动失败，请查看上方日志。"
   fi
-  ok "Xray 运行中 (TCP ${XRAY_PORT}$( ((NAT_MODE)) && [[ $XRAY_EXT_PORT != "$XRAY_PORT" ]] && echo "，外部端口 ${XRAY_EXT_PORT}"))"
+  ok "Xray 运行中 ($( ((LAND_MODE)) && echo 'Shadowsocks 2022 TCP+UDP' || echo TCP) ${XRAY_PORT}$( ((NAT_MODE)) && [[ $XRAY_EXT_PORT != "$XRAY_PORT" ]] && echo "，外部端口 ${XRAY_EXT_PORT}"))"
 }
 
 selinux_fix() {
@@ -1740,6 +2516,7 @@ masquerade:
     url: https://${SNI}/
     rewriteHost: true
 HY
+  relay_hy2_yaml >>"${HY_CONF}.tmp"
   local grp="root"; id hysteria >/dev/null 2>&1 && grp=hysteria
   chown "root:${grp}" "${HY_CONF}.tmp" "$HY_KEY" "$HY_CRT"
   chmod 640 "${HY_CONF}.tmp" "$HY_KEY"; chmod 644 "$HY_CRT"
@@ -1871,6 +2648,7 @@ render_firewall_compat() {
 }
 
 apply_firewall() {
+  if (( LAND_MODE )); then land_fw_apply; return; fi
   if (( NAT_MODE )); then apply_nat_hop; return; fi
   (( FW_ENABLED )) || { warn "已跳过防火墙配置（--no-firewall 或保留了其它防火墙）。"; return 0; }
   step "配置 nftables 防火墙"
@@ -2325,13 +3103,14 @@ build_info() { # 输出完整信息（无颜色），用于保存文件
 }
 
 save_info() {
-  build_info >"${INFO_FILE}.tmp"
+  if (( LAND_MODE )); then land_build_info >"${INFO_FILE}.tmp"; else build_info >"${INFO_FILE}.tmp"; fi
   chmod 600 "${INFO_FILE}.tmp"; mv -f "${INFO_FILE}.tmp" "$INFO_FILE"
 }
 
 show_info() {
   load_state
   (( INSTALLED )) || die "尚未安装，请先执行安装。"
+  if (( LAND_MODE )); then land_show_info; return; fi
   save_info
   local vl vl_qr
   vl=$(vless_link "$UUID" "${NODE_NAME}-Reality" 1)
@@ -2393,13 +3172,14 @@ choose_ports() {
   # Xray 端口
   p=${OPT_PORT:-$XRAY_PORT}
   while :; do
-    if [[ -z $OPT_PORT ]]; then ask p "VLESS-REALITY 监听端口 (TCP)" "$p"; p=$(sanitize_port_input "$p"); p=${p// /}; fi
+    if [[ -z $OPT_PORT ]]; then ask p "${XRAY_LABEL:-VLESS-REALITY} 监听端口 ($( ((LAND_MODE)) && echo TCP+UDP || echo TCP))" "$p"; p=$(sanitize_port_input "$p"); p=${p// /}; fi
     if ! is_port "$p"; then
       (( OPT_AUTO )) && die "端口无效: $p"; warn "端口无效。"; p=443; continue
     fi
-    if check_port_free tcp "$p" "xray"; then XRAY_PORT=$p; break; fi
-    (( OPT_AUTO )) || [[ -n $OPT_PORT ]] && die "TCP 端口 $p 已被占用，请释放或使用 --port 指定其它端口。"
+    if check_port_free tcp "$p" "xray" && { (( ! LAND_MODE )) || check_port_free udp "$p" "xray"; }; then XRAY_PORT=$p; break; fi
+    (( OPT_AUTO )) || [[ -n $OPT_PORT ]] && die "端口 $p 已被占用，请释放或使用 --port 指定其它端口。"
   done
+  (( ! LAND_MODE )) || { HY2_ENABLED=0; return 0; }
   # Hysteria2
   if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
   elif (( ! OPT_AUTO )); then
@@ -2684,15 +3464,20 @@ choose_nat_ports() {
     if nat_usable "${XRAY_EXT_PORT:-0}"; then def=$XRAY_EXT_PORT; else def=$(nat_first_usable); fi
   fi
   while :; do
-    if [[ -n $OPT_PORT ]]; then p=$(opt_ext "$OPT_PORT"); else ask p "VLESS-REALITY 使用的外部端口（TCP，可选: $(nat_ext_list)）" "$def"; p=$(sanitize_port_input "$p"); p=${p// /}; fi
+    if [[ -n $OPT_PORT ]]; then p=$(opt_ext "$OPT_PORT"); else ask p "${XRAY_LABEL:-VLESS-REALITY} 使用的外部端口（$( ((LAND_MODE)) && echo 'TCP+UDP，映射需同时包含 UDP 才能转发 UDP' || echo TCP)，可选: $(nat_ext_list)）" "$def"; p=$(sanitize_port_input "$p"); p=${p// /}; fi
     if nat_usable "$p"; then
       if check_port_free tcp "$(ext2int "$p")" "xray"; then XRAY_EXT_PORT=$p; XRAY_PORT=$(ext2int "$p"); break; fi
     else
       warn "端口 ${p} 不在映射端口中或已被排除。"
     fi
-    { [[ -n $OPT_PORT ]] || (( OPT_AUTO )); } && die "无法使用外部端口 ${p} 作为 VLESS-REALITY 端口（NAT 模式下 --port 表示外部端口，需包含在 --nat-ports 中）。"
+    { [[ -n $OPT_PORT ]] || (( OPT_AUTO )); } && die "无法使用外部端口 ${p} 作为 ${XRAY_LABEL:-VLESS-REALITY} 端口（NAT 模式下 --port 表示外部端口，需包含在 --nat-ports 中）。"
     def=$(nat_first_usable "$p") || def=""
   done
+  if (( LAND_MODE )); then # 落地机：只有一个 SS2022 端口（TCP+UDP）
+    check_port_free udp "$XRAY_PORT" "xray" || warn "UDP ${XRAY_PORT} 已被占用，Shadowsocks 的 UDP 转发可能无法使用。"
+    HY2_ENABLED=0 HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT="" HOP_BACKEND=""
+    return 0
+  fi
 
   # 4) Hysteria2（UDP）：可与 Reality 共用同一个端口号（服务商同时映射 TCP+UDP 时，节省映射名额）
   if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
@@ -2774,8 +3559,14 @@ choose_nat_ports() {
 # NAT 模式说明：为什么跳过调优 / 防火墙 / fail2ban / Swap
 nat_skip_notice() {
   step "NAT 精简模式"
-  info "已跳过：sysctl/BBR 调优$( ((OPT_TUNE)) && echo '（已用 --tune 强制启用，见下文）')、nftables 防火墙、fail2ban、Swap、$( ((OPT_UPGRADE)) || echo '系统升级、')RealiTLScanner。"
-  echo "   原因：NAT 小鸡多为 LXC / OpenVZ 容器（当前: ${VIRT:-未知}），内核参数与 Swap 由宿主机控制，修改通常无权限或无效；"
+  info "已跳过：nftables 防火墙、fail2ban、Swap、$( ((OPT_UPGRADE)) || echo '系统升级、')RealiTLScanner。"
+  case ${OPT_TUNE:-2} in
+    1) echo "   网络调优：已用 --tune / --tune-preset 启用，只应用本机/容器内可写的参数（见下文）。" ;;
+    0) echo "   网络调优：已用 --no-tune 跳过（之后可运行 proxy tune）。" ;;
+    *) if (( OPT_AUTO )); then echo "   网络调优：--auto 下默认跳过（加 --tune 启用，或之后运行 proxy tune）。"
+       else echo "   网络调优：稍后询问，只应用可写的参数（不强制 BBR）。"; fi ;;
+  esac
+  echo "   原因：NAT 小鸡多为 LXC / OpenVZ 容器（当前: ${VIRT:-未知}），很多内核参数与 Swap 由宿主机控制，修改通常无权限或无效；"
   echo "         入站只能经过服务商的端口映射，本机防火墙意义不大；fail2ban 常驻约 30~50MB 内存，对 64~256MB 的小鸡负担过重。"
   echo "   Xray 日志级别 warning 且关闭访问日志；Hysteria2 日志级别 warn。"
   local envs; envs=$(go_mem_env)
@@ -2811,16 +3602,32 @@ resolve_mode() {
   [[ -n $OPT_NAT ]] && NAT_MODE=$OPT_NAT
   [[ $NAT_MODE == 1 ]] || NAT_MODE=0
   if [[ -z $OPT_UPGRADE ]]; then if (( NAT_MODE )); then OPT_UPGRADE=0; else OPT_UPGRADE=1; fi; fi
-  if [[ -z $OPT_TUNE ]]; then if (( NAT_MODE )); then OPT_TUNE=0; else OPT_TUNE=1; fi; fi
+  if [[ -z $OPT_TUNE ]]; then
+    if (( ! NAT_MODE )); then OPT_TUNE=1
+    elif [[ -n $OPT_TUNE_PRESET$OPT_TUNE_CC$OPT_TUNE_QDISC$OPT_TUNE_BUF$OPT_TUNE_BW ]]; then OPT_TUNE=1
+    else OPT_TUNE=2; fi
+  fi
   return 0
 }
 
 do_install() {
   load_state
+  # 落地机：--land，或已安装为落地机且未指定 --no-land
+  if [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; then do_install_land; return; fi
+  local was_land=$LAND_MODE
+  LAND_MODE=0
   [[ -n $OPT_NAT ]] && NAT_MODE=$OPT_NAT
   preflight      # Alpine 可能在此切换为 NAT 模式
   resolve_mode
   take_lock
+  if (( was_land )); then
+    info "由落地机改装为 Reality / Hysteria2 节点：移除落地机白名单规则，停止 Shadowsocks，重新生成节点配置。"
+    land_fw_remove
+    if is_openrc; then rc-service xray stop >/dev/null 2>&1 9>&- || true   # 避免旧的 SS 端口被当作「其它已监听端口」放行
+    else systemctl stop xray >/dev/null 2>&1 || true; fi
+    HY2_ENABLED=1
+    if (( ! NAT_MODE )); then XRAY_PORT=443 HY2_PORT=443 HOP_RANGE="20000-50000"; fi
+  fi
   if (( INSTALLED )) && (( ! OPT_AUTO )); then
     warn "检测到已安装。重新安装将保留现有密钥/UUID/密码，仅更新组件与配置。"
     confirm "继续重新安装？" y || return 0
@@ -2836,11 +3643,11 @@ do_install() {
   if (( NAT_MODE )); then
     nat_net_check
     nat_skip_notice
-    (( OPT_TUNE )) && apply_tuning
+    nat_tune
   else
     SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
     ensure_swap
-    (( OPT_TUNE )) && apply_tuning
+    if (( OPT_TUNE == 1 )); then apply_tuning; fi
   fi
 
   step "端口设置"
@@ -2964,11 +3771,19 @@ reality_selftest() {
       if [[ $code =~ ^[23][0-9][0-9]$ ]]; then rc=0 ok_url=$url; break; fi
     done
   fi
+  local eip=""
+  if (( rc == 0 )) && relay_active; then
+    eip=$(curl -s --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" https://api64.ipify.org 2>/dev/null | tr -d '[:space:]') || eip=""
+  fi
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   if (( rc == 0 )); then
     local h=${ok_url#https://}; h=${h%%/*}
     ok "REALITY 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
+    if relay_active; then
+      if [[ -n $eip ]]; then ok "落地转发生效：客户端 → 本机 Reality → $(relay_tag) → 出口 IP ${eip}"
+      else warn "经落地转发查询出口 IP 失败。"; fi
+    fi
   else
     local direct=""
     direct=$(curl -s -o /dev/null --connect-timeout 8 -m 12 -w '%{http_code}' "https://www.gstatic.com/generate_204" 2>/dev/null) || true
@@ -2985,6 +3800,657 @@ reality_selftest() {
 }
 
 # ============================================================
+#       落地机（Shadowsocks 2022 出口）/ 中转机的落地转发
+# ============================================================
+# 落地机：本机只运行 Xray 的 Shadowsocks 2022 入站（TCP+UDP），不装 Reality / Hysteria2 / fail2ban，
+#         可选来源 IP 白名单（Xray 路由 + nftables 双重限制），仅允许中转机连接。
+# 中转机：普通 / NAT 模式安装的节点，把 Xray 的默认出站改为落地机（ss:// 链接），
+#         内网 / BT 屏蔽规则仍在最前；Hysteria2 经本机 127.0.0.1 的 socks 入站同样走落地机。
+land_norm_method() {
+  case ${1,,} in
+    1|aes-128|aes128|aes-128-gcm|2022-blake3-aes-128-gcm) echo 2022-blake3-aes-128-gcm ;;
+    2|aes-256|aes256|aes-256-gcm|2022-blake3-aes-256-gcm) echo 2022-blake3-aes-256-gcm ;;
+    3|chacha|chacha20|chacha20-poly1305|2022-blake3-chacha20-poly1305) echo 2022-blake3-chacha20-poly1305 ;;
+    *) return 1 ;;
+  esac
+}
+land_key_len() { if [[ $1 == *aes-128* ]]; then echo 16; else echo 32; fi; }
+land_gen_key() { openssl rand -base64 "$(land_key_len "$1")"; }
+b64d() { # 兼容 URL-safe 与缺少填充的 base64
+  local s=${1//-/+}; s=${s//_//}
+  while (( ${#s} % 4 )); do s+="="; done
+  printf '%s' "$s" | base64 -d 2>/dev/null
+}
+land_key_ok() { # $1 方法 $2 密钥（多用户 iPSK 写法 k1:k2 逐段检查）
+  local want part n; want=$(land_key_len "$1")
+  [[ -n $2 && $2 =~ ^[A-Za-z0-9+/=:]+$ ]] || return 1
+  local IFS=:
+  for part in $2; do
+    n=$( { printf '%s' "$part" | base64 -d 2>/dev/null || true; } | wc -c | tr -d ' ')
+    [[ $n == "$want" ]] || return 1
+  done
+}
+urldecode() { local s=${1//\\/\\\\}; printf '%b' "${s//%/\\x}"; }
+
+# ---------- 来源 IP 白名单 ----------
+valid_cidr() {
+  local a=$1 ip pfx="" x
+  if [[ $a == */* ]]; then ip=${a%/*}; pfx=${a##*/}; else ip=$a; fi
+  [[ -z $pfx || $pfx =~ ^[0-9]{1,3}$ ]] || return 1
+  if is_ipv4 "$ip"; then
+    local IFS=.; for x in $ip; do (( 10#$x <= 255 )) || return 1; done
+    [[ -z $pfx ]] || (( 10#$pfx <= 32 ))
+    return
+  fi
+  if [[ $ip == *:* && $ip =~ ^[0-9A-Fa-f:.]+$ && $ip != *:::* ]]; then
+    [[ -z $pfx ]] || (( 10#$pfx <= 128 ))
+    return
+  fi
+  return 1
+}
+land_norm_allow() { # 逗号/空格分隔 → LAND_NORM（空格分隔、去重）；有无效项时 LAND_BAD=该项并返回 1
+  local s x out=""
+  LAND_NORM="" LAND_BAD=""
+  s=$(sanitize_port_input "$1"); s=${s//,/ }
+  for x in $s; do
+    valid_cidr "$x" || { LAND_BAD=$x; return 1; }
+    [[ " $out " == *" $x "* ]] || out+="${out:+ }$x"
+  done
+  LAND_NORM=$out
+}
+land_allow_json() { # 白名单 + 本机回环（自检用）→ JSON 数组
+  local x list='["127.0.0.1/32","::1/128"]'
+  for x in $LAND_ALLOW; do list=$(jq -c --arg x "$x" '. + [$x]' <<<"$list"); done
+  printf '%s' "$list"
+}
+
+# ---------- 落地机 Xray 配置 ----------
+land_xray_json() {
+  jq -n --argjson port "$XRAY_PORT" --arg method "$LAND_METHOD" --arg key "$LAND_KEY" \
+    --argjson privnets "$PRIV_NETS_JSON" --argjson allow "$(land_allow_json)" --argjson wl "$([[ -n $LAND_ALLOW ]] && echo 1 || echo 0)" '
+  {
+    log: {loglevel: "warning", access: "none"},
+    inbounds: [{
+      tag: "ss-in",
+      port: $port,
+      protocol: "shadowsocks",
+      settings: {method: $method, password: $key, network: "tcp,udp"},
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+    }],
+    outbounds: [
+      {tag: "direct", protocol: "freedom"},
+      {tag: "block", protocol: "blackhole"}
+    ],
+    routing: {
+      domainStrategy: "AsIs",
+      rules: ([
+        {type: "field", ip: $privnets, outboundTag: "block"},
+        {type: "field", protocol: ["bittorrent"], outboundTag: "block"}
+      ] + (if $wl == 1 then [
+        {type: "field", source: $allow, outboundTag: "direct"},
+        {type: "field", inboundTag: ["ss-in"], outboundTag: "block"}
+      ] else [] end))
+    }
+  }'
+}
+
+ss_link_build() { # $1 方法 $2 密钥 $3 地址 $4 端口 $5 名称（SIP002；2022 方法使用 百分号编码的 method:password）
+  printf 'ss://%s:%s@%s:%s#%s' "$(urlencode "$1")" "$(urlencode "$2")" "$(host_fmt "$3")" "$4" "$(urlencode "$5")"
+}
+land_link() { ss_link_build "$LAND_METHOD" "$LAND_KEY" "$(server_addr)" "$(pub_xray_port)" "${NODE_NAME}"; }
+land_tag_of() { # $1 名称 $2 地址
+  local t; t=$(printf '%s' "${1:-$2}" | tr -cd 'A-Za-z0-9_.-' | cut -c1-32)
+  [[ -n $t ]] || t=$(printf '%s' "$2" | tr -cd 'A-Za-z0-9_.-' | cut -c1-32)
+  printf 'land-%s' "${t:-1}"
+}
+land_outbound_json() { # $1 方法 $2 密钥 $3 地址 $4 端口 $5 tag
+  jq -n --arg m "$1" --arg k "$2" --arg a "$3" --argjson p "$4" --arg t "$5" \
+    '{tag: $t, protocol: "shadowsocks", settings: {servers: [{address: $a, port: $p, method: $m, password: $k}]}}'
+}
+
+land_build_info() {
+  local link; link=$(land_link)
+  echo "================ proxy-oneclick 落地机信息 ================"
+  echo "生成时间: $(date '+%F %T %Z')"
+  echo "协议:     Shadowsocks 2022（Xray，TCP+UDP）"
+  echo "地址:     $(server_addr)   端口: $(pub_xray_port)$( ((NAT_MODE)) && echo "（本机监听 ${XRAY_PORT}）")"
+  echo "加密:     ${LAND_METHOD}"
+  echo "密钥:     ${LAND_KEY}"
+  echo "白名单:   ${LAND_ALLOW:-未设置（任何 IP 均可连接，建议只允许中转机）}"
+  echo
+  echo "---------- ss:// 链接（SIP002）----------"
+  echo "$link"
+  echo
+  echo "---------- 中转机一键命令（中转机需已用本脚本安装节点）----------"
+  echo "proxy land-add '${link}'"
+  echo
+  echo "---------- Xray 出站（outbound）片段：可直接粘贴到其它 Xray 中转配置的 outbounds ----------"
+  land_outbound_json "$LAND_METHOD" "$LAND_KEY" "$(server_addr)" "$(pub_xray_port)" "$(land_tag_of "$NODE_NAME" "$(server_addr)")"
+  echo
+  echo "---------- mihomo (Clash.Meta) ----------"
+  cat <<Y
+proxies:
+  - name: "${NODE_NAME}"
+    type: ss
+    server: $(server_addr)
+    port: $(pub_xray_port)
+    cipher: ${LAND_METHOD}
+    password: "${LAND_KEY}"
+    udp: true
+Y
+  echo "========================================================"
+}
+land_show_info() {
+  load_state
+  (( INSTALLED && LAND_MODE )) || die "本机尚未安装为落地机。"
+  land_build_info >"${INFO_FILE}.tmp"; chmod 600 "${INFO_FILE}.tmp"; mv -f "${INFO_FILE}.tmp" "$INFO_FILE"
+  local link; link=$(land_link)
+  echo
+  hr; _green "  落地机  Shadowsocks 2022 (${LAND_METHOD})"; hr
+  printf '  地址: %s  端口: %s (TCP+UDP)%s\n' "$(server_addr)" "$(pub_xray_port)" "$( ((NAT_MODE)) && echo "  本机监听: ${XRAY_PORT}")"
+  printf '  密钥: %s\n' "$LAND_KEY"
+  if [[ -n $LAND_ALLOW ]]; then printf '  来源白名单: %s%s\n' "$LAND_ALLOW" "$(land_fw_active && echo '（Xray 路由 + nftables）' || echo '（Xray 路由）')"
+  else printf '  来源白名单: %s未设置%s（任何人拿到链接都能用；建议 proxy allow 设置为中转机 IP）\n' "$C_YELLOW" "$C_NONE"; fi
+  echo; _cyan "  ss:// 链接："; echo "$link"
+  echo; _cyan "  在中转机上执行（中转机需已用本脚本安装 Reality / Hy2 节点）："
+  echo "  proxy land-add '${link}'"
+  echo; _cyan "  Xray 出站片段（手动配置其它中转时粘贴到 outbounds，并设为默认出站）："
+  land_outbound_json "$LAND_METHOD" "$LAND_KEY" "$(server_addr)" "$(pub_xray_port)" "$(land_tag_of "$NODE_NAME" "$(server_addr)")"
+  echo; hr
+  printf '  以上信息已保存到 %s（权限 600）。随时执行 %sproxy info%s 再次查看。\n' "$INFO_FILE" "$C_GREEN" "$C_NONE"
+  hr
+}
+
+# ---------- 落地机 nftables 白名单（非 NAT 容器且有 nft 时） ----------
+land_fw_active() { have nft && nft list table inet "$LAND_NFT_TABLE" >/dev/null 2>&1; }
+land_fw_remove() {
+  if [[ -f $LAND_FW_UNIT || -f $LAND_FW_RC ]]; then svc_disable_stop proxy-oneclick-land-fw; fi
+  have nft && { nft delete table inet "$LAND_NFT_TABLE" >/dev/null 2>&1 || true; }
+  rm -f "$LAND_FW_UNIT" "$LAND_FW_RC" "$LAND_FW_FILE"
+  sd_reload
+}
+land_fw_render() {
+  local v4="" v6="" x
+  for x in $LAND_ALLOW; do if [[ $x == *:* ]]; then v6+="${v6:+, }$x"; else v4+="${v4:+, }$x"; fi; done
+  {
+    echo "#!/usr/sbin/nft -f"
+    echo "# 由 proxy-oneclick 生成（落地机来源 IP 白名单）；卸载时删除"
+    echo "table inet ${LAND_NFT_TABLE}"
+    echo "delete table inet ${LAND_NFT_TABLE}"
+    echo "table inet ${LAND_NFT_TABLE} {"
+    [[ -n $v4 ]] && printf '  set allow4 {\n    type ipv4_addr; flags interval; auto-merge\n    elements = { %s }\n  }\n' "$v4"
+    [[ -n $v6 ]] && printf '  set allow6 {\n    type ipv6_addr; flags interval; auto-merge\n    elements = { %s }\n  }\n' "$v6"
+    echo "  chain input {"
+    echo "    type filter hook input priority -10; policy accept;"
+    echo "    iif \"lo\" accept"
+    [[ -n $v4 ]] && echo "    meta l4proto { tcp, udp } th dport ${XRAY_PORT} ip saddr @allow4 accept"
+    [[ -n $v6 ]] && echo "    meta l4proto { tcp, udp } th dport ${XRAY_PORT} ip6 saddr @allow6 accept"
+    echo "    meta l4proto { tcp, udp } th dport ${XRAY_PORT} counter drop comment \"not in whitelist\""
+    echo "  }"
+    echo "}"
+  } >"${LAND_FW_FILE}.tmp"
+}
+land_fw_apply() {
+  if [[ -z $LAND_ALLOW ]] || (( ! LAND_MODE )); then land_fw_remove; return 0; fi
+  [[ -n $VIRT ]] || detect_virt
+  if (( NAT_MODE )) && is_container; then
+    land_fw_remove; info "NAT 容器（${VIRT}）：来源白名单仅由 Xray 路由实现（非白名单连接被丢弃）。"; return 0
+  fi
+  have nft || { [[ -n $PKG ]] && pkg_try nftables; }
+  if ! have nft; then land_fw_remove; info "未安装 nftables：来源白名单仅由 Xray 路由实现。"; return 0; fi
+  mkdir -p "$STATE_DIR"
+  land_fw_render
+  if ! nft -c -f "${LAND_FW_FILE}.tmp" >/dev/null 2>&1; then
+    rm -f "${LAND_FW_FILE}.tmp"; land_fw_remove
+    warn "nftables 不支持白名单规则（内核/容器限制），来源白名单仅由 Xray 路由实现。"; return 0
+  fi
+  mv -f "${LAND_FW_FILE}.tmp" "$LAND_FW_FILE"; chmod 600 "$LAND_FW_FILE"
+  local nftbin; nftbin=$(command -v nft)
+  if is_openrc; then
+    cat >"$LAND_FW_RC" <<RC
+#!/sbin/openrc-run
+# 由 proxy-oneclick 生成（落地机来源 IP 白名单）
+description="proxy-oneclick landing whitelist"
+depend() {
+  want net
+  after firewall
+  before xray
+}
+start() {
+  ebegin "Loading proxy-oneclick landing whitelist"
+  ${nftbin} -f "${LAND_FW_FILE}"
+  eend \$?
+}
+stop() {
+  ebegin "Removing proxy-oneclick landing whitelist"
+  ${nftbin} delete table inet ${LAND_NFT_TABLE} 2>/dev/null
+  eend 0
+}
+RC
+    chmod 755 "$LAND_FW_RC"
+  else
+    cat >"$LAND_FW_UNIT" <<UNIT
+[Unit]
+Description=proxy-oneclick landing whitelist (nftables)
+After=network-pre.target nftables.service
+Before=xray.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${nftbin} -f ${LAND_FW_FILE}
+ExecStop=-${nftbin} delete table inet ${LAND_NFT_TABLE}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+  fi
+  svc_enable proxy-oneclick-land-fw
+  svc_restart proxy-oneclick-land-fw >/dev/null 2>&1 || true
+  if land_fw_active; then ok "nftables 白名单已加载：端口 ${XRAY_PORT} (TCP+UDP) 只允许 ${LAND_ALLOW}"
+  else land_fw_remove; warn "nftables 白名单加载失败，来源白名单仅由 Xray 路由实现。"; fi
+}
+
+# ---------- 经 SS2022 服务器的真实请求测试（落地机自检 / 中转机添加落地前） ----------
+LAND_EXIT_IP=""
+ss_probe() { # $1 地址 $2 端口 $3 方法 $4 密钥；成功时 LAND_EXIT_IP=出口 IP
+  LAND_EXIT_IP=""
+  [[ -x $XRAY_BIN ]] || { warn "未找到 xray，无法测试。"; return 1; }
+  mktmp
+  local dir port="" i pid url ip="" rc=1
+  dir=$(mktemp -d "${TMP_DIR}/ssprobe.XXXXXX") || return 1
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    port=$(( 20000 + RANDOM % 40000 ))
+    [[ $port == "$XRAY_PORT" || $port == "${HY2_PORT:-}" || $port == "${RELAY_SOCKS:-}" ]] && continue
+    port_in_use tcp "$port" || break
+  done
+  jq -n --argjson sport "$port" --argjson ob "$(land_outbound_json "$3" "$4" "$1" "$2" probe)" \
+    '{log: {loglevel: "warning"}, inbounds: [{listen: "127.0.0.1", port: $sport, protocol: "socks", settings: {udp: false}}], outbounds: [$ob]}' \
+    >"${dir}/client.json" 2>/dev/null || { rm -rf "$dir"; return 1; }
+  chmod 600 "${dir}/client.json"
+  env GOMEMLIMIT=24MiB GOGC=50 "$XRAY_BIN" run -config "${dir}/client.json" >"${dir}/client.log" 2>&1 &
+  pid=$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    kill -0 "$pid" 2>/dev/null || break
+    port_in_use tcp "$port" && break
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    for url in "https://api.ipify.org" "https://api64.ipify.org" "https://ifconfig.co/ip" "https://icanhazip.com"; do
+      ip=$(curl -s --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null | tr -d '[:space:]') || ip=""
+      if [[ $ip =~ ^[0-9A-Fa-f:.]{3,45}$ ]] && { is_ipv4 "$ip" || [[ $ip == *:* ]]; }; then rc=0; break; fi
+    done
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  (( rc == 0 )) && LAND_EXIT_IP=$ip
+  (( rc == 0 )) || grep -vi 'password' "${dir}/client.log" 2>/dev/null | tail -n 3 | sed 's/^/    /' >&2 || true
+  rm -rf "$dir"
+  return $rc
+}
+tcp_probe() { # $1 地址 $2 端口
+  local h=$1
+  if have timeout; then timeout 6 bash -c "exec 3<>/dev/tcp/${h}/$2" 2>/dev/null
+  else bash -c "exec 3<>/dev/tcp/${h}/$2" 2>/dev/null; fi
+}
+
+land_selftest() {
+  info "落地机自检：临时客户端 → 本机 127.0.0.1:${XRAY_PORT}（SS2022）→ 外网 ..."
+  if ss_probe 127.0.0.1 "$XRAY_PORT" "$LAND_METHOD" "$LAND_KEY"; then
+    ok "落地机自检通过：出口 IP ${LAND_EXIT_IP}"
+  else
+    warn "落地机自检未通过（经本机 SS2022 访问外网失败）。可查看: proxy status"
+  fi
+  return 0
+}
+
+# ---------- 落地机安装 ----------
+land_choose_method() {
+  local m=${OPT_LAND_METHOD:-} c def=1
+  if [[ -z $m ]]; then
+    case $LAND_METHOD in *aes-256*) def=2 ;; *chacha20*) def=3 ;; esac
+    if (( OPT_AUTO )); then m=$def
+    else
+      echo "   加密方式（均为 Shadowsocks 2022，客户端/中转需支持 SS2022）："
+      echo "     1) 2022-blake3-aes-128-gcm        （默认，最轻量，CPU 有 AES 指令时最快）"
+      echo "     2) 2022-blake3-aes-256-gcm"
+      echo "     3) 2022-blake3-chacha20-poly1305  （无 AES 硬件加速的 ARM 小鸡）"
+      ask c "请选择" "$def"; m=$c
+    fi
+  fi
+  m=$(land_norm_method "$m") || { warn "加密方式无效，使用默认 2022-blake3-aes-128-gcm。"; m=2022-blake3-aes-128-gcm; }
+  if [[ $m != "$LAND_METHOD" ]] || ! land_key_ok "$m" "$LAND_KEY"; then
+    LAND_METHOD=$m; LAND_KEY=$(land_gen_key "$m")
+    info "已生成新的 ${m} 密钥（$(land_key_len "$m") 字节）。"
+  fi
+}
+land_choose_allow() {
+  local r
+  if [[ -n $OPT_LAND_ALLOW ]]; then r=$OPT_LAND_ALLOW
+  elif (( OPT_AUTO )); then r=${LAND_ALLOW:-none}
+  else
+    echo "   来源 IP 白名单：只允许这些中转机连接（IPv4 / IPv6 / CIDR，逗号或空格分隔）。"
+    echo "   不确定中转机出口 IP 时可先留空（none），之后用 proxy allow 修改。"
+    ask r "允许的来源 IP" "${LAND_ALLOW:-none}"
+  fi
+  [[ ${r,,} == none || ${r,,} == all || $r == 无 ]] && r=""
+  while :; do
+    if land_norm_allow "$r"; then LAND_ALLOW=$LAND_NORM; break; fi
+    { [[ -n $OPT_LAND_ALLOW ]] || (( OPT_AUTO )); } && die "白名单中有无效地址: ${LAND_BAD}（例如 1.2.3.4、1.2.3.0/24、2001:db8::1）"
+    warn "无效地址: ${LAND_BAD}"
+    ask r "允许的来源 IP（none 为不限制）" "none"
+    [[ ${r,,} == none ]] && r=""
+  done
+  if [[ -n $LAND_ALLOW ]]; then info "来源白名单: ${LAND_ALLOW}"
+  else warn "未设置来源白名单：任何拿到链接的人都能使用本落地机（建议之后用 proxy allow 设置）。"; fi
+}
+land_pick_default_port() {
+  local p i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    p=$(( 20000 + RANDOM % 40000 ))
+    port_in_use tcp "$p" || port_in_use udp "$p" || { printf '%s' "$p"; return 0; }
+  done
+  printf '%s' 34567
+}
+
+do_install_land() {
+  load_state
+  local was_land=$LAND_MODE was_inst=$INSTALLED
+  [[ -n $OPT_NAT ]] && NAT_MODE=$OPT_NAT
+  LAND_MODE=1
+  preflight
+  resolve_mode
+  take_lock
+  if (( was_inst )) && (( ! was_land )); then
+    warn "本机已安装 Reality / Hysteria2 节点。改装为落地机将移除 Reality 入站、Hysteria2、本脚本防火墙与 fail2ban 规则（密钥保留在状态文件中）。"
+    (( OPT_AUTO )) || confirm "确认改装为落地机？" n || return 0
+  elif (( was_inst )) && (( ! OPT_AUTO )); then
+    warn "检测到已安装落地机。重新安装将保留现有端口/密钥/白名单（除非另行修改）。"
+    confirm "继续重新安装？" y || return 0
+  fi
+
+  pkg_update_upgrade
+  step "安装依赖"
+  install_deps_nat
+  detect_virt
+  ensure_time_sync      # SS2022 校验时间戳，时间误差 > 30 秒会被拒绝
+  mktmp
+  step "获取服务器信息"
+  detect_ip; detect_geo; show_sysinfo
+  if (( NAT_MODE )); then
+    nat_net_check
+    nat_tune
+  else
+    SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
+    if (( OPT_TUNE == 1 )); then apply_tuning; fi
+  fi
+
+  step "端口设置"
+  HY2_ENABLED=0
+  if (( ! was_land )) && [[ -z $OPT_PORT ]]; then XRAY_PORT=$(land_pick_default_port); XRAY_EXT_PORT=""; fi
+  XRAY_LABEL="Shadowsocks 2022"
+  if (( NAT_MODE )); then
+    choose_nat_addr
+    choose_nat_ports
+  else
+    choose_ports
+    NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE="" HOP_BACKEND=""
+  fi
+  HY2_ENABLED=0 HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT="" HOP_BACKEND=""
+  [[ -n $OPT_NAME ]] && NODE_NAME=$OPT_NAME
+  if [[ -z $NODE_NAME ]] || (( ! was_land )) && [[ -z $OPT_NAME ]]; then NODE_NAME="$(default_node_name)-land"; fi
+
+  step "Shadowsocks 2022 设置"
+  land_choose_method
+  land_choose_allow
+
+  # 清理节点模式的组件（若之前装过）
+  RELAY_ON=0
+  [[ -x $HY_BIN || -f $HY_UNIT || -f $HY_RC ]] && { info "移除 Hysteria2 ..."; remove_hysteria; }
+  remove_nat_hop
+  if [[ -f $FW_FILE || -f $FW_UNIT ]]; then info "移除节点模式的 nftables 规则 ..."; remove_firewall; fi
+  if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; fi
+  FW_ENABLED=0
+
+  install_xray
+  save_state
+  write_xray_config
+  restart_xray
+  land_fw_apply
+  INSTALLED=1
+  save_state
+  self_install
+  ( trap - ERR; set +e; land_selftest ) || true
+  land_show_info
+  if (( ! NAT_MODE )); then
+    echo
+    warn "如果云服务商有安全组 / 防火墙，请放行 TCP 和 UDP ${XRAY_PORT}$([[ -n $LAND_ALLOW ]] && echo "（可只允许中转机 IP）")。"
+  fi
+  echo
+  _green "落地机安装完成！在中转机上执行上面的 proxy land-add 命令即可；管理菜单：proxy"
+}
+
+# ---------- 落地机管理 ----------
+need_land() { need_installed; (( LAND_MODE )) || die "本机不是落地机（此功能仅用于 --land 安装的落地机）。"; }
+need_node() { need_installed; (( ! LAND_MODE )) || die "本机是落地机（Shadowsocks 2022），没有 Reality / Hysteria2 节点功能。菜单中可管理白名单、端口与密钥。"; }
+
+land_apply() {
+  save_state
+  write_xray_service
+  write_xray_config
+  restart_xray
+  land_fw_apply
+  save_state
+  land_build_info >"${INFO_FILE}.tmp" && chmod 600 "${INFO_FILE}.tmp" && mv -f "${INFO_FILE}.tmp" "$INFO_FILE"
+}
+land_menu_allow() {
+  need_land
+  [[ -n $PKG ]] || detect_os
+  echo "  当前白名单: ${LAND_ALLOW:-未设置（不限制）}"
+  local s=$OPT_LAND_ALLOW
+  land_choose_allow
+  OPT_LAND_ALLOW=$s
+  land_apply
+  ok "白名单已更新: ${LAND_ALLOW:-不限制}"
+}
+land_menu_port() {
+  need_land
+  detect_os; detect_virt
+  local old; old=$(pub_xray_port)
+  local s1=$OPT_PORT s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
+  XRAY_LABEL="Shadowsocks 2022"
+  if (( NAT_MODE )); then
+    OPT_PORT="" OPT_NAT_EXT="" OPT_NAT_ADDR=""
+    choose_nat_addr; choose_nat_ports
+  else
+    OPT_PORT=${s1:-}
+    choose_ports
+  fi
+  OPT_PORT=$s1 OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
+  HY2_ENABLED=0 HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT=""
+  land_apply
+  ok "端口已更新：${old} -> $(pub_xray_port)。中转机需要重新执行 land-add（新链接见下方）。"
+  land_show_info
+}
+land_menu_key() {
+  need_land
+  echo "  当前加密方式: ${LAND_METHOD}"
+  local old=$LAND_METHOD
+  land_choose_method
+  if [[ $LAND_METHOD == "$old" ]]; then
+    (( OPT_AUTO )) || confirm "加密方式未变，是否重新生成密钥（旧链接失效）？" y || return 0
+    LAND_KEY=$(land_gen_key "$LAND_METHOD")
+  fi
+  land_apply
+  ok "已更换为 ${LAND_METHOD} 新密钥。中转机需要重新执行 land-add（新链接见下方）。"
+  land_show_info
+}
+
+# ---------- 中转机：落地转发 ----------
+RELAY_M="" RELAY_K="" RELAY_H="" RELAY_P="" RELAY_N=""
+ss_parse() { # $1 ss:// 链接；成功时设置 RELAY_M/K/H/P/N。返回 1 格式错误 2 非 SS2022 3 密钥长度不对
+  local l rest ui hp name="" m k host port
+  l=$(printf '%s' "$1" | tr -d '[:space:]')
+  [[ $l == ss://* ]] || return 1
+  rest=${l#ss://}
+  if [[ $rest == *'#'* ]]; then name=${rest#*#}; rest=${rest%%#*}; fi
+  rest=${rest%%\?*}; rest=${rest%/}
+  [[ $rest == *@* ]] || rest=$(b64d "$rest") || return 1
+  [[ $rest == *@* ]] || return 1
+  ui=${rest%@*}; hp=${rest##*@}
+  ui=$(urldecode "$ui")
+  [[ $ui == *:* ]] || ui=$(b64d "$ui") || return 1
+  [[ $ui == *:* ]] || return 1
+  m=${ui%%:*}; k=${ui#*:}
+  if [[ $hp =~ ^\[([0-9A-Fa-f:.]+)\]:([0-9]+)$ ]]; then host=${BASH_REMATCH[1]} port=${BASH_REMATCH[2]}
+  elif [[ $hp =~ ^([^:/]+):([0-9]+)$ ]]; then host=${BASH_REMATCH[1]} port=${BASH_REMATCH[2]}
+  else return 1; fi
+  valid_addr "$host" && is_port "$port" || return 1
+  [[ $m == 2022-blake3-* ]] || return 2
+  m=$(land_norm_method "$m") || return 2
+  land_key_ok "$m" "$k" || return 3
+  name=$(urldecode "$name" | tr -cd 'A-Za-z0-9_.-')
+  RELAY_M=$m RELAY_K=$k RELAY_H=$host RELAY_P=$port RELAY_N=$name
+}
+relay_active() { [[ $RELAY_ON == 1 && -n $RELAY_LINK ]] && (( ! LAND_MODE )) && ss_parse "$RELAY_LINK"; }
+relay_tag() { land_tag_of "$RELAY_N" "$RELAY_H"; }
+relay_inject() { # $1 Xray 配置文件（节点模式）：落地出站放在最前 + 路由最后一条兜底到落地
+  relay_active || { [[ $RELAY_ON == 1 && -n $RELAY_LINK ]] && warn "保存的落地链接无法解析，已按直连生成配置。"; return 0; }
+  local ob tag; tag=$(relay_tag)
+  ob=$(land_outbound_json "$RELAY_M" "$RELAY_K" "$RELAY_H" "$RELAY_P" "$tag")
+  if [[ -z $RELAY_SOCKS ]] || ! is_port "$RELAY_SOCKS"; then RELAY_SOCKS=$(land_pick_default_port); fi
+  jq --argjson ob "$ob" --argjson sp "$RELAY_SOCKS" --argjson hy "${HY2_ENABLED:-0}" '
+    .outbounds = [$ob] + .outbounds
+    | (if $hy == 1 then .inbounds += [{tag: "hy2-relay", listen: "127.0.0.1", port: $sp, protocol: "socks",
+          settings: {auth: "noauth", udp: true, ip: "127.0.0.1"}}] else . end)
+    | .routing.rules += [{type: "field", network: "tcp,udp", outboundTag: $ob.tag}]' "$1" >"${1}.relay" &&
+    mv -f "${1}.relay" "$1"
+}
+relay_hy2_yaml() { # 追加到 Hysteria2 配置：经本机 Xray socks 入站走落地
+  relay_active || return 0
+  (( HY2_ENABLED )) && is_port "${RELAY_SOCKS:-}" || return 0
+  cat <<HY
+
+# 落地转发：Hysteria2 流量经本机 Xray（127.0.0.1:${RELAY_SOCKS}）→ 落地机 ${RELAY_H}
+outbounds:
+  - name: land
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:${RELAY_SOCKS}
+HY
+}
+
+relay_test() { # 使用 RELAY_M/K/H/P：TCP 连接 → 经落地的真实请求（检查出口 IP）
+  local hip
+  info "测试 TCP 连接 ${RELAY_H}:${RELAY_P} ..."
+  if tcp_probe "$RELAY_H" "$RELAY_P"; then ok "TCP 连接成功。"
+  else warn "无法建立 TCP 连接到 ${RELAY_H}:${RELAY_P}（落地机未运行 / 端口未放行 / 落地机白名单未包含本机 IP / 云安全组拦截）。"; return 1; fi
+  info "经落地机发起真实请求（查询出口 IP）..."
+  if ! ss_probe "$RELAY_H" "$RELAY_P" "$RELAY_M" "$RELAY_K"; then
+    warn "经落地机的请求失败：可能是密钥/加密方式不对、落地机白名单未包含本机出口 IP $(curl -4 -s --connect-timeout 5 -m 8 https://api.ipify.org 2>/dev/null || true)，或两端时间相差超过 30 秒。"
+    return 1
+  fi
+  hip=$RELAY_H
+  if ! is_ipv4 "$hip" && [[ $hip != *:* ]]; then hip=$(getent ahosts "$hip" 2>/dev/null | awk 'NR==1{print $1}') || hip=""; fi
+  if [[ -n $hip && $LAND_EXIT_IP == "$hip" ]]; then ok "经落地机访问正常：出口 IP ${LAND_EXIT_IP}（与落地机地址一致）"
+  else ok "经落地机访问正常：出口 IP ${LAND_EXIT_IP}$([[ -n $hip ]] && echo "（落地机地址 ${hip}；多 IP / NAT 落地机出口不同属正常）")"; fi
+  return 0
+}
+
+relay_add() {
+  need_node
+  local link=${OPT_LAND_LINK:-} rc=0
+  if [[ -z $link ]]; then
+    (( OPT_AUTO )) && die "请提供链接：proxy land-add 'ss://...'"
+    echo "  在落地机上执行 proxy info 可获得 ss:// 链接（Shadowsocks 2022）。"
+    ask link "粘贴落地机 ss:// 链接" "${RELAY_LINK}"
+  fi
+  ss_parse "$link" || rc=$?
+  case $rc in
+    0) ;;
+    2) die "只支持 Shadowsocks 2022 链接（2022-blake3-aes-128-gcm / aes-256-gcm / chacha20-poly1305）。" ;;
+    3) die "密钥长度与加密方式不匹配（aes-128 需要 16 字节、其它需要 32 字节的 base64 密钥）。" ;;
+    *) die "无法解析 ss:// 链接（格式: ss://方法:密钥@地址:端口#名称）。" ;;
+  esac
+  step "测试落地机 ${RELAY_H}:${RELAY_P}（${RELAY_M}）"
+  if ! relay_test; then
+    if (( OPT_FORCE )); then warn "测试未通过，--force 强制启用。"
+    elif (( OPT_AUTO )) || ! confirm "测试未通过，仍然保存并启用落地转发吗？" n; then
+      die "未启用落地转发（配置未改变）。确认无误可加 --force 强制启用。"
+    fi
+  fi
+  RELAY_LINK=$(ss_link_build "$RELAY_M" "$RELAY_K" "$RELAY_H" "$RELAY_P" "${RELAY_N:-land}")
+  RELAY_ON=1
+  if [[ -z $RELAY_SOCKS ]] || port_in_use tcp "$RELAY_SOCKS"; then RELAY_SOCKS=$(land_pick_default_port); fi
+  detect_os
+  apply_all
+  ok "落地转发已启用：本机 Xray 默认出站 → $(relay_tag)（${RELAY_H}:${RELAY_P}）$( ((HY2_ENABLED)) && echo '；Hysteria2 同样经落地机')"
+  ( trap - ERR; set +e; reality_selftest ) || true
+}
+relay_off() {
+  need_node
+  [[ -n $RELAY_LINK ]] || { warn "尚未设置落地转发。"; return 0; }
+  [[ $RELAY_ON == 1 ]] || { info "落地转发已是停用状态。"; return 0; }
+  RELAY_ON=0; detect_os; apply_all
+  ok "已停用落地转发（恢复直连出站；落地链接已保留，可用 proxy land-on 重新启用）。"
+}
+relay_on() {
+  need_node
+  [[ -n $RELAY_LINK ]] || die "没有保存的落地链接，请先 proxy land-add 'ss://...'"
+  ss_parse "$RELAY_LINK" || die "保存的落地链接无法解析，请重新 land-add。"
+  step "测试落地机 ${RELAY_H}:${RELAY_P}"
+  if ! relay_test && (( ! OPT_FORCE )); then
+    { (( OPT_AUTO )) || ! confirm "测试未通过，仍然启用吗？" n; } && die "未启用落地转发。"
+  fi
+  RELAY_ON=1; detect_os; apply_all
+  ok "已启用落地转发 → $(relay_tag)"
+  ( trap - ERR; set +e; reality_selftest ) || true
+}
+relay_del() {
+  need_node
+  [[ -n $RELAY_LINK ]] || { info "没有设置落地转发。"; return 0; }
+  (( OPT_AUTO )) || confirm "删除保存的落地链接并恢复直连？" y || return 0
+  RELAY_LINK="" RELAY_ON=0 RELAY_SOCKS=""; detect_os; apply_all
+  ok "已删除落地转发，恢复直连出站。"
+}
+relay_status_line() {
+  if [[ -z $RELAY_LINK ]]; then echo "未设置"; return; fi
+  if ss_parse "$RELAY_LINK"; then
+    printf '%s %s:%s（%s）%s' "$(relay_tag)" "$(host_fmt "$RELAY_H")" "$RELAY_P" "$RELAY_M" "$([[ $RELAY_ON == 1 ]] && echo "${C_GREEN}已启用${C_NONE}" || echo "${C_YELLOW}已停用${C_NONE}")"
+  else echo "链接无法解析"; fi
+}
+menu_relay() {
+  need_node
+  echo; hr; _green "  落地转发（中转机 → 落地机 Shadowsocks 2022）"; hr
+  echo "  当前落地: $(relay_status_line)"
+  echo "  本机出口 IP: $(curl -4 -s --connect-timeout 4 -m 6 https://api.ipify.org 2>/dev/null || echo 未知)（需在落地机白名单中: 落地机上 proxy allow）"
+  echo "  启用后：客户端 → 本机 Reality/Hy2 → 落地机 → 目标网站；内网 / BT 屏蔽规则仍优先生效。"
+  hr
+  echo "  1) 添加 / 修改落地（粘贴 ss:// 链接）  2) 测试落地连通性  3) 停用（恢复直连，保留链接）"
+  echo "  4) 重新启用  5) 删除落地  0) 返回"
+  local c; ask c "请选择" "0"
+  case $c in
+    1) OPT_LAND_LINK=""; relay_add ;;
+    2) if [[ -n $RELAY_LINK ]] && ss_parse "$RELAY_LINK"; then relay_test || true; else warn "尚未设置落地。"; fi ;;
+    3) relay_off ;;
+    4) relay_on ;;
+    5) relay_del ;;
+    *) return 0 ;;
+  esac
+}
+do_land_cli() {
+  case ${OPT_LAND_ACT:-menu} in
+    add) relay_add ;;
+    on) relay_on ;;
+    off) relay_off ;;
+    del) relay_del ;;
+    test) need_node; if [[ -z $RELAY_LINK ]] || ! ss_parse "$RELAY_LINK"; then die "尚未设置落地。"; fi; relay_test ;;
+    *) load_state; if (( LAND_MODE )); then land_show_info; else menu_relay; fi ;;
+  esac
+}
+
+# ============================================================
 #                        管理功能
 # ============================================================
 need_installed() {
@@ -2995,6 +4461,7 @@ need_installed() {
 }
 
 apply_all() { # 重新生成配置并重启（在修改参数后调用）
+  if (( LAND_MODE )); then land_apply; return; fi
   save_state
   if direct_mode; then
     write_xray_service
@@ -3009,7 +4476,7 @@ apply_all() { # 重新生成配置并重启（在修改参数后调用）
 }
 
 menu_change_sni() {
-  need_installed; mktmp
+  need_node; mktmp
   detect_ip; detect_geo
   (( NAT_MODE )) || SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
   local old=$SNI
@@ -3025,6 +4492,7 @@ menu_change_sni() {
 
 menu_regen_keys() {
   need_installed
+  if (( LAND_MODE )); then land_menu_key; return; fi
   warn "将重新生成 UUID、x25519 密钥、ShortId、ML-DSA-65 密钥及 Hysteria2 密码/证书，所有旧客户端将失效！"
   (( OPT_AUTO )) || confirm "确认重新生成？" n || return 0
   gen_xray_keys
@@ -3037,6 +4505,7 @@ menu_regen_keys() {
 
 menu_change_ports() {
   need_installed
+  if (( LAND_MODE )); then land_menu_port; return; fi
   if (( NAT_MODE )); then menu_change_ports_nat; return; fi
   local oldx=$XRAY_PORT oldh=$HY2_PORT
   choose_ports_interactive
@@ -3069,7 +4538,7 @@ choose_ports_interactive() {
 }
 
 menu_users() {
-  need_installed
+  need_node
   while :; do
     echo; hr; _green "  用户管理（VLESS 额外用户）"; hr
     echo "  主用户: ${UUID}  (main)"
@@ -3142,6 +4611,9 @@ update_script() {
       if (( NAT_MODE )) && ! grep -q 'NAT_MODE' "${TMP_DIR}/proxy.sh"; then
         warn "在线版本不支持 NAT 模式，更新后将无法管理当前安装，已取消。"; return 0
       fi
+      if { (( LAND_MODE )) || [[ -n $RELAY_LINK ]]; } && ! grep -q 'LAND_MODE' "${TMP_DIR}/proxy.sh"; then
+        warn "在线版本不支持落地机 / 落地转发，更新后将无法管理当前配置，已取消。"; return 0
+      fi
       (( OPT_AUTO )) && { warn "自动模式下不降级，已取消。"; return 0; }
       confirm "仍要降级吗？" n || return 0
     fi
@@ -3155,9 +4627,10 @@ update_script() {
 menu_status() {
   load_state
   [[ -n $INIT_SYS ]] || detect_init
-  echo; hr; _green "  服务状态$( ((NAT_MODE)) && echo '（NAT 模式）')"; hr
+  echo; hr; _green "  服务状态$( ((LAND_MODE)) && echo '（落地机）')$( ((NAT_MODE)) && echo '（NAT 模式）')"; hr
   local s svcs="xray hysteria-server proxy-oneclick-fw fail2ban"
   if (( NAT_MODE )); then svcs="xray hysteria-server"; [[ -n $HOP_RANGE ]] && svcs+=" proxy-oneclick-hop"; fi
+  if (( LAND_MODE )); then svcs="xray"; [[ -f $LAND_FW_UNIT || -f $LAND_FW_RC ]] && svcs+=" proxy-oneclick-land-fw"; fi
   for s in $svcs; do
     local st; st=$(svc_state "$s")
     [[ -z $st ]] && st="unknown"
@@ -3167,16 +4640,26 @@ menu_status() {
   done
   [[ -x $XRAY_BIN ]] && printf '  Xray 版本:      %s\n' "$("$XRAY_BIN" version | awk 'NR==1{print $2}')"
   [[ -x $HY_BIN ]] && printf '  Hysteria2 版本: %s\n' "$("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
-  if (( NAT_MODE )); then
-    nat_status_lines
+  if (( LAND_MODE )); then
+    printf '  落地机:         Shadowsocks 2022 %s，端口 %s (TCP+UDP)%s\n' "$LAND_METHOD" "$(pub_xray_port)" "$( ((NAT_MODE)) && echo " → 本机 ${XRAY_PORT}")"
+    printf '  来源白名单:     %s\n' "${LAND_ALLOW:-未设置（不限制）}$([[ -n $LAND_ALLOW ]] && { land_fw_active && echo '（Xray 路由 + nftables）' || echo '（Xray 路由）'; })"
   else
-    printf '  拥塞控制:       %s / %s\n' "$(sysval net.ipv4.tcp_congestion_control)" "$(sysval net.core.default_qdisc)"
+    printf '  落地转发:       %s\n' "$(relay_status_line)"
+    (( NAT_MODE )) && nat_status_lines
   fi
+  printf '  拥塞控制:       %s / %s\n' "$(sysval net.ipv4.tcp_congestion_control)" "$(sysval net.core.default_qdisc)"
+  if [[ -f $TUNE_CUR ]]; then printf '  网络调优:       预设 %s / 缓冲区 %s（详情: proxy tune status）\n' "$(tune_cur_get PRESET)" "$(tune_cur_get BUFFER_EFF)"
+  elif [[ -f $SYSCTL_FILE ]]; then printf '  网络调优:       v1.1.x 默认（BBR + fq）\n'
+  else printf '  网络调优:       未应用（proxy tune）\n'; fi
   printf '  时间同步:       %s\n' "$(time_sync_status)"
   echo; _cyan "  监听端口："
   local lx lh
   lx=$(ss -Htlnp 2>/dev/null | awk '/xray/{print "   TCP "$4"  xray"}') || true
   lh=$(ss -Hulnp 2>/dev/null | awk '/hysteria/{print "   UDP "$4"  hysteria"}') || true
+  if (( LAND_MODE )); then
+    lh=$(ss -Hulnp 2>/dev/null | awk '/xray/{print "   UDP "$4"  xray"}') || true
+    [[ -n $lh ]] || { lh=$(ss -Huln "sport = :${XRAY_PORT}" 2>/dev/null | awk '{print "   UDP "$4"  (xray)"}') || true; }
+  fi
   # 看不到进程名时（容器权限受限）按配置端口显示
   if [[ -z $lx ]]; then lx=$(ss -Htln "sport = :${XRAY_PORT}" 2>/dev/null | awk '{print "   TCP "$4"  (xray)"}') || true; fi
   (( HY2_ENABLED )) && [[ -z $lh ]] && { lh=$(ss -Huln "sport = :${HY2_PORT}" 2>/dev/null | awk '{print "   UDP "$4"  (hysteria)"}') || true; }
@@ -3187,7 +4670,9 @@ menu_status() {
     fail2ban-client status sshd 2>/dev/null | sed 's/^/   /' || true
   fi
   echo
-  if (( NAT_MODE )) && [[ -z $HOP_RANGE ]]; then
+  if (( LAND_MODE )); then
+    echo "  1) 查看 Xray 日志   3) 查看 nftables 白名单规则   4) 实时跟踪 Xray 日志   0) 返回"
+  elif (( NAT_MODE )) && [[ -z $HOP_RANGE ]]; then
     echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   4) 实时跟踪 Xray 日志   0) 返回"
   elif (( NAT_MODE )); then
     echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看端口跳跃规则   4) 实时跟踪 Xray 日志   0) 返回"
@@ -3199,6 +4684,7 @@ menu_status() {
     1) svc_logs xray 80 ;;
     2) svc_logs hysteria-server 80 ;;
     3) if (( NAT_MODE )); then if [[ -n $HOP_RANGE ]]; then show_hop_rules; fi
+       elif (( LAND_MODE )); then nft list table inet "$LAND_NFT_TABLE" 2>/dev/null || warn "未启用 nftables 白名单。"
        else
          nft list table inet "$NFT_TABLE" 2>/dev/null || warn "未找到本脚本的防火墙表。"
          nft list table ip "${NFT_TABLE}_nat" 2>/dev/null || true
@@ -3234,6 +4720,7 @@ show_hop_rules() {
 
 menu_nat() {
   need_installed
+  if (( LAND_MODE )); then land_menu_port; return; fi
   (( NAT_MODE )) || { warn "当前不是 NAT 模式。"; return 0; }
   detect_virt
   echo; hr; _green "  NAT 信息 / 端口跳跃"; hr
@@ -3305,6 +4792,7 @@ TIP
 
 menu_firewall() {
   need_installed
+  if (( LAND_MODE )); then land_menu_allow; return; fi
   if (( NAT_MODE )); then warn "NAT 模式不管理防火墙（入站由服务商端口映射控制）。"; menu_nat; return; fi
   echo; hr; _green "  防火墙管理"; hr
   echo "  当前状态: $( ((FW_ENABLED)) && echo 由本脚本管理 || echo 未启用)   SSH 端口: ${SSH_PORTS:-未检测}"
@@ -3329,8 +4817,10 @@ do_uninstall() {
   require_root
   load_state
   [[ -n $INIT_SYS ]] || detect_init
-  if (( NAT_MODE )); then
-    warn "将卸载 Xray、Hysteria2、端口跳跃规则、服务脚本及管理命令（NAT 模式）。"
+  if (( LAND_MODE )); then
+    warn "将卸载落地机：Xray（Shadowsocks 2022）、来源白名单规则、网络调优（如有）、服务脚本及管理命令。"
+  elif (( NAT_MODE )); then
+    warn "将卸载 Xray、Hysteria2、端口跳跃规则、网络调优（如有）、服务脚本及管理命令（NAT 模式）。"
   else
     warn "将卸载 Xray、Hysteria2、本脚本防火墙规则、调优配置、fail2ban 规则及管理命令。"
   fi
@@ -3345,16 +4835,11 @@ do_uninstall() {
   ok "Xray 已移除"
   remove_hysteria; ok "Hysteria2 已移除"
   remove_nat_hop
-  remove_firewall; ok "防火墙 / 端口跳跃规则已移除"
+  remove_firewall; land_fw_remove; ok "防火墙 / 端口跳跃 / 落地机白名单规则已移除"
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; ok "fail2ban 规则已移除（fail2ban 软件包保留）"; fi
-  if [[ -f $SYSCTL_FILE || -f $LIMITS_FILE || -f $SYSTEMD_LIMITS_FILE || -f $JOURNALD_FILE ]]; then
-    rm -f "$SYSCTL_FILE" "$LIMITS_FILE" "$SYSTEMD_LIMITS_FILE" "$JOURNALD_FILE"
-    sysctl --system >/dev/null 2>&1 || true
-    if [[ $INIT_SYS == systemd ]]; then
-      systemctl daemon-reexec >/dev/null 2>&1 || true
-      systemctl restart systemd-journald >/dev/null 2>&1 || true
-    fi
-    ok "调优配置已移除（BBR 等将在重启后恢复系统默认）"
+  if tune_has_config; then
+    ( trap - ERR; set +e; tune_restore quiet ) || warn "恢复调优设置时出现问题，请运行 sysctl --system 或重启。"
+    ok "调优配置已移除（已恢复调优前的参数）"
   fi
   if (( DNS64_SET )) && [[ -f $RESOLV_BAK ]]; then
     if confirm "安装时写入了 DNS64 服务器，是否恢复原来的 /etc/resolv.conf？" y; then
@@ -3385,6 +4870,7 @@ show_menu() {
   load_state
   clear 2>/dev/null || true
   [[ -n $INIT_SYS ]] || detect_init
+  if (( LAND_MODE )); then show_land_menu; return; fi
   local menu10="防火墙管理"; (( NAT_MODE )) && menu10="NAT 信息 / 端口跳跃"
   local st="${C_RED}未安装${C_NONE}"
   if (( INSTALLED )); then
@@ -3405,7 +4891,10 @@ ${C_CYAN}============================================================${C_NONE}
    ${C_GREEN}8)${C_NONE} 运行状态 / 日志
    ${C_GREEN}9)${C_NONE} 网络测速 / 延迟提示
   ${C_GREEN}10)${C_NONE} ${menu10}
-  ${C_GREEN}11)${C_NONE} 卸载
+  ${C_GREEN}11)${C_NONE} 网络调优（BBR / 队列算法 / 缓冲区 / 恢复）
+  ${C_GREEN}12)${C_NONE} 添加 / 修改落地转发（本机作中转，出口走落地机）
+  ${C_GREEN}13)${C_NONE} 安装为落地机（Shadowsocks 2022 出口，给其它中转机用）
+  ${C_GREEN}14)${C_NONE} 卸载
    ${C_GREEN}0)${C_NONE} 退出
 ${C_CYAN}------------------------------------------------------------${C_NONE}
 MENU
@@ -3422,19 +4911,70 @@ MENU
     8) act=menu_status ;;
     9) act=menu_speed ;;
     10) if (( NAT_MODE )); then act=menu_nat; else act=menu_firewall; fi ;;
-    11) act=do_uninstall ;;
+    11) act=menu_tune ;;
+    12) act=menu_relay ;;
+    13) OPT_LAND=1; act=do_install ;;
+    14) act=do_uninstall ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
+  run_menu_act "$act"
+}
+run_menu_act() {
+  local act=$1
   # 在子 shell 中执行：出错时返回菜单而不是直接退出
   local rc=0
   set +e
   ( set -e; "$act" )
   rc=$?
   set -e
+  OPT_LAND=""
   (( rc == 0 )) || warn "操作未完成（退出码 ${rc}）。"
   [[ $act == do_uninstall && ! -x $BIN_PATH && ! -f $STATE_FILE ]] && exit 0
   return 0
+}
+
+show_land_menu() {
+  local st="${C_RED}未安装${C_NONE}"
+  if (( INSTALLED )); then
+    if svc_active xray; then st="${C_GREEN}运行中${C_NONE}"; else st="${C_YELLOW}已安装 (Xray 未运行)${C_NONE}"; fi
+  fi
+  cat <<MENU
+${C_CYAN}============================================================${C_NONE}
+   ${C_BOLD}proxy 一键脚本 v${SCRIPT_VERSION}${C_NONE}  ${C_YELLOW}落地机${C_NONE}（Shadowsocks 2022）
+   状态: ${st}   端口: $(pub_xray_port) (TCP+UDP)   加密: ${LAND_METHOD#2022-blake3-}
+   白名单: ${LAND_ALLOW:-未设置（不限制）}$( ((NAT_MODE)) && printf '\n   %sNAT 模式%s  地址: %s  映射: %s' "$C_YELLOW" "$C_NONE" "${SERVER_ADDR:-?}" "${NAT_PORTS:-?}")
+${C_CYAN}============================================================${C_NONE}
+   ${C_GREEN}1)${C_NONE} 安装 / 重新安装（落地机）
+   ${C_GREEN}2)${C_NONE} 查看 ss:// 链接 / 中转机命令 / Xray 出站片段
+   ${C_GREEN}3)${C_NONE} 修改来源 IP 白名单
+   ${C_GREEN}4)${C_NONE} 修改端口
+   ${C_GREEN}5)${C_NONE} 更换密钥 / 加密方式
+   ${C_GREEN}6)${C_NONE} 更新 Xray / 脚本
+   ${C_GREEN}7)${C_NONE} 运行状态 / 日志
+   ${C_GREEN}8)${C_NONE} 网络调优（BBR / 队列算法 / 缓冲区 / 恢复）
+   ${C_GREEN}9)${C_NONE} 改装为 Reality / Hysteria2 节点
+  ${C_GREEN}10)${C_NONE} 卸载
+   ${C_GREEN}0)${C_NONE} 退出
+${C_CYAN}------------------------------------------------------------${C_NONE}
+MENU
+  local c act=""; ask c "请输入数字" ""
+  (( TTY_EOF )) && { echo; exit 0; }
+  case $c in
+    1) act=do_install ;;
+    2) act=show_info ;;
+    3) act=land_menu_allow ;;
+    4) act=land_menu_port ;;
+    5) act=land_menu_key ;;
+    6) act=menu_update ;;
+    7) act=menu_status ;;
+    8) act=menu_tune ;;
+    9) OPT_LAND=0; act=do_install ;;
+    10) act=do_uninstall ;;
+    0|q|Q) exit 0 ;;
+    *) warn "请输入正确的数字。"; return 0 ;;
+  esac
+  run_menu_act "$act"
 }
 
 usage() {
@@ -3456,9 +4996,10 @@ proxy 一键脚本 v${SCRIPT_VERSION} —— VLESS + REALITY + Vision (ML-DSA-65
   --no-firewall       不配置 nftables 防火墙
   --no-upgrade        跳过系统软件包升级
   --no-tune           跳过 sysctl 网络调优
+  --tune-preset <名>  安装/调优使用的预设（默认 bbr-fq，见下方「网络调优」）
   -h, --help          显示帮助
 
-NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过调优·防火墙·fail2ban·Swap）:
+NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙·fail2ban·Swap；调优可选）:
   --nat               启用 NAT 模式（Alpine 必须使用；之后 proxy 命令自动沿用）
   --no-nat            切换回普通模式
   --nat-addr <地址>   链接中使用的公网 IP 或域名（默认自动检测，IPv4 优先）
@@ -3471,10 +5012,37 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过调优·�
   --nat-exclude <端口> 整段转发时需要排除的外部端口（如映射给 SSH 的端口），逗号分隔
   --hop <段>          NAT 模式默认关闭；仅整段转发时可用，例如 10003-10020（自动跳过 Reality/排除端口）
   --dns64             IPv6-only 机器无法访问 GitHub 时写入公共 DNS64 服务器
-  --tune / --upgrade  NAT 模式下仍执行 sysctl 调优 / 系统升级（默认跳过）
+  --tune / --upgrade  NAT 模式下执行网络调优（只写可写参数）/ 系统升级（交互安装会询问调优，--auto 默认跳过）
   例: bash proxy.sh --nat --auto --nat-addr 1.2.3.4 --nat-ports 52430,52431
       bash proxy.sh --nat --auto --port 52430 --nat-share      # 只有一个 TCP+UDP 映射端口
       bash proxy.sh --nat --auto --nat-port 59221:443        # 公网 59221 → 内部 443（TCP+UDP 同一条映射）
+
+网络调优（独立功能，未安装代理也可用；NAT / LXC / Alpine 自动跳过只读参数）:
+  proxy tune                  交互菜单（查看状态 / 选择预设 / 恢复）
+  proxy tune status           当前拥塞控制、队列算法、关键参数及是否可写
+  proxy tune preview          只预览（当前值 → 目标值），不修改
+  proxy tune apply            应用（先预览再确认；加 --auto 不询问）
+  proxy tune restore          恢复调优前的原值并删除配置文件
+  --tune-preset <名>  bbr-fq（默认）| bbr-fq_codel | bbr-cake | cubic-fq_codel（保守）| keep（只调缓冲区）| custom
+  --tune-cc <算法>    自定义拥塞控制（须在 tcp_available_congestion_control 中），例如 bbr / cubic
+  --tune-qdisc <算法> 自定义队列算法：fq | fq_codel | cake | fq_pie | sfq | pfifo_fast
+  --tune-buffer <档>  auto（按内存，默认）| small | medium | large | bdp
+  --tune-bw <Mbps> --tune-rtt <ms>   按带宽×延迟（BDP）计算缓冲区上限
+  例: proxy tune apply --tune-preset bbr-fq_codel --auto
+      proxy tune apply --tune-cc bbr --tune-qdisc cake --tune-bw 1000 --tune-rtt 180
+
+落地机 / 落地转发（中转机 → 落地机，出口 IP 为落地机）:
+  --land              安装为落地机：只运行 Xray Shadowsocks 2022（TCP+UDP），无 Reality/Hy2，内存占用最低
+                      可与 --nat（NAT 映射端口 / Alpine）、--port、--name、--auto 组合
+  --land-method <m>   aes-128（默认 2022-blake3-aes-128-gcm）| aes-256 | chacha20
+  --land-allow <列表> 来源 IP 白名单（只允许中转机；IPv4/IPv6/CIDR，逗号分隔；none = 不限制）
+  --no-land           落地机改装回 Reality / Hysteria2 节点
+  例: bash proxy.sh --land --auto --land-allow 203.0.113.10          # 落地机，只允许中转机 203.0.113.10
+      bash proxy.sh --land --nat --auto --port 52430:8388            # NAT 落地机：公网 52430 → 内部 8388
+  proxy allow [--land-allow 列表]   （落地机）修改来源白名单
+  proxy land-add 'ss://...'         （中转机）添加 / 替换落地：测试连通后设为默认出站（--force 测试失败也启用）
+  proxy land-test | land-off | land-on | land-del   （中转机）测试 / 停用（恢复直连，保留链接）/ 重新启用 / 删除
+  proxy land                        菜单（落地机上显示 ss:// 链接）
 
 管理命令:
   proxy               打开交互菜单
@@ -3489,6 +5057,8 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过调优·�
   proxy speed         测速 / 延迟提示
   proxy firewall      防火墙管理（NAT 模式为 NAT 信息 / 端口跳跃）
   proxy nat           NAT 信息 / 修改映射端口 / 端口跳跃
+  proxy tune          网络调优（见上）
+  proxy land          落地转发 / 落地机信息（见上）
   proxy uninstall     卸载
 USAGE
 }
@@ -3514,6 +5084,25 @@ parse_args() {
       --no-tune) OPT_TUNE=0 ;;
       --tune) OPT_TUNE=1 ;;
       --upgrade) OPT_UPGRADE=1 ;;
+      --tune-preset|--tune-preset=*)
+        local tp; if [[ $1 == *=* ]]; then tp=${1#*=}; else tp=${2-}; shift; fi
+        OPT_TUNE_PRESET=$(tune_norm_preset "$tp") || die "--tune-preset 参数无效: ${tp}（可选 ${TUNE_PRESETS[*]}）" ;;
+      --tune-buffer|--tune-buf)
+        case ${2-} in auto|small|medium|large|bdp) OPT_TUNE_BUF=$2 ;; *) die "--tune-buffer 参数无效（auto|small|medium|large|bdp）" ;; esac; shift ;;
+      --tune-cc) [[ ${2-} =~ ^[a-z0-9_]{1,16}$ ]] || die "--tune-cc 参数无效"; OPT_TUNE_CC=$2; shift ;;
+      --tune-qdisc) [[ ${2-} =~ ^(fq|fq_codel|cake|fq_pie|sfq|pfifo_fast|keep)$ ]] || die "--tune-qdisc 参数无效（fq|fq_codel|cake|fq_pie|sfq|pfifo_fast）"; OPT_TUNE_QDISC=$2; shift ;;
+      --tune-bw) [[ ${2-} =~ ^[0-9]{1,6}$ ]] || die "--tune-bw 需要 1-100000 的整数（Mbps）"
+        OPT_TUNE_BW=$((10#$2)); (( OPT_TUNE_BW >= 1 && OPT_TUNE_BW <= 100000 )) || die "--tune-bw 需要 1-100000 的整数（Mbps）"; shift ;;
+      --tune-rtt) [[ ${2-} =~ ^[0-9]{1,5}$ ]] || die "--tune-rtt 需要 1-2000 的整数（ms）"
+        OPT_TUNE_RTT=$((10#$2)); (( OPT_TUNE_RTT >= 1 && OPT_TUNE_RTT <= 2000 )) || die "--tune-rtt 需要 1-2000 的整数（ms）"; shift ;;
+      tune|tuning)
+        OPT_ACTION=tune
+        case ${2-} in
+          status|show) OPT_TUNE_ACT=status; shift ;;
+          preview|diff|dry-run) OPT_TUNE_ACT=preview; shift ;;
+          apply|set) OPT_TUNE_ACT=apply; shift ;;
+          restore|reset|revert) OPT_TUNE_ACT=restore; shift ;;
+        esac ;;
       --nat) OPT_NAT=1 ;;
       --no-nat) OPT_NAT=0 ;;
       --nat-addr|--addr) [[ -n ${2-} ]] || die "$1 需要参数"; OPT_NAT_ADDR=$2; shift ;;
@@ -3522,6 +5111,24 @@ parse_args() {
       --nat-share) OPT_NAT_SHARE=1 ;;
       --nat-no-share) OPT_NAT_SHARE=0 ;;
       --dns64) OPT_DNS64=1 ;;
+      --land) OPT_LAND=1 ;;
+      --no-land) OPT_LAND=0 ;;
+      --land-method) land_norm_method "${2-}" >/dev/null || die "--land-method 参数无效（aes-128 | aes-256 | chacha20）"; OPT_LAND_METHOD=$2; shift ;;
+      --land-allow)
+        [[ -n ${2-} ]] || die "--land-allow 需要参数（例如 1.2.3.4,2001:db8::/64，或 none）"
+        if [[ ${2,,} == none ]]; then OPT_LAND_ALLOW=none; else land_norm_allow "$2" || die "--land-allow 中有无效地址: ${LAND_BAD}"; OPT_LAND_ALLOW=$2; fi
+        shift ;;
+      --force) OPT_FORCE=1 ;;
+      land-add|relay-add)
+        OPT_ACTION=land; OPT_LAND_ACT=add
+        if [[ ${2-} == ss://* ]]; then OPT_LAND_LINK=$2; shift; fi ;;
+      ss://*) OPT_LAND_LINK=$1; [[ -n $OPT_ACTION ]] || { OPT_ACTION=land; OPT_LAND_ACT=add; } ;;
+      land-on|relay-on) OPT_ACTION=land; OPT_LAND_ACT=on ;;
+      land-off|relay-off) OPT_ACTION=land; OPT_LAND_ACT=off ;;
+      land-del|land-rm|land-remove|relay-del) OPT_ACTION=land; OPT_LAND_ACT=del ;;
+      land-test|relay-test) OPT_ACTION=land; OPT_LAND_ACT="test" ;;
+      land|relay) OPT_ACTION=land ;;
+      allow|whitelist) OPT_ACTION=allow ;;
       -h|--help|help) usage; exit 0 ;;
       -v|--version|version) echo "$SCRIPT_VERSION"; exit 0 ;;
       install) OPT_ACTION=install ;;
@@ -3542,14 +5149,32 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND ]]; }; then
     OPT_ACTION=install
   fi
+  # 只给了 --land-allow：修改落地机白名单
+  [[ -z $OPT_ACTION && -n $OPT_LAND_ALLOW ]] && OPT_ACTION=allow
+  # 只给了调优参数（或单独的 --tune）：执行独立调优
+  if [[ -z $OPT_ACTION ]] && { [[ -n $OPT_TUNE_PRESET$OPT_TUNE_CC$OPT_TUNE_QDISC$OPT_TUNE_BUF$OPT_TUNE_BW$OPT_TUNE_RTT ]] || [[ $OPT_TUNE == 1 ]]; }; then
+    OPT_ACTION=tune
+  fi
+  [[ -n $OPT_TUNE_BW && -z $OPT_TUNE_RTT || -z $OPT_TUNE_BW && -n $OPT_TUNE_RTT ]] && die "--tune-bw 与 --tune-rtt 需要同时使用"
   # 普通模式下 --port / --hy2-port 只接受单个端口；NAT 模式的 外部:内部 写法在安装时再校验
   if [[ $OPT_NAT != 1 ]]; then
     [[ -z $OPT_PORT || $OPT_PORT != *:* || -f $STATE_FILE ]] || die "--port 的 外部:内部 写法仅用于 NAT 模式（--nat）。"
   fi
   return 0
+}
+tune_norm_preset() { # 预设名（含别名）→ 标准名
+  case ${1,,} in
+    bbr-fq|bbr|default|fq) echo bbr-fq ;;
+    bbr-fq_codel|bbr-fqcodel|fq_codel) echo bbr-fq_codel ;;
+    bbr-cake|cake) echo bbr-cake ;;
+    cubic-fq_codel|cubic|conservative|safe) echo cubic-fq_codel ;;
+    keep|buffers|buffer|none) echo keep ;;
+    custom) echo custom ;;
+    *) return 1 ;;
+  esac
 }
 is_port_opt() { # 端口，或 NAT 模式的 公网:内部（例如 59221:443）
   is_port "$1" && return 0
@@ -3576,6 +5201,9 @@ main() {
     speed) menu_speed ;;
     firewall) menu_firewall ;;
     nat) menu_nat ;;
+    tune) do_tune ;;
+    land) do_land_cli ;;
+    allow) land_menu_allow ;;
     uninstall) do_uninstall ;;
     "")
       if [[ ! -t 0 && ! -r /dev/tty ]]; then usage; die "非交互环境请使用 --auto。"; fi
