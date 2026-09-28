@@ -23,7 +23,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.2.1"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -330,13 +330,15 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
             HOP_BACKEND VIRT DNS64_SET
-            LAND_MODE LAND_METHOD LAND_KEY LAND_ALLOW RELAY_LINK RELAY_ON RELAY_SOCKS)
+            LAND_MODE LAND_METHOD LAND_KEY LAND_ALLOW RELAY_LINK RELAY_ON RELAY_SOCKS NAT_PREF)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
 EXTRA_TCP="" EXTRA_UDP="" DISABLED_FW="" SWAP_CREATED=0 SERVER_ADDR=""
 NAT_MODE=0 NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE=""
 HOP_BACKEND="" VIRT="" DNS64_SET=0
 LAND_MODE=0 LAND_METHOD="2022-blake3-aes-128-gcm" LAND_KEY="" LAND_ALLOW="" RELAY_LINK="" RELAY_ON=0 RELAY_SOCKS=""
+NAT_PREF=auto       # 菜单「切换 NAT 模式」：auto = 自动检测；on = 强制 NAT（同 --nat）；off = 强制普通模式（同 --no-nat）
+NAT_SRC=""          # 本次安装 NAT_MODE 的来源：cli | manual | alpine | state | auto | detect
 
 load_state() {
   [[ -f $STATE_FILE ]] || return 0
@@ -428,8 +430,7 @@ detect_os() {
     x86_64|amd64) ARCH=amd64 ;;
     aarch64|arm64) ARCH=arm64 ;;
     armv7*|armv8l)
-      direct_mode || die "不支持的 CPU 架构: $(uname -m)（普通模式仅支持 amd64 / arm64；armv7 请使用 --nat）"
-      ARCH=armv7 ;;
+      ARCH=armv7 ;;   # 普通模式不支持：在 preflight 确定 NAT 模式后检查
     *) die "不支持的 CPU 架构: $(uname -m)（仅支持 amd64 / arm64$(direct_mode && echo ' / armv7')）" ;;
   esac
 }
@@ -438,14 +439,157 @@ detect_os() {
 alpine_check() {
   ver_ge "$OS_VER" "3.18" || refuse_os "Alpine ${OS_VER} 版本过旧，NAT 模式需要 Alpine 3.18 及以上。"
   [[ $INIT_SYS == openrc ]] || refuse_os "Alpine 未检测到 OpenRC（缺少 openrc-run / rc-service），请先执行: apk add openrc"
-  if (( ! NAT_MODE && ! LAND_MODE )); then
-    warn "Alpine（musl + OpenRC）只支持 NAT / 精简模式（--nat）：直接下载官方二进制、使用 OpenRC 服务、跳过防火墙/fail2ban（网络调优可选）。"
-    if [[ $OPT_NAT == 0 ]] || (( OPT_AUTO )) || ! confirm "是否以 NAT 模式继续安装？" y; then
-      printf '%s[错误]%s Alpine 请使用: bash proxy.sh --nat（自动安装: bash proxy.sh --nat --auto --nat-ports 公网端口[:内部端口]）；或落地机: bash proxy.sh --land\n' "$C_RED" "$C_NONE" >&2
+  # v1.2.1：NAT 模式统一在 decide_nat_mode（安装入口）中确定；这里只做系统检查
+  return 0
+}
+
+# ---------- v1.2.1：安装前统一确定 NAT_MODE（菜单 1 / 13 / --land / 改装 共用） ----------
+# 本机网卡上的全部地址（不依赖 iproute2：精简容器装依赖前可能没有 ip 命令）
+local_addrs() {
+  if have ip; then
+    ip addr show 2>/dev/null | awk '$1=="inet"||$1=="inet6"{sub(/\/.*/, "", $2); print $2}'
+  else
+    awk '/32 host LOCAL/{print prev} {prev=$2}' /proc/net/fib_trie 2>/dev/null | sort -u
+    awk '{print $1}' /proc/net/if_inet6 2>/dev/null   # 32 位十六进制（不含冒号）
+  fi
+}
+ip6_hex() { # IPv6 → 32 位十六进制小写（用于与 /proc/net/if_inet6 比较）
+  local a=${1,,} head tail h="" g n i
+  if [[ $a == *::* ]]; then head=${a%%::*} tail=${a#*::}; else head=$a tail=""; fi
+  local -a H T; IFS=: read -ra H <<<"$head"; IFS=: read -ra T <<<"$tail"
+  n=$(( 8 - ${#H[@]} - ${#T[@]} )); (( n >= 0 )) || return 1
+  for g in "${H[@]}"; do h+=$(printf '%04x' "0x${g:-0}"); done
+  for (( i = 0; i < n; i++ )); do h+="0000"; done
+  for g in "${T[@]}"; do h+=$(printf '%04x' "0x${g:-0}"); done
+  printf '%s' "$h"
+}
+ip_is_local() { # $1 IP 是否配置在本机网卡上
+  local a x=${1,,} xh=""
+  [[ -n $x ]] || return 1
+  [[ $x == *:* ]] && xh=$(ip6_hex "$x" 2>/dev/null)
+  while IFS= read -r a; do
+    a=${a,,}
+    [[ $a == "$x" || ( -n $xh && $a == "$xh" ) ]] && return 0
+  done < <(local_addrs)
+  return 1
+}
+nat_probe_pubip() { # 快速获取公网 IP（不中断安装）；输出 IP，失败为空
+  local ip=""
+  ip=$(curl -4 -fsS --connect-timeout 4 -m 6 https://api.ipify.org 2>/dev/null | tr -d '[:space:]') || ip=""
+  [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || ip=$(curl -4 -fsS --connect-timeout 4 -m 6 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]') || ip=""
+  [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || ip=""
+  if [[ -z $ip ]]; then
+    ip=$(curl -6 -fsS --connect-timeout 4 -m 6 https://api64.ipify.org 2>/dev/null | tr -d '[:space:]') || ip=""
+    [[ $ip == *:* ]] || ip=""
+  fi
+  printf '%s' "$ip"
+}
+nat_virt_ask() { [[ $VIRT =~ ^(lxc|lxc-libvirt|openvz)$ ]]; }  # 需要询问是否 NAT 的容器类型
+# 仅按本机信息（不联网）判断的倾向：用于菜单标题
+nat_guess_local() {
+  [[ ${OS_ID:-$(osr_get ID)} == alpine ]] && return 0
+  [[ -n $VIRT ]] || detect_virt
+  nat_virt_ask || return 1
+  # 网卡上没有任何公网 IPv4 → 多半是 NAT
+  ! local_addrs | grep -Evq '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|169\.254\.|::1$|fe80:|f[cd][0-9a-f]{2}:|[^.:]*$)'
+}
+nat_pref_text() { case $NAT_PREF in on) echo 开 ;; off) echo 关 ;; *) echo 自动 ;; esac; }
+nat_mode_label() { # 菜单标题：普通 / NAT（自动检测）/ NAT（手动）
+  local pend=""
+  if (( INSTALLED )) && [[ $NAT_PREF == on && $NAT_MODE != 1 || $NAT_PREF == off && $NAT_MODE == 1 ]]; then pend="，重新安装后生效"; fi
+  case $NAT_PREF in
+    on) echo "NAT（手动${pend}）" ;;
+    off) echo "普通（手动${pend}）" ;;
+    *) if (( INSTALLED )); then
+         if (( NAT_MODE )); then echo "NAT（自动检测）"; else echo "普通"; fi
+       elif nat_guess_local; then echo "NAT（自动检测）"
+       else echo "普通"; fi ;;
+  esac
+}
+# 优先级：--nat/--no-nat > 菜单手动设置（NAT_PREF） > Alpine 强制 NAT > 已安装的模式 > 自动检测（LXC/OpenVZ 询问）
+decide_nat_mode() {
+  local want="" src=""
+  if [[ -n $OPT_NAT ]]; then want=$OPT_NAT src=cli
+    # 命令行与菜单手动设置冲突时，以命令行为准并同步保存，避免之后的菜单操作按旧设置走
+    if [[ $NAT_PREF == on && $OPT_NAT == 0 ]]; then NAT_PREF=off; info "命令行 --no-nat 覆盖菜单中的 NAT 模式设置（已改为：关）。"
+    elif [[ $NAT_PREF == off && $OPT_NAT == 1 ]]; then NAT_PREF=on; info "命令行 --nat 覆盖菜单中的 NAT 模式设置（已改为：开）。"; fi
+  elif [[ $NAT_PREF == on ]]; then want=1 src=manual
+  elif [[ $NAT_PREF == off ]]; then want=0 src=manual
+  fi
+  if [[ $OS_ID == alpine ]]; then
+    if [[ $want == 0 ]]; then
+      printf '%s[错误]%s Alpine（musl + OpenRC）只支持 NAT / 精简模式，不能使用普通模式（%s）。\n' "$C_RED" "$C_NONE" "$([[ $src == cli ]] && echo '去掉 --no-nat' || echo '请在菜单 15 中把 NAT 模式改为「自动」或「开」')" >&2
+      printf '        Alpine 请使用: bash proxy.sh --nat（自动安装: bash proxy.sh --nat --auto --nat-ports 公网端口[:内部端口]）；或落地机: bash proxy.sh --land\n' >&2
       exit 1
     fi
-    NAT_MODE=1
+    if [[ -z $want ]]; then
+      want=1 src=alpine
+      info "Alpine（musl + OpenRC）只支持 NAT / 精简模式：已自动启用 NAT 模式（公网端口 → 内部端口映射；直接下载官方二进制、OpenRC 服务、不装防火墙/fail2ban，网络调优会先询问）。"
+    fi
   fi
+  if [[ -z $want ]] && { (( INSTALLED )) || [[ $NAT_MODE == 1 ]]; }; then
+    want=$([[ $NAT_MODE == 1 ]] && echo 1 || echo 0) src=state
+  fi
+  if [[ -z $want ]]; then
+    detect_virt
+    if nat_virt_ask; then
+      local pub def=n why
+      pub=$(nat_probe_pubip)
+      if [[ -z $pub ]]; then why="无法获取公网 IP"
+      elif ip_is_local "$pub"; then why="公网 IP ${pub} 配置在本机网卡上，多半不是 NAT"
+      else def=y why="公网 IP ${pub} 不在本机网卡上（本机: $(local_addrs | grep -Ev '^(127\.|::1$|fe80:)' | head -n 3 | tr '\n' ' ')），多半是 NAT"; fi
+      info "检测到 ${VIRT} 容器：${why}。"
+      if (( OPT_AUTO )); then
+        want=$([[ $def == y ]] && echo 1 || echo 0) src=detect
+        info "自动模式：$([[ $want == 1 ]] && echo '按 NAT 模式安装（如判断有误请加 --no-nat）' || echo '按普通模式安装（NAT 机请加 --nat）')。"
+      else
+        if confirm "是否为 NAT 机（只有服务商映射的端口可用）？" "$def"; then want=1; else want=0; fi
+        src=auto
+      fi
+    else
+      want=0 src=auto
+    fi
+  fi
+  NAT_MODE=$want NAT_SRC=$src
+  return 0
+}
+# 已安装的模式与菜单手动设置不一致时（例如刚切换了 NAT 模式）：提示重新安装
+nat_pref_mismatch() {
+  (( INSTALLED )) || return 1
+  [[ $NAT_PREF == on && $NAT_MODE != 1 || $NAT_PREF == off && $NAT_MODE == 1 ]]
+}
+nat_pref_guard() { # 端口等操作前调用；不一致时询问是否立即重新安装，返回 1 表示调用方不要继续
+  nat_pref_mismatch || return 0
+  warn "当前已安装为$( ((NAT_MODE)) && echo ' NAT ' || echo '普通')模式，但菜单中的 NAT 模式设置为「$(nat_pref_text)」。切换模式需要重新安装（保留密钥 / UUID）。"
+  if (( ! OPT_AUTO )) && confirm "是否现在重新安装以切换模式？" y; then
+    OPT_LAND=$( ((LAND_MODE)) && echo 1 || echo 0 ); do_install
+  else
+    info "未修改。可在菜单 $( ((LAND_MODE)) && echo 11 || echo 15) 改回「自动」，或用菜单 1$( ((LAND_MODE)) || echo ' / 13') 重新安装。"
+  fi
+  return 1
+}
+menu_nat_pref() {
+  load_state
+  [[ -n $OS_ID ]] || OS_ID=$(osr_get ID); OS_ID=${OS_ID,,}
+  echo; hr; _green "  切换 NAT 模式（当前: $(nat_pref_text)，模式: $(nat_mode_label)）"; hr
+  echo "   1) 自动：Alpine 强制 NAT；LXC/OpenVZ 容器安装时询问（公网 IP 不在本机网卡上默认「是」）；已安装的沿用原模式"
+  echo "   2) 开：强制 NAT 映射端口流程（公网端口 → 内部端口），等同 --nat"
+  echo "   3) 关：强制普通模式（直接监听端口），等同 --no-nat$([[ $OS_ID == alpine ]] && echo "  ${C_YELLOW}[Alpine 不可用]${C_NONE}")"
+  echo "   0) 返回"
+  local c def new
+  case $NAT_PREF in on) def=2 ;; off) def=3 ;; *) def=1 ;; esac
+  ask c "请选择" "$def"
+  case $c in 1) new=auto ;; 2) new=on ;; 3) new=off ;; *) return 0 ;; esac
+  if [[ $new == off && $OS_ID == alpine ]]; then warn "Alpine（musl + OpenRC）只支持 NAT / 精简模式，不能切换为普通模式。"; return 0; fi
+  NAT_PREF=$new
+  save_state
+  ok "NAT 模式设置已保存：$(nat_pref_text)（模式: $(nat_mode_label)）"
+  if nat_pref_mismatch; then
+    nat_pref_guard || true
+  elif (( ! INSTALLED )); then
+    info "将在安装时生效：菜单 1（Reality / Hysteria2）或 13（落地机）。"
+  fi
+  return 0
 }
 
 # 直接从 GitHub Releases 下载二进制（NAT 模式或 Alpine）
@@ -659,7 +803,7 @@ install_deps_nat() {
     [[ $OS_ID == fedora ]] || rpm -q epel-release >/dev/null 2>&1 || pkg_try epel-release
     pkg_try qrencode
   fi
-  ok "依赖安装完成（NAT 精简模式）。"
+  ok "依赖安装完成（$( ((NAT_MODE)) && echo "NAT ")精简模式）。"
 }
 
 # ---------- 时间同步（REALITY 对时间误差敏感，全新 DD 镜像常常没有时间同步服务） ----------
@@ -719,7 +863,9 @@ preflight() {
   detect_os
   openrc_ready
   have curl || pkg_bootstrap_curl
-  info "系统: ${OS_NAME} / 架构: ${ARCH} / 包管理: ${PKG} / init: ${INIT_SYS}$( ((NAT_MODE)) && echo ' / NAT 模式')"
+  decide_nat_mode
+  [[ $ARCH == armv7 ]] && ! direct_mode && die "不支持的 CPU 架构: $(uname -m)（普通模式仅支持 amd64 / arm64；armv7 请使用 --nat）"
+  info "系统: ${OS_NAME} / 架构: ${ARCH} / 包管理: ${PKG} / init: ${INIT_SYS} / 模式: $( ((NAT_MODE)) && echo NAT || echo 普通)$(case $NAT_SRC in cli) echo '（命令行指定）' ;; manual) echo '（菜单手动设置）' ;; alpine) echo '（Alpine 强制）' ;; state) echo '（沿用已安装）' ;; auto|detect) ((NAT_MODE)) && echo '（自动检测）' ;; esac)"
 }
 pkg_bootstrap_curl() {
   if [[ $PKG == apk ]]; then apk add --no-cache curl ca-certificates >/dev/null
@@ -805,6 +951,16 @@ tune_root_qdisc() { # $1 网卡 → 根队列类型；多队列网卡输出 mq(�
   else
     printf '%s' "${root:--}"
   fi
+}
+tune_qdisc_label() { # $1 网卡 → 实际生效的队列：优先读 tc；容器内 default_qdisc 常不可见，不再显示「-」
+  local ifc=${1:-} d="" q=""
+  d=$(tune_get net.core.default_qdisc 2>/dev/null) || d=""
+  if [[ -n $ifc ]] && have tc; then q=$(tune_root_qdisc "$ifc"); [[ $q == - ]] && q=""; fi
+  if [[ -z $q && ${TUNE_RES[qdisc]-} == ok && ${TUNE_QD:-keep} != keep && -n $ifc ]]; then q=$TUNE_QD; fi
+  if [[ -n $q ]]; then
+    printf '%s（网卡 %s%s）' "$q" "$ifc" "$([[ -n $d && $d != "$q" && $q != "mq($d)" ]] && printf '；default_qdisc %s' "$d")"
+  elif [[ -n $d ]]; then printf '%s（default_qdisc）' "$d"
+  else printf '未知'; fi
 }
 tune_iface_uses() { # $1 网卡 $2 队列算法：根队列（或 mq 的全部子队列）已是该算法
   local r; r=$(tune_root_qdisc "$1")
@@ -1205,7 +1361,7 @@ tune_commit() {
   if (( n_skip )) && (( TUNE_COMPACT )); then
     info "跳过 ${n_skip} 项只读/不可见参数（$(is_container && echo '容器内由宿主机控制' || echo '无权限')）。"
   fi
-  ok "调优已应用：成功 ${n_ok} 项，跳过 ${n_skip} 项，失败 ${n_fail} 项。拥塞控制 $(tune_get net.ipv4.tcp_congestion_control || echo '-') / 队列 $(tune_get net.core.default_qdisc || echo '-')"
+  ok "调优已应用：成功 ${n_ok} 项，跳过 ${n_skip} 项，失败 ${n_fail} 项。拥塞控制 $(tune_get net.ipv4.tcp_congestion_control || echo '未知') / 队列 $(tune_qdisc_label "$TUNE_IFACE")"
   if (( ${#persist[@]} )); then ok "已写入 ${SYSCTL_FILE}（恢复: proxy tune restore）"; else warn "没有可写的参数，未写入配置文件（容器内内核参数由宿主机控制）。"; fi
   return 0
 }
@@ -1329,7 +1485,7 @@ tune_restore() { # $1 = quiet（卸载时调用，不询问）
   fi
   rm -rf "$TUNE_DIR"
   TUNE_DETECTED=0
-  ok "已恢复调优前的设置（还原 ${n} 项；拥塞控制 $(tune_get net.ipv4.tcp_congestion_control || echo '-') / 队列 $(tune_get net.core.default_qdisc || echo '-')）"
+  ok "已恢复调优前的设置（还原 ${n} 项；拥塞控制 $(tune_get net.ipv4.tcp_congestion_control || echo '未知') / 队列 $(tune_qdisc_label "$iface")）"
   (( ${#legacy_keys[@]} )) && info "旧版本写入的参数已回退到系统默认；与内存相关的少数参数（如 tcp_max_syn_backlog、fs.file-max）重启后完全恢复。"
   return 0
 }
@@ -1498,7 +1654,11 @@ nat_tune() {
   if (( $(tune_writable_count) == 0 )); then
     info "当前环境没有可写的内核网络参数（容器内由宿主机控制），跳过。"; return 0
   fi
-  if [[ ${OPT_TUNE:-2} != 1 ]] && ! confirm "是否进行网络调优？（不可写的参数自动跳过；之后可随时用 proxy tune 调整或恢复）" y; then
+  if [[ ${OPT_TUNE:-2} != 1 ]]; then
+    echo "   将按内存自动选择 TCP 缓冲区档位$(tune_cc_ok bbr && [[ ${TUNE_ST[net.ipv4.tcp_congestion_control]} == ok ]] && echo '，并启用 BBR + fq（网卡队列用 tc 设置）')；"
+    echo "   容器内只读 / 宿主机控制的参数自动跳过，会先显示预览；之后可随时用 proxy tune 调整或恢复。"
+  fi
+  if [[ ${OPT_TUNE:-2} != 1 ]] && ! confirm "是否进行网络调优？" y; then
     info "已跳过网络调优（之后可运行: proxy tune）。"; return 0
   fi
   preset=$(tune_opt_preset "")
@@ -3369,19 +3529,66 @@ nat_segs_ext2int() { # 外部端口段 → 内部端口段
 }
 
 choose_nat_addr() {
-  local a def=${OPT_NAT_ADDR:-${SERVER_ADDR:-${PUBLIC_IP4:-$PUBLIC_IP6}}}
-  while :; do
-    if [[ -n $OPT_NAT_ADDR ]]; then a=$OPT_NAT_ADDR; else ask a "公网地址（服务商提供的 IP 或解析到该 IP 的域名，用于分享链接）" "$def"; fi
-    a=${a#[}; a=${a%]}; a=${a// /}
-    if [[ -n $a ]] && valid_addr "$a"; then SERVER_ADDR=$a; break; fi
-    { [[ -n $OPT_NAT_ADDR ]] || (( OPT_AUTO )); } && die "公网地址无效: ${a:-空}（请用 --nat-addr 指定 IP 或域名）"
-    warn "地址格式无效，请输入 IPv4 / IPv6 / 域名。"
-  done
+  # v1.2.1：外部查询服务得到的是「出口 IP」；NAT 机的入口（商家端口映射地址）经常与出口不同，
+  #         因此交互模式不再把出口 IP 作为默认值直接回车通过，必须手动填写或明确确认。
+  # 只有上次在 NAT 模式下填写过的地址（NAT_PORTS 非空）才算「已确认的入口地址」；普通模式保存的是自动检测的 IP
+  local a egress=${PUBLIC_IP4:-$PUBLIC_IP6} saved=""
+  [[ -n $NAT_PORTS ]] && saved=${SERVER_ADDR:-}
+  if [[ -n $OPT_NAT_ADDR ]]; then
+    a=${OPT_NAT_ADDR#[}; a=${a%]}; a=${a// /}
+    valid_addr "$a" || die "公网地址无效: ${a:-空}（请用 --nat-addr 指定 IP 或域名）"
+    SERVER_ADDR=$a
+  elif (( OPT_AUTO )); then
+    if [[ -n $saved ]] && valid_addr "$saved"; then SERVER_ADDR=$saved
+    elif [[ -n $egress ]]; then
+      SERVER_ADDR=$egress
+      warn "未指定 --nat-addr：暂用检测到的出口 IP ${egress} 作为链接地址。NAT 机入口地址可能不同，请以商家面板「端口映射」中的地址为准（proxy nat → 1 修改，或重新安装时加 --nat-addr）。"
+    else
+      die "无法确定公网地址，请用 --nat-addr 指定商家提供的入口 IP 或域名。"
+    fi
+  else
+    [[ -n $egress ]] || egress=$(nat_probe_pubip)   # 修改端口等管理操作没有预先检测
+    echo "   公网地址 = 客户端连接的入口地址：请填写商家面板「端口映射 / NAT 转发」条目中显示的 IP 或域名（写进分享链接）。"
+    if [[ -n $egress ]]; then
+      echo "   检测到的出口 IP: ${egress}（NAT 机入口地址可能不同）"
+    else
+      echo "   未能检测到出口 IP。"
+    fi
+    # 之前手动填写过（且与出口 IP 不同）的地址可回车沿用；与出口 IP 相同时同样需要明确确认
+    local def=""; [[ -n $saved && $saved != "$egress" ]] && def=$saved
+    while :; do
+      ask a "公网地址（商家提供的入口 IP 或解析到它的域名$( [[ -n $def ]] && echo '，回车沿用当前' )）" "$def"
+      (( TTY_EOF )) && die "未输入公网地址（可用 --nat-addr 指定）。"
+      a=${a#[}; a=${a%]}; a=${a// /}
+      if [[ -z $a ]]; then
+        if [[ -n $egress ]] && confirm "确认出口 IP ${egress} 同时也是入口地址（商家面板端口映射里显示的就是它）？" n; then a=$egress
+        else warn "请输入商家面板端口映射中的入口地址。"; continue; fi
+      elif [[ ${a,,} == y || ${a,,} == yes ]] && [[ -n $egress ]]; then
+        if confirm "使用出口 IP ${egress} 作为入口地址？" y; then a=$egress; else continue; fi
+      fi
+      if valid_addr "$a"; then SERVER_ADDR=$a; break; fi
+      warn "地址格式无效，请输入 IPv4 / IPv6 / 域名。"
+    done
+  fi
   if is_ipv4 "$SERVER_ADDR" && is_private_v4 "$SERVER_ADDR"; then
     warn "${SERVER_ADDR} 是内网地址，客户端通常无法直接连接；请确认填写的是服务商提供的公网 IP / 域名。"
   fi
+  nat_addr_selfcheck "$SERVER_ADDR" "$egress"
   [[ $SERVER_ADDR == *:* ]] && info "公网地址为 IPv6，链接中将写成 [${SERVER_ADDR}] 形式。"
   ok "公网地址: ${SERVER_ADDR}"
+}
+nat_addr_selfcheck() { # $1 入口地址 $2 出口 IP：只提示，不阻止
+  local addr=$1 egress=$2 ip=""
+  if is_ipv4 "$addr" || [[ $addr == *:* ]]; then ip=$addr
+  elif have getent; then ip=$(getent ahosts "$addr" 2>/dev/null | awk 'NR==1{print $1}') || ip=""
+    if [[ -n $ip ]]; then info "域名 ${addr} 解析到 ${ip}。"; else info "域名 ${addr} 暂时无法解析（客户端需能解析该域名）。"; return 0; fi
+  fi
+  [[ -n $ip ]] || return 0
+  if ip_is_local "$ip"; then info "入口地址 ${ip} 配置在本机网卡上。"
+  elif [[ -n $egress && $ip != "$egress" ]]; then
+    info "入口地址 ${ip} 与出口 IP ${egress} 不同、也不在本机网卡上：NAT 机入口与出口不同很常见，只要与商家面板端口映射一致即可。"
+  fi
+  return 0
 }
 
 # 交互：为没有写 ":内部" 的每一项询问内部端口（默认沿用已保存的映射，否则与公网端口相同）
@@ -3616,8 +3823,7 @@ do_install() {
   if [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; then do_install_land; return; fi
   local was_land=$LAND_MODE
   LAND_MODE=0
-  [[ -n $OPT_NAT ]] && NAT_MODE=$OPT_NAT
-  preflight      # Alpine 可能在此切换为 NAT 模式
+  preflight      # decide_nat_mode：命令行 / 菜单设置 / Alpine / 已安装 / 自动检测，端口设置前确定 NAT_MODE
   resolve_mode
   take_lock
   if (( was_land )); then
@@ -4157,9 +4363,8 @@ land_pick_default_port() {
 do_install_land() {
   load_state
   local was_land=$LAND_MODE was_inst=$INSTALLED
-  [[ -n $OPT_NAT ]] && NAT_MODE=$OPT_NAT
   LAND_MODE=1
-  preflight
+  preflight      # 同上：Alpine 落地机也强制 NAT 模式（v1.2.0 在这里漏掉了，导致走了普通端口流程并自动调优）
   resolve_mode
   take_lock
   if (( was_inst )) && (( ! was_land )); then
@@ -4256,6 +4461,7 @@ land_menu_allow() {
 }
 land_menu_port() {
   need_land
+  nat_pref_guard || return 0
   detect_os; detect_virt
   local old; old=$(pub_xray_port)
   local s1=$OPT_PORT s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
@@ -4506,6 +4712,7 @@ menu_regen_keys() {
 menu_change_ports() {
   need_installed
   if (( LAND_MODE )); then land_menu_port; return; fi
+  nat_pref_guard || return 0
   if (( NAT_MODE )); then menu_change_ports_nat; return; fi
   local oldx=$XRAY_PORT oldh=$HY2_PORT
   choose_ports_interactive
@@ -4872,6 +5079,7 @@ show_menu() {
   [[ -n $INIT_SYS ]] || detect_init
   if (( LAND_MODE )); then show_land_menu; return; fi
   local menu10="防火墙管理"; (( NAT_MODE )) && menu10="NAT 信息 / 端口跳跃"
+  local mode_lbl; mode_lbl=$(nat_mode_label)
   local st="${C_RED}未安装${C_NONE}"
   if (( INSTALLED )); then
     if svc_active xray; then st="${C_GREEN}运行中${C_NONE}"; else st="${C_YELLOW}已安装 (Xray 未运行)${C_NONE}"; fi
@@ -4879,7 +5087,7 @@ show_menu() {
   cat <<MENU
 ${C_CYAN}============================================================${C_NONE}
    ${C_BOLD}proxy 一键脚本 v${SCRIPT_VERSION}${C_NONE}  VLESS-REALITY-Vision + Hysteria2
-   状态: ${st}${SNI:+   SNI: ${C_GREEN}${SNI}${C_NONE}}$( ((NAT_MODE)) && printf '\n   %sNAT 模式%s  地址: %s  映射: %s' "$C_YELLOW" "$C_NONE" "${SERVER_ADDR:-?}" "${NAT_PORTS:-?}")
+   状态: ${st}${SNI:+   SNI: ${C_GREEN}${SNI}${C_NONE}}   模式: ${mode_lbl}$( ((NAT_MODE && INSTALLED)) && printf '\n   %sNAT 模式%s  地址: %s  映射: %s' "$C_YELLOW" "$C_NONE" "${SERVER_ADDR:-?}" "${NAT_PORTS:-?}")
 ${C_CYAN}============================================================${C_NONE}
    ${C_GREEN}1)${C_NONE} 安装 / 重新安装
    ${C_GREEN}2)${C_NONE} 查看链接 / 二维码 / Clash 配置
@@ -4895,6 +5103,7 @@ ${C_CYAN}============================================================${C_NONE}
   ${C_GREEN}12)${C_NONE} 添加 / 修改落地转发（本机作中转，出口走落地机）
   ${C_GREEN}13)${C_NONE} 安装为落地机（Shadowsocks 2022 出口，给其它中转机用）
   ${C_GREEN}14)${C_NONE} 卸载
+  ${C_GREEN}15)${C_NONE} 切换 NAT 模式（当前: $(nat_pref_text)）
    ${C_GREEN}0)${C_NONE} 退出
 ${C_CYAN}------------------------------------------------------------${C_NONE}
 MENU
@@ -4915,6 +5124,7 @@ MENU
     12) act=menu_relay ;;
     13) OPT_LAND=1; act=do_install ;;
     14) act=do_uninstall ;;
+    15) act=menu_nat_pref ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -4943,7 +5153,7 @@ show_land_menu() {
 ${C_CYAN}============================================================${C_NONE}
    ${C_BOLD}proxy 一键脚本 v${SCRIPT_VERSION}${C_NONE}  ${C_YELLOW}落地机${C_NONE}（Shadowsocks 2022）
    状态: ${st}   端口: $(pub_xray_port) (TCP+UDP)   加密: ${LAND_METHOD#2022-blake3-}
-   白名单: ${LAND_ALLOW:-未设置（不限制）}$( ((NAT_MODE)) && printf '\n   %sNAT 模式%s  地址: %s  映射: %s' "$C_YELLOW" "$C_NONE" "${SERVER_ADDR:-?}" "${NAT_PORTS:-?}")
+   白名单: ${LAND_ALLOW:-未设置（不限制）}   模式: $(nat_mode_label)$( ((NAT_MODE)) && printf '\n   %sNAT 模式%s  地址: %s  映射: %s' "$C_YELLOW" "$C_NONE" "${SERVER_ADDR:-?}" "${NAT_PORTS:-?}")
 ${C_CYAN}============================================================${C_NONE}
    ${C_GREEN}1)${C_NONE} 安装 / 重新安装（落地机）
    ${C_GREEN}2)${C_NONE} 查看 ss:// 链接 / 中转机命令 / Xray 出站片段
@@ -4955,6 +5165,7 @@ ${C_CYAN}============================================================${C_NONE}
    ${C_GREEN}8)${C_NONE} 网络调优（BBR / 队列算法 / 缓冲区 / 恢复）
    ${C_GREEN}9)${C_NONE} 改装为 Reality / Hysteria2 节点
   ${C_GREEN}10)${C_NONE} 卸载
+  ${C_GREEN}11)${C_NONE} 切换 NAT 模式（当前: $(nat_pref_text)）
    ${C_GREEN}0)${C_NONE} 退出
 ${C_CYAN}------------------------------------------------------------${C_NONE}
 MENU
@@ -4971,6 +5182,7 @@ MENU
     8) act=menu_tune ;;
     9) OPT_LAND=0; act=do_install ;;
     10) act=do_uninstall ;;
+    11) act=menu_nat_pref ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -5000,9 +5212,9 @@ proxy 一键脚本 v${SCRIPT_VERSION} —— VLESS + REALITY + Vision (ML-DSA-65
   -h, --help          显示帮助
 
 NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙·fail2ban·Swap；调优可选）:
-  --nat               启用 NAT 模式（Alpine 必须使用；之后 proxy 命令自动沿用）
+  --nat               启用 NAT 模式（Alpine 自动启用；LXC/OpenVZ 未指定时询问；之后 proxy 命令自动沿用）
   --no-nat            切换回普通模式
-  --nat-addr <地址>   链接中使用的公网 IP 或域名（默认自动检测，IPv4 优先）
+  --nat-addr <地址>   链接中使用的入口 IP 或域名（商家端口映射地址；交互时必填，--auto 未指定时暂用出口 IP）
   --nat-ports <列表>  服务商已映射的端口，逗号分隔，每项 外部[:内部]
                       例: 52430,52431   52430:8443   整段转发: 10001-10020 或 10001-10020:20001-20020
   --port <外部[:内部]>      NAT 模式下为 Reality 外部端口（未给 --nat-ports 时自动加入映射列表）
