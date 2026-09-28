@@ -20,7 +20,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.1.2"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -166,6 +166,37 @@ pause() { (( OPT_AUTO )) && return 0; local _x; _tty_read _x "按回车键继续
 have() { command -v "$1" >/dev/null 2>&1; }
 mktmp() { [[ -n $TMP_DIR && -d $TMP_DIR ]] || TMP_DIR=$(mktemp -d /tmp/proxy-oneclick.XXXXXX); }
 is_port() { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+# 端口类输入容错：去掉不可见/控制字符（退格、DEL、回车、ANSI 转义、零宽字符），
+# 全角冒号/逗号/顿号/数字/连字符 → 半角，~ 视为 -，合并多余空格
+sanitize_port_input() {
+  local s=$1 re i c
+  re=$'\e''\[[0-9;?]*[@-~]'
+  while [[ $s =~ $re ]]; do s=${s/"${BASH_REMATCH[0]}"/}; done
+  re=$'\e''[@-_]'
+  while [[ $s =~ $re ]]; do s=${s/"${BASH_REMATCH[0]}"/}; done
+  # 零宽字符 / 软连字符（U+200B-200D U+2060 U+FEFF U+00AD）
+  for c in $'\xe2\x80\x8b' $'\xe2\x80\x8c' $'\xe2\x80\x8d' $'\xe2\x81\xa0' $'\xef\xbb\xbf' $'\xc2\xad'; do s=${s//"$c"/}; done
+  # 全角空格 / 不换行空格 / 制表符 → 空格
+  for c in $'\xe3\x80\x80' $'\xc2\xa0' $'\t'; do s=${s//"$c"/ }; done
+  s=${s//：/:}; s=${s//，/,}; s=${s//、/,}; s=${s//；/,}
+  for c in － — – ‐ − ～ '~'; do s=${s//"$c"/-}; done
+  local fw=(０ １ ２ ３ ４ ５ ６ ７ ８ ９)
+  for i in "${!fw[@]}"; do s=${s//"${fw[i]}"/$i}; done
+  s=${s//[[:cntrl:]]/}
+  while [[ $s == *'  '* ]]; do s=${s//'  '/ }; done
+  s=${s# }; s=${s% }
+  printf '%s' "$s"
+}
+# 以可见形式显示原始输入（控制字符显示为转义序列；含非 ASCII 字符时附 cat -v 逐字节形式）
+show_raw_input() {
+  printf '%q' "$1"
+  local LC_ALL=C v
+  if [[ $1 == *[!\ -~]* ]]; then
+    v=$(printf '%s' "$1" | cat -v 2>/dev/null) || v=""
+    [[ -n $v ]] && printf '（逐字节: %s）' "$v"
+  fi
+  return 0
+}
 is_range() { # 20000-50000
   [[ $1 =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
   local a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
@@ -2362,7 +2393,7 @@ choose_ports() {
   # Xray 端口
   p=${OPT_PORT:-$XRAY_PORT}
   while :; do
-    if [[ -z $OPT_PORT ]]; then ask p "VLESS-REALITY 监听端口 (TCP)" "$p"; fi
+    if [[ -z $OPT_PORT ]]; then ask p "VLESS-REALITY 监听端口 (TCP)" "$p"; p=$(sanitize_port_input "$p"); p=${p// /}; fi
     if ! is_port "$p"; then
       (( OPT_AUTO )) && die "端口无效: $p"; warn "端口无效。"; p=443; continue
     fi
@@ -2377,7 +2408,7 @@ choose_ports() {
   (( HY2_ENABLED )) || return 0
   p=${OPT_HY2_PORT:-$HY2_PORT}
   while :; do
-    [[ -z $OPT_HY2_PORT ]] && ask p "Hysteria2 监听端口 (UDP)" "$p"
+    [[ -z $OPT_HY2_PORT ]] && { ask p "Hysteria2 监听端口 (UDP)" "$p"; p=$(sanitize_port_input "$p"); p=${p// /}; }
     is_port "$p" || { (( OPT_AUTO )) && die "端口无效: $p"; warn "端口无效。"; p=443; continue; }
     if check_port_free udp "$p" "hysteria"; then HY2_PORT=$p; break; fi
     (( OPT_AUTO )) || [[ -n $OPT_HY2_PORT ]] && die "UDP 端口 $p 已被占用，请使用 --hy2-port 指定其它端口。"
@@ -2386,7 +2417,7 @@ choose_ports() {
   local hop=${OPT_HOP:-${HOP_RANGE:-none}}
   [[ -z $OPT_HOP && -z $HOP_RANGE && $INSTALLED != 1 ]] && hop="20000-50000"
   while :; do
-    [[ -z $OPT_HOP ]] && ask hop "Hysteria2 端口跳跃范围（UDP，输入 none 关闭）" "$hop"
+    [[ -z $OPT_HOP ]] && { ask hop "Hysteria2 端口跳跃范围（UDP，输入 none 关闭）" "$hop"; hop=$(sanitize_port_input "$hop"); hop=${hop// /}; }
     if [[ $hop == none || $hop == no || -z $hop ]]; then HOP_RANGE=""; break; fi
     if is_range "$hop"; then
       local a=${hop%-*}
@@ -2444,8 +2475,9 @@ nat_fmt_item() { # $1 e1 $2 e2 $3 i1
 }
 # 规范化用户输入的列表（逗号/空格分隔），失败返回 1
 nat_norm_list() {
-  local it out="" e1 e2 i1 f
-  for it in ${1//,/ }; do
+  local it out="" e1 e2 i1 f l
+  l=$(sanitize_port_input "$1")
+  for it in ${l//,/ }; do
     f=$(nat_parse_item "$it") || return 1
     read -r e1 e2 i1 <<<"$f"
     [[ -n $e1 ]] || return 1
@@ -2489,6 +2521,14 @@ nat_all_ext() { # 逐个输出全部外部端口
   nat_items
   local k q
   for k in "${!NI_E1[@]}"; do for (( q = NI_E1[k]; q <= NI_E2[k]; q++ )); do echo "$q"; done; done
+}
+nat_ext_list() { # 仅外部端口（逗号分隔，整段显示为 a-b），用于提示
+  nat_items
+  local k out=""
+  for k in "${!NI_E1[@]}"; do
+    if (( NI_E2[k] > NI_E1[k] )); then out+="${out:+,}${NI_E1[k]}-${NI_E2[k]}"; else out+="${out:+,}${NI_E1[k]}"; fi
+  done
+  printf '%s' "$out"
 }
 nat_has_span() { # 是否包含整段转发（≥2 个端口的项）
   nat_items
@@ -2566,13 +2606,14 @@ choose_nat_addr() {
 
 # 交互：为没有写 ":内部" 的每一项询问内部端口（默认沿用已保存的映射，否则与公网端口相同）
 nat_ask_internal() {
-  local it out="" in def m
-  for it in ${1//,/ }; do
+  local it out="" in def m l
+  l=$(sanitize_port_input "$1")
+  for it in ${l//,/ }; do
     if [[ $it == *:* ]] || ! parse_port_span "$it" >/dev/null; then out+="${out:+,}$it"; continue; fi
     def=$it
     for m in ${NAT_PORTS//,/ }; do [[ $m == "${it}:"* ]] && def=${m#*:}; done
     ask in "公网端口 ${it} 对应的内部端口（本机监听端口，相同直接回车）" "$def" >&2
-    in=${in// /}
+    in=$(sanitize_port_input "$in"); in=${in// /}
     if [[ -z $in || $in == "$it" ]]; then out+="${out:+,}$it"; else out+="${out:+,}${it}:${in}"; fi
   done
   printf '%s' "$out"
@@ -2588,24 +2629,26 @@ nat_ports_from_opts() {
 opt_ext() { printf '%s' "${1%%:*}"; }   # "52430:443" → 52430
 
 choose_nat_ports() {
-  local r p def
+  local r p def raw
   # 1) 服务商映射给本机的端口
   def=${OPT_NAT_EXT:-$(nat_ports_from_opts)}
   local from_opt=0; [[ -n $def ]] && from_opt=1
   [[ -n $def ]] || def=$NAT_PORTS
   while :; do
-    if (( from_opt )); then r=$def
+    if (( from_opt )); then r=$def; raw=$r
     else
       echo "   NAT 机器只有服务商映射过的端口能从外部访问。常见两种："
       echo "     · 逐条映射（例如面板里只能加 5 条规则）：填写公网端口，如 59221 或 52430,52431"
       echo "     · 整段转发：填写范围，如 10001-10020"
       echo "   随后会逐个询问对应的内部端口（与公网端口相同直接回车）；也可直接写 公网:内部，如 59221:443"
       ask r "已映射的公网端口（逗号分隔）" "$def"
-      r=$(nat_ask_internal "$r")
+      raw=$r
+      r=$(nat_ask_internal "$(sanitize_port_input "$r")")
     fi
     if r=$(nat_norm_list "$r"); then NAT_PORTS=$r; nat_items; break; fi
-    { (( from_opt )) || (( OPT_AUTO )); } && die "NAT 映射端口无效或未指定。请使用 --nat-ports 52430,52431（外部[:内部]，或整段 a-b）或 --port 外部端口。"
-    warn "格式无效。例如 52430,52431 或 52430:8443 或 10001-10020。"
+    { (( from_opt )) || (( OPT_AUTO )); } && die "NAT 映射端口无效或未指定: $(show_raw_input "$raw")。请使用 --nat-ports 52430,52431（外部[:内部]，或整段 a-b）或 --port 外部端口。"
+    warn "格式无效。收到的输入: $(show_raw_input "$raw")（请检查是否含中文标点或不可见字符）"
+    warn "正确示例: 52430,52431 或 52430:8443 或 10001-10020。"
   done
   info "映射端口: ${NAT_PORTS}"
   # 2) 排除端口（整段转发时范围内可能含 SSH 映射等）
@@ -2625,7 +2668,7 @@ choose_nat_ports() {
   fi
   [[ -n $busy ]] && info "映射端口中已被本机其它程序占用的（外部端口）: ${busy}（默认排除）"
   if [[ -n $OPT_NAT_EXCLUDE ]] || (( OPT_AUTO )) || ! nat_has_span; then r=$def
-  else ask r "端口段内需要排除的外部端口（如映射给 SSH 的端口，空格/逗号分隔；没有请回车，none 清空）" "$def"; fi
+  else ask r "端口段内需要排除的外部端口（如映射给 SSH 的端口，空格/逗号分隔；没有请回车，none 清空）" "$def"; r=$(sanitize_port_input "$r"); fi
   [[ ${r,,} == none || $r == 无 ]] && r=""
   for x in ${r//,/ }; do
     if is_port "$x" && ext2int "$x" >/dev/null; then [[ " $list " == *" $x "* ]] || list+="$x "
@@ -2641,7 +2684,7 @@ choose_nat_ports() {
     if nat_usable "${XRAY_EXT_PORT:-0}"; then def=$XRAY_EXT_PORT; else def=$(nat_first_usable); fi
   fi
   while :; do
-    if [[ -n $OPT_PORT ]]; then p=$(opt_ext "$OPT_PORT"); else ask p "VLESS-REALITY 使用的外部端口（TCP，可选: ${NAT_PORTS}）" "$def"; fi
+    if [[ -n $OPT_PORT ]]; then p=$(opt_ext "$OPT_PORT"); else ask p "VLESS-REALITY 使用的外部端口（TCP，可选: $(nat_ext_list)）" "$def"; p=$(sanitize_port_input "$p"); p=${p// /}; fi
     if nat_usable "$p"; then
       if check_port_free tcp "$(ext2int "$p")" "xray"; then XRAY_EXT_PORT=$p; XRAY_PORT=$(ext2int "$p"); break; fi
     else
@@ -2680,7 +2723,7 @@ choose_nat_ports() {
   [[ -n $OPT_HY2_PORT ]] && def=$(opt_ext "$OPT_HY2_PORT")
   while :; do
     if [[ -n $OPT_HY2_PORT ]] || (( OPT_AUTO )); then p=$def
-    else ask p "Hysteria2 使用的外部端口（UDP，可选: ${NAT_PORTS}）" "$def"; fi
+    else ask p "Hysteria2 使用的外部端口（UDP，可选: $(nat_ext_list)）" "$def"; p=$(sanitize_port_input "$p"); p=${p// /}; fi
     if nat_usable "$p"; then
       if check_port_free udp "$(ext2int "$p")" "hysteria"; then HY2_EXT_PORT=$p; HY2_PORT=$(ext2int "$p"); break; fi
     else
@@ -2698,7 +2741,7 @@ choose_nat_ports() {
     hop=${HOP_EXT_RANGE:-none}
     ask hop "Hysteria2 端口跳跃范围（外部端口，须是服务商整段转发的端口，如 10002-10020；默认关闭）" "$hop"
   fi
-  hop=${hop// /}
+  hop=$(sanitize_port_input "$hop"); hop=${hop// /}
   HOP_RANGE="" HOP_EXT_RANGE=""
   if [[ -n $hop && $hop != none && $hop != no ]]; then
     if valid_segs "$hop"; then
