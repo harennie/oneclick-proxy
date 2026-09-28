@@ -8,23 +8,30 @@
 
 ## 一键安装
 
+**推荐**：先下载再运行（可以看到交互菜单）
+
 ```bash
-# 推荐：先下载再运行（可以看到交互菜单）
 curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh
+```
 
-# 没有 curl 时用 wget
+**没有 curl 时用 wget**
+
+```bash
 wget -O proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh
+```
 
-# 全自动（全部使用默认值，无任何交互）
+**全自动**（全部使用默认值，无任何交互）
+
+```bash
 curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh --auto
 ```
 
 > 最小化安装的 Debian（例如 bin456789/reinstall 重装的系统）可能 curl 和 wget 都没有，请先执行 `apt-get update && apt-get install -y curl`（RHEL 系：`dnf install -y curl`）。脚本运行后会自动安装其余依赖，包括时间同步服务。
 >
-> **Alpine 没有自带 bash**，请先执行 `apk add bash curl`，并且必须带 `--nat`（见下文「NAT 小鸡模式」）：
+> **Alpine 没有自带 bash**，请先安装依赖并运行安装命令，且必须带 `--nat`（见下文「NAT 小鸡模式」）：
+> 
 > ```bash
-> apk add bash curl
-> curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh --nat
+> apk add bash curl && curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh --nat
 > ```
 
 安装完成后输入 `proxy` 即可打开管理菜单，`proxy info` 随时查看链接 / 二维码 / Clash 配置。
@@ -106,9 +113,10 @@ NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239
 
 **不支持**：CentOS 7 及更老系统、既没有 systemd 又不是 Alpine 的环境。独立 IP 的普通 VPS 如果系统不合适，建议用 [bin456789/reinstall](https://github.com/bin456789/reinstall) 重装为 Debian 12：
 
+下载并运行重装脚本：
+
 ```bash
-curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
-bash reinstall.sh debian 12
+curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh && bash reinstall.sh debian 12
 ```
 
 > ⚠️ 重装会**清空整块硬盘**；重装过程出现问题时需要通过服务商的 **VNC / 串口控制台** 处理，请提前确认能登录控制台并备份数据。
@@ -132,9 +140,10 @@ bash reinstall.sh debian 12
 
 **示例：只有一条「协议 = 全部（TCP+UDP）」的映射，公网 59221 → 内部 443**
 
+Alpine 才需要先安装依赖：
+
 ```bash
-apk add bash curl        # Alpine 才需要
-bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239.14.191
+apk add bash curl && bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239.14.191
 ```
 
 结果：容器内 Xray（TCP）与 Hysteria2（UDP）都监听 443，分享链接为 `vless://…@156.239.14.191:59221…`、`hysteria2://…@156.239.14.191:59221/…`。`--port 59221:443` 效果相同。
@@ -178,13 +187,45 @@ bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239.14.191
 
 独立功能：不安装代理也能用（`bash proxy.sh tune`），NAT / LXC / OpenVZ / Alpine 下同样可用。菜单第 11 项，或命令行：
 
+**交互菜单**：查看状态 / 选择预设 / 恢复
+
 ```bash
-proxy tune                 # 交互菜单：查看状态 / 选择预设 / 恢复
-proxy tune status          # 当前拥塞控制、队列算法、关键参数及是否可写
-proxy tune preview         # 只预览（当前值 → 目标值），不做任何修改
-proxy tune apply           # 预览后确认应用；加 --auto 不询问
-proxy tune restore         # 恢复调优前的原值并删除配置文件
+proxy tune
+```
+
+**查看当前拥塞控制、队列算法、关键参数及是否可写**
+
+```bash
+proxy tune status
+```
+
+**只预览**（当前值 → 目标值），不做任何修改
+
+```bash
+proxy tune preview
+```
+
+**预览后确认应用**；加 `--auto` 不询问
+
+```bash
+proxy tune apply
+```
+
+**恢复调优前的原值并删除配置文件**
+
+```bash
+proxy tune restore
+```
+
+**使用指定预设并自动确认**
+
+```bash
 proxy tune apply --tune-preset bbr-fq_codel --auto
+```
+
+**自定义拥塞控制、队列算法、带宽和延迟**
+
+```bash
 proxy tune apply --tune-cc bbr --tune-qdisc cake --tune-bw 1000 --tune-rtt 180
 ```
 
@@ -234,19 +275,28 @@ proxy tune apply --tune-cc bbr --tune-qdisc cake --tune-bw 1000 --tune-rtt 180
 
 ### 1. 在落地机上安装（`--land`）
 
+**交互安装**：询问端口（默认随机 20000-60000）、加密方式、来源 IP 白名单
+
 ```bash
-# 交互安装：询问端口（默认随机 20000-60000）、加密方式、来源 IP 白名单
 bash proxy.sh --land
+```
 
-# 全自动：只允许中转机 203.0.113.10 连接（IPv4 / IPv6 / CIDR，逗号分隔）
+**全自动**：只允许中转机 203.0.113.10 连接（IPv4 / IPv6 / CIDR，逗号分隔）
+
+```bash
 bash proxy.sh --land --auto --land-allow 203.0.113.10
+```
 
-# 指定端口与加密方式
+**指定端口与加密方式**
+
+```bash
 bash proxy.sh --land --auto --port 8388 --land-method chacha20 --land-allow 203.0.113.10,2001:db8::/64
+```
 
-# NAT 小鸡 / Alpine 做落地机：公网 52430 → 内部 8388（映射需同时包含 TCP+UDP 才能转发 UDP）
-apk add bash curl   # Alpine
-bash proxy.sh --land --nat --auto --port 52430:8388 --nat-addr 1.2.3.4 --land-allow 203.0.113.10
+**NAT 小鸡 / Alpine 做落地机**：公网 52430 → 内部 8388（映射需同时包含 TCP+UDP 才能转发 UDP）
+
+```bash
+apk add bash curl && bash proxy.sh --land --nat --auto --port 52430:8388 --nat-addr 1.2.3.4 --land-allow 203.0.113.10
 ```
 
 - **尽量轻**：只装 Xray 一个程序（直接下载官方 Release 并校验 SHA256，只解压 `xray` 本体，不带 geo 数据文件），不装 Reality / Hysteria2 / fail2ban / 默认拒绝防火墙；Xray 以 `nobody` 运行、日志 warning 且关闭访问日志，内存 < 256MB 时自动设置 `GOMEMLIMIT`（128MB 的 Alpine 容器实测 Xray 常驻约 30MB）。支持 Debian / Ubuntu / RHEL 系（systemd）以及 Alpine（OpenRC），NAT 映射端口写法与 NAT 模式相同。
@@ -280,8 +330,9 @@ bash proxy.sh --land --nat --auto --port 52430:8388 --nat-addr 1.2.3.4 --land-al
 
 ```bash
 proxy land-add 'ss://2022-blake3-aes-128-gcm:xxxx%3D%3D@1.2.3.4:8388#HK-land'
-# 或菜单第 12 项「添加 / 修改落地转发」，粘贴链接
 ```
+
+也可以使用菜单第 12 项「添加 / 修改落地转发」，粘贴链接。
 
 - 解析 `ss://` 链接（也接受 base64 形式的 userinfo），只接受 SS2022 三种加密，并检查密钥长度。
 - **先测试再启用**：① TCP 连接落地机端口；② 用临时 Xray 客户端经落地机发起真实请求并显示出口 IP（与落地机地址比较）。不测速。测试失败默认不改配置（交互时可选择仍然启用，命令行可加 `--force`），并提示常见原因（密钥错误 / 白名单未包含本机出口 IP / 时间误差）。
@@ -289,12 +340,34 @@ proxy land-add 'ss://2022-blake3-aes-128-gcm:xxxx%3D%3D@1.2.3.4:8388#HK-land'
 - 落地设置保存在 `/root/.proxy-oneclick/state.env`（`RELAY_LINK` / `RELAY_ON` / `RELAY_SOCKS`），**每次重新生成配置都会重新加入**（`proxy sni`、`proxy port`、`proxy regen`、用户管理、更新、重新安装都不会把它覆盖掉）。
 - 管理：
 
+**落地转发菜单**：添加/修改、测试、停用、重新启用、删除
+
 ```bash
-proxy land        # 落地转发菜单：添加/修改、测试、停用、重新启用、删除
-proxy land-test   # 只测试当前落地
-proxy land-off    # 停用：恢复直连出站，保留链接
-proxy land-on     # 重新启用（先测试）
-proxy land-del    # 删除落地链接并恢复直连
+proxy land
+```
+
+**只测试当前落地**
+
+```bash
+proxy land-test
+```
+
+**停用**：恢复直连出站，保留链接
+
+```bash
+proxy land-off
+```
+
+**重新启用**（先测试）
+
+```bash
+proxy land-on
+```
+
+**删除落地链接并恢复直连**
+
+```bash
+proxy land-del
 ```
 
 `proxy status` 会显示当前落地（tag、地址、加密、启用 / 停用）。安装完成后 REALITY 自检也会显示经落地后的出口 IP。
@@ -376,19 +449,76 @@ NAT 小鸡不需要放行这些端口：只要在服务商面板里建好对应�
 
 ## 常用维护
 
+**菜单**
+
 ```bash
-proxy               # 菜单
-proxy info          # 链接 / 二维码 / mihomo 配置
-proxy sni           # 重新优选或手动更换 SNI（Hysteria2 证书与指纹会同步更新）
-proxy user          # 添加 / 删除额外用户（UUID + 备注）
-proxy update        # 更新 Xray / Hysteria2 / 脚本
-proxy update-script # 只更新本脚本（proxy 命令）
-proxy status        # 服务状态、时间同步、日志、防火墙规则、fail2ban
-proxy speed         # BBR 状态、到 SNI 的延迟、下载测速（Cloudflare / CacheFly / OVH 自动切换）
-proxy tune          # 网络调优：状态 / 预设 / 恢复（见「网络调优」）
-proxy land          # 落地转发（中转机）/ 落地机链接（落地机）
-proxy land-add 'ss://...'   # 中转机添加 / 替换落地
-proxy allow         # 落地机：修改来源 IP 白名单
+proxy
+```
+
+**链接 / 二维码 / mihomo 配置**
+
+```bash
+proxy info
+```
+
+**重新优选或手动更换 SNI**（Hysteria2 证书与指纹会同步更新）
+
+```bash
+proxy sni
+```
+
+**添加 / 删除额外用户**（UUID + 备注）
+
+```bash
+proxy user
+```
+
+**更新 Xray / Hysteria2 / 脚本**
+
+```bash
+proxy update
+```
+
+**只更新本脚本**（proxy 命令）
+
+```bash
+proxy update-script
+```
+
+**服务状态、时间同步、日志、防火墙规则、fail2ban**
+
+```bash
+proxy status
+```
+
+**BBR 状态、到 SNI 的延迟、下载测速**（Cloudflare / CacheFly / OVH 自动切换）
+
+```bash
+proxy speed
+```
+
+**网络调优**：状态 / 预设 / 恢复（见「网络调优」）
+
+```bash
+proxy tune
+```
+
+**落地转发**（中转机）/ 落地机链接（落地机）
+
+```bash
+proxy land
+```
+
+**中转机添加 / 替换落地**
+
+```bash
+proxy land-add 'ss://...'
+```
+
+**落地机：修改来源 IP 白名单**
+
+```bash
+proxy allow
 ```
 
 主要文件：
@@ -416,9 +546,16 @@ proxy allow         # 落地机：修改来源 IP 白名单
 
 ## 卸载
 
+**交互确认**
+
 ```bash
-proxy uninstall          # 交互确认
-proxy uninstall --auto   # 免确认
+proxy uninstall
+```
+
+**免确认**
+
+```bash
+proxy uninstall --auto
 ```
 
 会移除：Xray、Hysteria2（含 hysteria 用户）、nftables 表与 systemd 单元、sysctl / limits / journald 配置（并恢复调优前的参数值）、fail2ban 规则、`proxy` 命令、节点信息；可选择是否删除密钥与备份目录；安装时被停用的 firewalld / ufw 会询问是否恢复。安装时创建的 `/swapfile` 会保留（附删除方法）。NAT 模式还会移除 OpenRC 服务脚本、日志目录、端口跳跃规则，并恢复 `--dns64` 修改前的 `/etc/resolv.conf`。落地机还会移除白名单规则表与开机服务。最后别忘了在云控制台关闭不再需要的端口。
