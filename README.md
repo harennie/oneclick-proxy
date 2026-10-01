@@ -1,6 +1,8 @@
 # proxy 一键脚本 · VLESS-REALITY-Vision (ML-DSA-65) + Hysteria2
 
-> 当前版本：**v1.2.1**（修复 Alpine / LXC NAT 机上「安装为落地机」走了普通端口流程并自动调优的问题；菜单新增第 15 项「切换 NAT 模式」；NAT 模式不再把出口 IP 当作公网地址默认值。见文末「更新日志」）
+> 当前版本：**v1.2.2**（修复 `proxy sni --scan` 跳过环境预检时 `ARCH` 为空，RealiTLScanner 下载地址变成 `RealiTLScanner-linux-` 并返回 404。见文末「更新日志」）
+>
+> v1.2.1：修复 Alpine / LXC NAT 机上「安装为落地机」走了普通端口流程并自动调优的问题；菜单新增第 15 项「切换 NAT 模式」；NAT 模式不再把出口 IP 当作公网地址默认值。见文末「更新日志」
 >
 > v1.2.0：新增独立的「网络调优」功能 `proxy tune`：多种 BBR / 队列算法预设、按内存或带宽×延迟自动计算缓冲区、预览后再应用、可一键恢复，NAT / LXC / Alpine 也能用；新增「落地机」模式 `--land`（Shadowsocks 2022 出口 + 来源 IP 白名单）与中转机的「落地转发」`proxy land-add`。见下文「网络调优」「落地机 / 落地转发」与文末「更新日志」）
 
@@ -596,6 +598,9 @@ proxy uninstall --auto
 ---
 
 ## 更新日志
+
+### v1.2.2
+- 修复：`proxy sni --scan` 不经过 preflight，`ARCH` 仍为空时 RealiTLScanner 下载地址变成 `RealiTLScanner-linux-` 并返回 HTTP 404。拼下载地址前若 `ARCH` 为空会先调用 `detect_os`。
 
 ### v1.2.1
 - 修复：Alpine（以及 NAT 机）上用菜单第 13 项「安装为落地机」（或 `--land` 不带 `--nat`）时，依赖按精简模式安装，但端口却走了普通流程（「Shadowsocks 2022 监听端口」而不是「公网端口 / 内部端口」映射流程），并且像普通 VPS 一样自动执行了网络调优。原因：Alpine 的 NAT 判断在落地机模式下被跳过（`LAND_MODE=1` 时不设置 `NAT_MODE`），落地机又总是使用精简依赖。现在所有安装入口（菜单 1 / 13、`--land`、落地机 ↔ 节点改装）在环境检测阶段统一确定 NAT 模式，之后的调优、端口设置都以它为准；环境检测一行显示「模式: NAT（Alpine 强制 / 命令行指定 / 菜单手动设置 / 沿用已安装 / 自动检测）」。

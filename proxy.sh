@@ -23,7 +23,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.2.1"
+readonly SCRIPT_VERSION="1.2.2"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -2015,6 +2015,8 @@ scanner_parse() {
 scanner_collect() { # $1 输出候选列表文件
   local out=$1 url csv secs=${SCAN_SECS:-60}
   [[ -n $PUBLIC_IP4 ]] || { warn "无 IPv4，无法扫描。"; return 1; }
+  # proxy sni 不经过 preflight，ARCH 仍为空时下载地址会变成 RealiTLScanner-linux- 并 404
+  [[ -n $ARCH ]] || detect_os
   if [[ ! -x $SCANNER_BIN ]]; then
     url="https://github.com/XTLS/RealiTLScanner/releases/download/${SCANNER_VER}/RealiTLScanner-linux-${ARCH}"
     info "下载 RealiTLScanner ${SCANNER_VER} ..."
