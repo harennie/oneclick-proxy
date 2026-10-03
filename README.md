@@ -1,14 +1,6 @@
-# 哈人 · oneclick proxy · VLESS-REALITY + XHTTP + Hysteria2
+# oneclick proxy
 
-单文件 Bash 脚本。默认一键部署三个协议，都不需要自己的域名：
-
-- **VLESS + REALITY + XTLS-Vision**（含后量子签名 ML-DSA-65）
-- **VLESS + XHTTP + REALITY**（与 Vision 共用同一把 Reality 密钥和 SNI，单独 TCP 端口）
-- **Hysteria2**（端口跳跃 + 证书指纹固定）
-
-可选协议默认不装：Trojan + REALITY、TUIC v5、AnyTLS。Shadowsocks 2022 仍然只出现在落地机模式里。自动优选 REALITY 目标网站（SNI），自带 nftables 防火墙、fail2ban 与保守的网络调优。交互风格参考 [233boy/v2ray](https://github.com/233boy/v2ray)：数字菜单、少量颜色、安装后可用 `proxy` 命令管理。终端不支持颜色、`TERM=dumb` 或设置了 `NO_COLOR` 时退回纯文本。
-
----
+单文件 Bash 脚本，一键在 VPS 上安装代理节点，不需要自己的域名。
 
 ## 一键安装
 
@@ -94,6 +86,18 @@ proxy proto
 ```
 
 菜单第 16 项「协议开关」作用相同。命令行也可以直接带开关重跑安装，例如 `proxy --no-xhttp`、`proxy --tuic`、`proxy --no-hy2`。关闭只停止对应监听，密钥留在 `state.env`。
+
+---
+
+## 默认协议
+
+默认一次装好三个，都不需要自己的域名：
+
+- **VLESS + REALITY + XTLS-Vision**（含后量子签名 ML-DSA-65）
+- **VLESS + XHTTP + REALITY**（与 Vision 共用同一把 Reality 密钥和 SNI，单独 TCP 端口）
+- **Hysteria2**（端口跳跃 + 证书指纹固定）
+
+可选协议默认不装：Trojan + REALITY、TUIC v5、AnyTLS。安装时加 `--trojan`、`--tuic`、`--anytls`，或装完后用上面的 `proxy proto`。Shadowsocks 2022 只出现在落地机模式里。
 
 ---
 
