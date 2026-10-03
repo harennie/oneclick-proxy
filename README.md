@@ -1,13 +1,5 @@
 # 哈人 · oneclick proxy · VLESS-REALITY + XHTTP + Hysteria2
 
-> 当前版本：**v1.3.0**（默认一次装好 VLESS+REALITY+Vision、VLESS+XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC v5 / AnyTLS 默认关闭，装完后可单独开关且不丢密钥。见文末「更新日志」）
->
-> v1.2.2：修复 `proxy sni --scan` 跳过环境预检时 `ARCH` 为空，RealiTLScanner 下载地址变成 `RealiTLScanner-linux-` 并返回 404。
->
-> v1.2.1：修复 Alpine / LXC NAT 机上「安装为落地机」走了普通端口流程并自动调优的问题；菜单新增第 15 项「切换 NAT 模式」；NAT 模式不再把出口 IP 当作公网地址默认值。
->
-> v1.2.0：新增独立的「网络调优」功能 `proxy tune`；新增「落地机」模式 `--land`（Shadowsocks 2022 出口 + 来源 IP 白名单）与中转机的「落地转发」`proxy land-add`。见下文「网络调优」「落地机 / 落地转发」与文末「更新日志」。
-
 单文件 Bash 脚本。默认一键部署三个协议，都不需要自己的域名：
 
 - **VLESS + REALITY + XTLS-Vision**（含后量子签名 ML-DSA-65）
@@ -74,7 +66,7 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--no-firewall` | 不配置 nftables 防火墙 |
 | `--no-upgrade` | 跳过系统软件包升级 |
 | `--no-tune` | 跳过 sysctl 调优 |
-| `--tune-preset <名>` | 安装时使用的调优预设（默认 `bbr-fq`，与旧版相同），见「网络调优」 |
+| `--tune-preset <名>` | 安装时使用的调优预设（默认 `bbr-fq`），见「网络调优」 |
 | `--nat` / `--no-nat` | 启用 / 关闭 NAT 小鸡模式（记录在 state.env，之后 `proxy` 命令自动沿用）。不指定时：Alpine 自动启用 NAT；LXC / OpenVZ 容器首次安装时询问（公网 IP 不在本机网卡上时默认「是」，`--auto` 直接按此判断）；交互菜单第 15 项可手动切换 |
 | `--nat-addr <地址>` | 链接里使用的公网（入口）IP 或域名，即商家面板端口映射里显示的地址。交互安装时必须手动填写（检测到的出口 IP 只作提示）；`--auto` 未指定时暂用出口 IP 并给出警告 |
 | `--nat-ports <列表>` / `--nat-port` | 服务商已映射的端口，逗号分隔，每项 `外部[:内部]`：`52430`、`59221:443`、整段 `10001-10020`、`10001-10020:20001-20020` |
@@ -108,7 +100,7 @@ proxy proto
 ## 功能
 
 - **环境预检**：必须 root；识别发行版与架构（amd64 / arm64）；显示 IP、城市、ASN、内存；内存 < 1G 且无 Swap 时自动加 1G Swap；自动更新系统并安装依赖（RHEL 系自动启用 EPEL）；未检测到时间同步服务时自动安装并启用 systemd-timesyncd / chrony（REALITY 要求系统时间准确）。
-- **系统调优（保守，不换内核）**：普通模式安装时默认启用 BBR + fq；TCP/UDP 缓冲区（满足 Hysteria2 建议的 16MB）、文件句柄上限；journald 日志上限 100M（与 v1.1.x 结果完全相同）。配置写入 `/etc/sysctl.d/99-proxy-tune.conf`，卸载时恢复原值。v1.2.0 起也可以用 `proxy tune` 单独调整 / 恢复，见下文「网络调优」。
+- **系统调优（保守，不换内核）**：普通模式安装时默认启用 BBR + fq；TCP/UDP 缓冲区（满足 Hysteria2 建议的 16MB）、文件句柄上限；journald 日志上限 100M。配置写入 `/etc/sysctl.d/99-proxy-tune.conf`，卸载时恢复原值。也可以用 `proxy tune` 单独调整 / 恢复，见下文「网络调优」。
 - **Xray（官方 XTLS/Xray-install 安装最新版）**：
   - VLESS + REALITY + `xtls-rprx-vision`，默认 TCP 443；
   - 自动生成 UUID、x25519 密钥、ShortId（`openssl rand -hex 4`）、**ML-DSA-65**（服务端 `mldsa65Seed`，客户端链接 `pqv=`）；ML-DSA-65 要求目标网站证书链总长度 ≥ 3500 字节，不满足时脚本会自动对该目标关闭 pqv（REALITY 本身照常可用）；
@@ -125,7 +117,7 @@ proxy proto
 - **XHTTP（默认开启）**：VLESS + XHTTP + REALITY。与 Vision 共用同一把 x25519、ShortId、SNI 和 ML-DSA-65 种子，单独监听 TCP 8443，`flow` 必须为空，路径为随机 `/` + 十六进制。服务端和客户端链接的 `mode` 都是 `stream-one`（REALITY 直连；客户端用 `auto` 时有已知握手失败）。不需要自己的域名，也不把自己的证书挂到 XHTTP 上。
 - **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
 - **输出**：每个已开启协议单独一块：名称、地址、端口各一行，链接本身最后单独一行。vless://（含 / 不含 pqv）、xhttp 的 vless://（`mode=stream-one`，无 flow）、hysteria2://（`mport`、`sni`、`insecure=1`、`pinSHA256`）、可选的 trojan:// / tuic:// / anytls://，终端二维码，mihomo（Clash.Meta）YAML 片段。
-- **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。原有项目全部留在主菜单、两列编号，第 16 项是「协议开关」。其余仍是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
+- **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
 - **落地机 / 落地转发**：`--land` 把本机装成只跑 Shadowsocks 2022 的出口（落地机）；已安装的节点用 `proxy land-add 'ss://...'` 把出口切到落地机（中转），见下文。
 - **健壮性**：`set -o errexit -o pipefail -o errtrace` + 错误陷阱提示出错行；可重复运行（保留已有密钥，只更新组件与配置）；安装前检查端口占用；没有 IPv6 也能正常工作（链接使用 IPv4）；通过 shellcheck 检查。
 
@@ -186,7 +178,7 @@ XHTTP 还需要第二条外部 TCP 端口（默认 8443，不能和 Vision 共�
 - **Reality 与 Hysteria2 默认共用一个外部端口**（TCP 走 Reality、UDP 走 Hysteria2），因为很多服务商只给 5 条左右的映射。前提是该映射**同时转发 TCP 和 UDP**；若只转发 TCP，请加 `--nat-no-share` 并再提供一个 UDP 端口（例如 `--nat-ports 52430,52431`），或 `--no-hy2`。
 - **端口跳跃默认关闭**。只有在「整段转发」且机器有 DNAT 能力（nftables 或 iptables 可用、容器有 NET_ADMIN）时才能开启，例如 `--nat-ports 10001-10020 --hop 10003-10020`；Reality 端口和 `--nat-exclude` 排除的端口会被自动剔除，范围会被拆成多段（如 `10003-10009,10011-10020`）。探测失败会自动回落为不跳跃并给出提示。规则由 `proxy-oneclick-hop` 服务开机加载。
 - **`--nat-exclude`**：整段转发里已经给别的用途（例如 SSH 的 52429）的端口。当前被占用的端口也会自动排除。
-- **地址**：v1.2.1 起，交互安装时**必须填写入口地址**（商家面板「端口映射 / NAT 转发」条目里显示的 IP 或域名）。外部查询服务检测到的只是**出口 IP**，只作为提示「检测到的出口 IP: x（NAT 机入口地址可能不同）」显示；直接回车时需要再明确确认「出口 IP 同时也是入口地址」才会使用。填写后会做一次提示性自检（入口 ≠ 出口且不在本机网卡上时给出说明，不阻止）。IPv6 地址在链接中自动加方括号，私有地址会提醒；`--nat-addr` 可直接指定；`--auto` 未指定 `--nat-addr` 时暂用出口 IP 并警告。
+- **地址**：交互安装时**必须填写入口地址**（商家面板「端口映射 / NAT 转发」条目里显示的 IP 或域名）。外部查询服务检测到的只是**出口 IP**，只作为提示「检测到的出口 IP: x（NAT 机入口地址可能不同）」显示；直接回车时需要再明确确认「出口 IP 同时也是入口地址」才会使用。填写后会做一次提示性自检（入口 ≠ 出口且不在本机网卡上时给出说明，不阻止）。IPv6 地址在链接中自动加方括号，私有地址会提醒；`--nat-addr` 可直接指定；`--auto` 未指定 `--nat-addr` 时暂用出口 IP 并警告。
 - **何时进入 NAT 模式**（菜单 1 / 13、`--land`、改装都一样，在「端口设置」之前确定）：`--nat` / `--no-nat` > 菜单第 15 项手动设置 > Alpine 强制 NAT > 已安装的模式 > 自动检测（LXC / OpenVZ 容器询问「是否为 NAT 机（只有服务商映射的端口可用）？」，公网 IP 不在本机网卡上时默认「是」）。
 
 ### NAT 模式跳过的组件（以及原因）
@@ -217,7 +209,7 @@ XHTTP 还需要第二条外部 TCP 端口（默认 8443，不能和 Vision 共�
 
 ---
 
-## 网络调优（`proxy tune`，v1.2.0）
+## 网络调优（`proxy tune`）
 
 独立功能：不安装代理也能用（`bash proxy.sh tune`），NAT / LXC / OpenVZ / Alpine 下同样可用。菜单第 11 项，或命令行：
 
@@ -269,37 +261,36 @@ proxy tune apply --tune-cc bbr --tune-qdisc cake --tune-bw 1000 --tune-rtt 180
 
 | 预设 | 说明 |
 |---|---|
-| `bbr-fq`（默认） | BBR + fq。fq 为 BBR 提供高效的 pacing，服务器端首选；普通模式安装默认使用，结果与 v1.1.x 相同 |
+| `bbr-fq`（默认） | BBR + fq。fq 为 BBR 提供高效的 pacing，服务器端首选；普通模式安装默认使用 |
 | `bbr-fq_codel` | BBR + fq_codel。内核 4.20+ BBR 在非 fq 队列下由 TCP 自身做 pacing；适合本机还有其它业务 / 做路由的机器 |
 | `bbr-cake` | BBR + cake（需内核有 `sch_cake`），CPU 开销略高 |
 | `cubic-fq_codel`（保守） | 不启用 BBR，cubic + fq_codel，与多数发行版默认接近 |
 | `keep` | 只调缓冲区 / 连接参数，拥塞控制与队列保持系统原来的设置（之前由本脚本改过的会改回原值） |
 | `custom` | 从本机可用的算法里分别选择拥塞控制与队列算法（`--tune-cc` / `--tune-qdisc`） |
 
-内核缺少预设需要的组件时，菜单中会标注「不可用：缺少 …」；非交互模式下会保持该项不变并给出提示（例如没有 BBR 时只应用缓冲区等参数，和旧版行为一致）。
+内核缺少预设需要的组件时，菜单中会标注「不可用：缺少 …」；非交互模式下会保持该项不变并给出提示（例如没有 BBR 时只应用缓冲区等参数）。
 
-**缓冲区档位**（`--tune-buffer`，独立调优默认 `auto` 按内存；安装时默认 `medium` 以保持旧版结果）：
+**缓冲区档位**（`--tune-buffer`，独立调优默认 `auto` 按内存；安装时默认 `medium`）：
 
 | 档位 | TCP 缓冲区上限 | 说明 |
 |---|---|---|
 | `small` | 4MB（UDP/core 8MB） | ≤256MB 小鸡；UDP 仍保留 8MB，满足 quic-go（Hysteria2）约 7MB 的接收缓冲区需求 |
-| `medium` | 16MB | 与 v1.1.x 相同 |
+| `medium` | 16MB | 普通 VPS 的默认档 |
 | `large` | 64MB | 约 2GB 及以上内存，高带宽长距离线路 |
 | `bdp` | 2 × 带宽 × 延迟 | `--tune-bw <Mbps> --tune-rtt <ms>`，下限 4MB，上限按内存（≤256MB 8MB、≤1GB 32MB、≤4GB 64MB、更大 128MB） |
 
-其余参数：`tcp_fastopen=3`、`tcp_mtu_probing=1`、`tcp_slow_start_after_idle=0`、`tcp_notsent_lowat=131072`、`tcp_fin_timeout=30`、`tcp_keepalive_time=600`、`somaxconn` / `tcp_max_syn_backlog` / `netdev_max_backlog` 按档位、文件句柄上限（与旧版相同）。`ip_local_port_range` 和 conntrack 不修改（`status` 中显示 conntrack 使用率，超过 80% 会提醒）。
+其余参数：`tcp_fastopen=3`、`tcp_mtu_probing=1`、`tcp_slow_start_after_idle=0`、`tcp_notsent_lowat=131072`、`tcp_fin_timeout=30`、`tcp_keepalive_time=600`、`somaxconn` / `tcp_max_syn_backlog` / `netdev_max_backlog` 按档位、文件句柄上限。`ip_local_port_range` 和 conntrack 不修改（`status` 中显示 conntrack 使用率，超过 80% 会提醒）。
 
 **应用流程**：先显示预览表（参数 / 当前值 / 目标值 / 状态），确认后只写可写的参数，跳过的逐条说明原因，例如「跳过：容器内只读（宿主机控制）」「跳过：容器内不可见」「跳过：全局参数，容器内修改会影响宿主机」（特权容器里 `fs.file-max`、`default_qdisc` 等全局参数即使可写也不碰）。队列算法会立即应用到默认网卡（`tc`，多队列网卡重建 mq），并通过 `net.core.default_qdisc` 持久化。
 
 **持久化与恢复**：
-- 只维护一个文件 `/etc/sysctl.d/99-proxy-tune.conf`（沿用旧版文件名，升级用户不会出现两份配置），只包含成功应用的参数；OpenRC 下会确保 `sysctl` 服务在 boot 运行级。
+- 只维护一个文件 `/etc/sysctl.d/99-proxy-tune.conf`，只包含成功应用的参数；OpenRC 下会确保 `sysctl` 服务在 boot 运行级。
 - 容器内 `systemd-sysctl` 常因 `/proc/sys` 只读挂载而被跳过，且网卡队列只能用 `tc` 设置，因此容器中额外添加开机服务 `proxy-oneclick-tune`（systemd 单元或 OpenRC 脚本）重新应用。
-- 首次应用前把所有相关参数的原值备份到 `/root/.proxy-oneclick/tune/backup.env`（之后换预设不会覆盖备份）；`proxy tune restore` 还原原值、网卡队列，删除配置文件与开机服务。卸载时自动执行同样的恢复。
-- 从 v1.1.x 升级的机器没有原值备份：恢复时删除旧文件并重新加载系统 sysctl 配置，其余参数回退到内核默认值（默认队列 / 拥塞控制按内核编译配置）；`tcp_max_syn_backlog`、`fs.file-max` 等与内存相关的少数参数重启后完全恢复。
+- 首次应用前把所有相关参数的原值备份到 `/root/.proxy-oneclick/tune/backup.env`（之后换预设不会覆盖备份）；`proxy tune restore` 还原原值、网卡队列，删除配置文件与开机服务。卸载时自动执行同样的恢复。没有备份时，恢复会删掉该配置文件并重新加载系统 sysctl，其余参数回到内核默认值。
 
 ---
 
-## 落地机 / 落地转发（v1.2.0）
+## 落地机 / 落地转发
 
 常见用法：客户端连一台线路好的 **中转机**（本脚本安装的 Reality / Hysteria2 节点），中转机再把流量交给另一台 **落地机** 出去，目标网站看到的是落地机的 IP（例如需要特定地区 IP、或中转机 IP 不干净）。
 
@@ -525,11 +516,11 @@ Hysteria2 ▶ …              sing-box  ▶ 未安装
 ════════════════════════════════
 ```
 
-NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单仍是原来的 11 项（没有客户端直连协议），框标题同样是 `oneclick proxy`。
+NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 11 项（没有客户端直连协议），框标题同样是 `oneclick proxy`。
 
 **协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥，但不会把已关闭的协议重新打开。
 
-**切换 NAT 模式**（第 15 项，落地机菜单为第 11 项，v1.2.1）：`自动`（默认：Alpine 强制 NAT、LXC/OpenVZ 容器安装时询问、已安装的沿用原模式）/ `开`（强制 NAT 映射端口流程，等同 `--nat`）/ `关`（强制普通模式，等同 `--no-nat`；Alpine 不可用）。在第 1 或 13 项安装前选择即可；设置保存在 `state.env`（`NAT_PREF`），之后的修改端口等操作都按它执行。已安装时切换到不同模式会提示立即重新安装（保留密钥 / UUID）；命令行 `--nat` / `--no-nat` 优先并同步该设置。
+**切换 NAT 模式**（第 15 项，落地机菜单为第 11 项）：`自动`（默认：Alpine 强制 NAT、LXC/OpenVZ 容器安装时询问、已安装的沿用原模式）/ `开`（强制 NAT 映射端口流程，等同 `--nat`）/ `关`（强制普通模式，等同 `--no-nat`；Alpine 不可用）。在第 1 或 13 项安装前选择即可；设置保存在 `state.env`（`NAT_PREF`），之后的修改端口等操作都按它执行。已安装时切换到不同模式会提示立即重新安装（保留密钥 / UUID）；命令行 `--nat` / `--no-nat` 优先并同步该设置。
 
 **链接 / 二维码 / mihomo 配置**
 
@@ -656,58 +647,3 @@ proxy uninstall --auto
 - 落地转发只改变本机 Xray / Hysteria2 代理流量的出口，本机系统自身的流量（apt、脚本下载等）仍然直连。
 - 落地机只支持 Shadowsocks 2022；中转机 `land-add` 只接受 SS2022 链接。Xray 26.x 会对 Shadowsocks 打印弃用提示（官方推荐 VLESS Encryption），将来如被移除需要改用其它协议。
 - NAT 容器落地机的白名单只由 Xray 路由实现（非白名单连接会被接受后丢弃，而不是在防火墙层拒绝）。
-
----
-
-## 更新日志
-
-### v1.3.0
-- 默认一键（含 `--auto`）安装三个协议：VLESS + REALITY + Vision、VLESS + XHTTP + REALITY、Hysteria2。XHTTP 按 Xray 官方「steal others」最小示例：同一把 Reality 私钥 / SNI / ShortId，单独 TCP 端口（默认 8443），不填 flow，`xhttpSettings.mode` 与客户端链接都是 `stream-one`，路径随机并写入状态。不需要自己的域名。
-- 可选协议默认关闭，安装时不询问：Trojan + REALITY（Xray）、TUIC v5 与 AnyTLS（sing-box，自签证书 CN = 所选 SNI）。`--trojan` / `--tuic` / `--anytls` 或装完后的菜单第 16 项、`proxy proto` 再打开。关闭只停监听，不删 UUID、密钥、路径和密码。
-- NAT 只有一个映射端口时，XHTTP 放不下第二条 TCP，会警告并跳过，`--nat --auto --port 59221:443` 仍然得到 Reality + Hysteria2。`--no-xhttp` 可一开始就不装。
-- 旧的 `state.env` 里没有 `XHTTP_ENABLED` 时，`proxy sni` 不会突然打开 XHTTP；重新安装或菜单 / `--xhttp` 才会打开。
-- 没有把 Shadowsocks 2022 做成客户端直连入站，落地机用法不变。没有加 NaiveProxy（需要自有域名和单独服务）。
-- 菜单改成「哈人」字符 Logo，Logo 正下方小标题和双线框标题都是 `oneclick proxy`。原有 1–15 项全部留在主菜单两列里，第 16 项是协议开关。安装结束时每个协议的链接单独一块。
-
-### v1.2.2
-- 修复：`proxy sni --scan` 不经过 preflight，`ARCH` 仍为空时 RealiTLScanner 下载地址变成 `RealiTLScanner-linux-` 并返回 HTTP 404。拼下载地址前若 `ARCH` 为空会先调用 `detect_os`。
-
-### v1.2.1
-- 修复：Alpine（以及 NAT 机）上用菜单第 13 项「安装为落地机」（或 `--land` 不带 `--nat`）时，依赖按精简模式安装，但端口却走了普通流程（「Shadowsocks 2022 监听端口」而不是「公网端口 / 内部端口」映射流程），并且像普通 VPS 一样自动执行了网络调优。原因：Alpine 的 NAT 判断在落地机模式下被跳过（`LAND_MODE=1` 时不设置 `NAT_MODE`），落地机又总是使用精简依赖。现在所有安装入口（菜单 1 / 13、`--land`、落地机 ↔ 节点改装）在环境检测阶段统一确定 NAT 模式，之后的调优、端口设置都以它为准；环境检测一行显示「模式: NAT（Alpine 强制 / 命令行指定 / 菜单手动设置 / 沿用已安装 / 自动检测）」。
-- Alpine 不再询问「是否以 NAT 模式继续」，直接启用 NAT 模式并说明原因；`--no-nat` 仍会拒绝。非 Alpine 的 LXC / OpenVZ 容器首次安装且未指定 `--nat` / `--no-nat` 时询问「是否为 NAT 机（只有服务商映射的端口可用）？」：检测到的公网 IP 不在本机任何网卡上时默认「是」；`--auto` 直接按该判断。普通 VPS（KVM 等）不受影响，仍为普通流程。
-- NAT 模式的网络调优恢复为 v1.2.0 设计：交互时先说明将做什么（按内存选缓冲区，BBR 可用且可写时启用 BBR + fq）再询问，`--auto` 只在给了 `--tune` / `--tune-preset` 时执行。
-- 修复调优结果一行在容器内显示「队列 -」：容器里 `net.core.default_qdisc` 通常不可见，现在优先用 `tc` 读取默认网卡实际生效的队列（例如「队列 fq（网卡 eth0）」），没有 `tc` 时显示刚应用的值或「未知」；`proxy tune restore` 同样处理。
-- 新增菜单第 15 项「切换 NAT 模式（当前: 自动/开/关）」（落地机菜单第 11 项），菜单标题显示「模式: 普通 / NAT（自动检测）/ NAT（手动）」；设置持久化到 `state.env`，已安装时切换会提示重新安装，修改端口前若与已安装模式不一致也会提示。原有 0–14 项编号不变。
-- NAT 模式的「公网地址」不再把外部服务检测到的出口 IP 作为默认值：只显示为「检测到的出口 IP: x（NAT 机入口地址可能不同）」，需要填写商家面板端口映射中的入口地址，直接回车须明确确认出口 IP 即入口；填写后做提示性自检（不阻止）。适用于安装、落地机、`proxy port`、`proxy nat`。之前在 NAT 模式下填写过的地址可回车沿用；`--auto` 未给 `--nat-addr` 时暂用出口 IP 并警告。
-- 落地机在普通模式下的依赖提示改为「依赖安装完成（精简模式）」，避免误以为已处于 NAT 模式。
-
-### v1.2.0
-- 新增独立的「网络调优」功能：菜单第 11 项、`proxy tune [status|preview|apply|restore]`，未安装代理也可单独使用。
-- 新增「落地机」模式 `--land`：只运行 Xray Shadowsocks 2022（TCP+UDP，默认 `2022-blake3-aes-128-gcm`，可选 aes-256 / chacha20），支持 Alpine / OpenRC 与 NAT 映射端口，低内存自动设置 `GOMEMLIMIT`；可选来源 IP 白名单（Xray 路由 + nftables）；输出 `ss://` 链接、Xray 出站片段与中转机一键命令；独立的落地机菜单（白名单 / 端口 / 密钥 / 改装回节点 / 卸载）。
-- 新增中转机「落地转发」：菜单第 12 项、`proxy land-add 'ss://...'`，先测试 TCP 连通与经落地的真实请求（显示出口 IP）再启用；Reality 与 Hysteria2（经本机 socks）都走落地机，内网 / BT 屏蔽规则仍优先；`land-test` / `land-off` / `land-on` / `land-del`；设置持久化，重新生成配置不会丢失。
-- 菜单：12 = 添加 / 修改落地转发，13 = 安装为落地机，14 = 卸载（v1.1.x 为 11 = 卸载）。
-- 修复：从 NAT / 落地机模式改回普通模式时，删除脚本自建的 xray 服务文件并让官方脚本重新安装（否则 443 端口因缺少 `CAP_NET_BIND_SERVICE` 无法监听）；容器内看不到进程名的临时端口 UDP 套接字不再被当作「其它服务」自动放行。
-- 预设：`bbr-fq`（默认）、`bbr-fq_codel`、`bbr-cake`、`cubic-fq_codel`（保守）、`keep`（只调缓冲区）、`custom`（从本机可用算法中分别选择拥塞控制与队列算法）；不再对所有人强制 BBR + fq。
-- 自动探测虚拟化 / init / 内核 / 可用拥塞控制（含 BBR 版本）/ 可用队列算法 / 内存，并对每个参数实际测试是否可写；缓冲区按内存分 small / medium / large 三档，或输入带宽与延迟按 BDP 计算。
-- 应用前显示「当前值 → 目标值」预览并确认；只写可写的参数，跳过项逐条说明原因；特权容器中不修改会影响宿主机的全局参数。队列算法立即应用到默认网卡。
-- 首次应用前备份原值，`proxy tune restore` 可完整恢复；卸载时自动恢复（此前只删除文件，要等重启才恢复）。容器内添加开机服务重新应用调优；OpenRC 确保 sysctl 服务开机运行。
-- 安装流程改为调用同一套调优代码：普通模式默认仍为 BBR + fq + 16MB 缓冲区，写入的参数与 v1.1.x 完全相同（新增：立即把默认网卡切换到 fq，旧版要重启后才生效）；新增 `--tune-preset` / `--tune-buffer` / `--tune-cc` / `--tune-qdisc` / `--tune-bw` / `--tune-rtt` 参数。
-- NAT 模式：交互安装时询问是否调优（只应用可写参数，BBR 可用且可写时用 `bbr-fq`，否则 `keep`，缓冲区按内存）；`--auto` 默认仍跳过，加 `--tune` 或 `--tune-preset` 启用。
-- `proxy status` 在 NAT 模式下也显示拥塞控制 / 队列，并显示当前调优预设。
-
-### v1.1.2
-- NAT 端口输入容错：映射端口、内部端口、排除端口、VLESS-REALITY / Hysteria2 外部端口及端口跳跃范围的输入，会先去掉不可见字符（退格 `^H`、DEL、回车、ANSI 转义序列、零宽字符），并把全角冒号 `：`、全角逗号 `，` / 顿号 `、`、全角数字、全角连字符 / 破折号 / `~` 转换为半角，合并多余空格。普通（非 NAT）模式的端口输入同样处理；域名、UUID、密码等输入不受影响。
-- 映射端口「格式无效」时显示实际收到的原始输入（控制字符以转义形式显示，含非 ASCII 字符时附逐字节形式），并提示检查中文标点或不可见字符。
-- VLESS-REALITY / Hysteria2 外部端口提示中的「可选」只列外部端口（如 `61573`、`10001-10020`），不再显示 `61573:443` 这样的映射写法。
-- 分享链接客户端指纹保持 `fp=chrome`（确认没有使用 `randomized`）。
-
-### v1.1.1
-- SNI 优选：X25519MLKEM768 由硬性要求改为**优先项**——支持的候选排前面；本地区没有支持的候选时仍选用其余检测全部通过的目标，并打印警告。`--sni`、手动输入、重新安装时的检查同样只警告不拒绝（重新安装的交互确认默认改为「重新优选」）。
-- 修复：ML-DSA-65 要求目标证书链总长度 ≥ 3500 字节，否则服务端 REALITY 握手全部失败（此前被误认为是 MLKEM 不兼容）。现在按所选 SNI 自动判断，不满足时对该目标关闭 pqv（链接不再带 `pqv=`），候选列表新增 Chain 列并优先证书链够长的目标。已安装用户执行 `proxy sni` 或重新安装即可自动判断。
-- CDN / WAF 识别：除 Cloudflare 外，按响应头拒绝 Imperva/Incapsula、Fastly、Akamai、CloudFront、Azure Front Door、Sucuri、BunnyCDN（兼容 busybox）。
-- 香港候选替换为 `my.hkust.edu.hk factsfigures.cuhk.edu.hk dsbs.cuhk.edu.hk rmda.cuhk.edu.hk`（原列表全部不合格；后两个 HSTS 仅 300 秒，排在最后）；其它地区剔除了实测走 CDN 的候选，SG / PH 改为少量自建站点，不足时扩展到邻近地区。
-- 安装 / 更换 SNI 后自动进行 REALITY 自检（本机临时客户端 → 127.0.0.1 节点 → 外网），只打印结果，不影响安装。
-- 端口跳跃未启用时，菜单中不再显示「查看端口跳跃规则」。
-
-### v1.1.0
-- 新增 NAT 小鸡 / Alpine / OpenRC 模式（`--nat`）。
