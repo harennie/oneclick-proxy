@@ -33,6 +33,8 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 安装完成后输入 `proxy` 即可打开管理菜单，`proxy info` 随时查看链接 / 二维码 / Clash 配置。
 节点信息同时保存在 `/root/proxy-info.txt`（权限 600）。
 
+双栈（同时能用 IPv4 和 IPv6 出站）在安装、重装或改写节点配置时会询问一次出站策略：IPv4优先、IPv6优先、仅IPv4、仅IPv6，并记在 `state.env`，之后沿用。`--auto` 还没保存过选择时使用 IPv4优先。只有一种地址时不询问。
+
 ### 命令行参数
 
 | 参数 | 说明 |

@@ -459,7 +459,8 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             REALITY_ENABLED XHTTP_ENABLED XHTTP_PORT XHTTP_PATH XHTTP_EXT_PORT
             TROJAN_ENABLED TROJAN_PORT TROJAN_PASS TROJAN_EXT_PORT
             TUIC_ENABLED TUIC_PORT TUIC_PASS TUIC_EXT_PORT
-            ANYTLS_ENABLED ANYTLS_PORT ANYTLS_PASS ANYTLS_EXT_PORT)
+            ANYTLS_ENABLED ANYTLS_PORT ANYTLS_PASS ANYTLS_EXT_PORT
+            OUTBOUND_IP)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
@@ -476,6 +477,11 @@ HOP_BACKEND="" VIRT="" DNS64_SET=0
 LAND_MODE=0 LAND_METHOD="2022-blake3-aes-128-gcm" LAND_KEY="" LAND_ALLOW="" RELAY_LINK="" RELAY_ON=0 RELAY_SOCKS=""
 NAT_PREF=auto       # 菜单「切换 NAT 模式」：auto = 自动检测；on = 强制 NAT（同 --nat）；off = 强制普通模式（同 --no-nat）
 NAT_SRC=""          # 本次安装 NAT_MODE 的来源：cli | manual | alpine | state | auto | detect
+# 已记住的出站策略：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6。空 = 还没问过。
+# 双栈且为空时保持原来的 AsIs / Hy2 happy eyeballs，直到交互询问或 --auto（默认 46）。
+OUTBOUND_IP=""
+OUTBOUND_EFFECTIVE=""   # 本次写配置实际使用的策略（单栈会强制 4 或 6，不覆盖 OUTBOUND_IP）
+OUTBOUND_IP_DONE=0      # 本次进程只决定一次
 
 load_state() {
   [[ -f $STATE_FILE ]] || { STATE_HAS_XHTTP=0; return 0; }
@@ -2703,6 +2709,196 @@ xray_clients_json() { # $1 = flow（默认 xtls-rprx-vision；XHTTP 传空字符
   printf '%s' "$list"
 }
 
+# ----------------------------- 出站地址族 -----------------------------
+# 双栈（同时能用 IPv4 和 IPv6 出站）在写节点配置时询问一次：IPv4优先 / IPv6优先 / 仅IPv4 / 仅IPv6。
+# 只有一种地址族时不询问，Xray 用 UseIPv4 或 UseIPv6。选择记在 OUTBOUND_IP，之后重配沿用。
+# IPv4：默认路由的源地址不是回环 / 链路本地（NAT 内网地址算有 IPv4）。IPv6：全球单播（2000::/3），不算 fe80 和 ULA。
+outbound_ipv4_ok() {
+  local a=$1 o1 o2 o3 o4
+  [[ $a =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  o1=$((10#${BASH_REMATCH[1]})) o2=$((10#${BASH_REMATCH[2]})) o3=$((10#${BASH_REMATCH[3]})) o4=$((10#${BASH_REMATCH[4]}))
+  (( o1 <= 255 && o2 <= 255 && o3 <= 255 && o4 <= 255 )) || return 1
+  (( o1 == 0 || o1 == 127 )) && return 1
+  (( o1 == 169 && o2 == 254 )) && return 1
+  return 0
+}
+outbound_ipv6_global() { # 2000::/3；排除 ::1、fe80::/10、ULA fc00::/7
+  local a=${1,,}
+  [[ $a == *:* ]] || return 1
+  [[ $a == ::1 || $a == fe80:* || $a == fc* || $a == fd* ]] && return 1
+  [[ $a == [23]* ]]
+}
+outbound_detect_families_ip() {
+  local s4="" s6=""
+  s4=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || s4=""
+  s6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || s6=""
+  if outbound_ipv4_ok "$s4"; then OB_HAS_V4=1; fi
+  if outbound_ipv6_global "$s6"; then OB_HAS_V6=1; fi
+  return 0
+}
+outbound_detect_families_proc() {
+  local a
+  if awk 'NR>1 && $2=="00000000" && $1!="lo" {found=1} END{exit !found}' /proc/net/route 2>/dev/null; then
+    while IFS= read -r a; do
+      if outbound_ipv4_ok "$a"; then OB_HAS_V4=1; break; fi
+    done < <(awk '/32 host LOCAL/{print prev} {prev=$2}' /proc/net/fib_trie 2>/dev/null)
+  fi
+  if awk '$1=="00000000000000000000000000000000" && $2=="00" && $NF!="lo" {found=1} END{exit !found}' /proc/net/ipv6_route 2>/dev/null; then
+    while IFS= read -r a; do
+      # /proc/net/if_inet6 是 32 位十六进制；2000::/3 的首位为 2 或 3
+      if [[ ${a,,} == [23]* ]]; then OB_HAS_V6=1; break; fi
+    done < <(awk '{print $1}' /proc/net/if_inet6 2>/dev/null)
+  fi
+  return 0
+}
+outbound_detect_families() {
+  OB_HAS_V4=0 OB_HAS_V6=0
+  if have ip; then outbound_detect_families_ip; else outbound_detect_families_proc; fi
+  return 0
+}
+xray_domain_strategy() {
+  case ${OUTBOUND_EFFECTIVE:-} in
+    46) printf '%s' UseIPv4v6 ;;
+    64) printf '%s' UseIPv6v4 ;;
+    4) printf '%s' UseIPv4 ;;
+    6) printf '%s' UseIPv6 ;;
+    *) printf '%s' "" ;;
+  esac
+}
+hy2_direct_mode() {
+  case ${OUTBOUND_EFFECTIVE:-} in
+    46|64|4|6) printf '%s' "$OUTBOUND_EFFECTIVE" ;;
+    *) printf '%s' "" ;;
+  esac
+}
+hy2_outbound_name() {
+  case $1 in
+    46) printf '%s' ipv4-first ;;
+    64) printf '%s' ipv6-first ;;
+    4) printf '%s' ipv4-only ;;
+    6) printf '%s' ipv6-only ;;
+    *) printf '%s' direct ;;
+  esac
+}
+sb_ip_strategy() {
+  case ${OUTBOUND_EFFECTIVE:-} in
+    46) printf '%s' prefer_ipv4 ;;
+    64) printf '%s' prefer_ipv6 ;;
+    4) printf '%s' ipv4_only ;;
+    6) printf '%s' ipv6_only ;;
+    *) printf '%s' "" ;;
+  esac
+}
+# sing-box 1.12 起 domain_strategy 废弃，1.14 移除；新版本用 domain_resolver.strategy
+sb_resolver_is_new() {
+  local v
+  [[ -x $SB_BIN ]] || return 0
+  v=$("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}') || v=""
+  v=${v#v}
+  [[ $v =~ ^[0-9] ]] || return 0
+  ver_ge "$v" "1.12.0"
+}
+outbound_can_ask() { [[ -t 0 || -r /dev/tty ]]; }
+outbound_apply_code() { OUTBOUND_IP=$1 OUTBOUND_EFFECTIVE=$1 OUTBOUND_IP_CHANGED=1; }
+outbound_ask() {
+  local c def=1
+  echo "   出站地址（本机同时有 IPv4 和 IPv6；只影响代理出站，不会关闭系统 IPv6）："
+  echo "     1) IPv4优先"
+  echo "     2) IPv6优先"
+  echo "     3) 仅IPv4"
+  echo "     4) 仅IPv6"
+  while :; do
+    ask c "请选择" "$def"
+    case $c in
+      1) outbound_apply_code 46; break ;;
+      2) outbound_apply_code 64; break ;;
+      3) outbound_apply_code 4; break ;;
+      4) outbound_apply_code 6; break ;;
+      *) warn "请输入 1-4。" ;;
+    esac
+  done
+}
+outbound_use_saved_or_default() { # 双栈或检测不到时：沿用已保存的选择；--auto 且未保存则 IPv4优先
+  if [[ $OUTBOUND_IP =~ ^(46|64|4|6)$ ]]; then
+    OUTBOUND_EFFECTIVE=$OUTBOUND_IP
+    return 0
+  fi
+  if (( OPT_AUTO )); then
+    outbound_apply_code 46
+    info "自动模式：出站使用 IPv4优先。"
+    return 0
+  fi
+  if (( OB_HAS_V4 && OB_HAS_V6 )) && outbound_can_ask; then
+    outbound_ask
+    return 0
+  fi
+  # 还没问过，且这次不能问：保持原行为（Xray AsIs，Hy2 不写出站 mode）
+  OUTBOUND_EFFECTIVE=""
+}
+ensure_outbound_ip() {
+  (( OUTBOUND_IP_DONE )) && return 0
+  OUTBOUND_IP_DONE=1
+  OUTBOUND_IP_CHANGED=0
+  outbound_detect_families
+  if (( OB_HAS_V4 && ! OB_HAS_V6 )); then
+    OUTBOUND_EFFECTIVE=4
+    info "本机只有 IPv4，出站使用仅IPv4。"
+  elif (( OB_HAS_V6 && ! OB_HAS_V4 )); then
+    OUTBOUND_EFFECTIVE=6
+    info "本机只有 IPv6，出站使用仅IPv6。"
+  else
+    outbound_use_saved_or_default
+  fi
+  if (( OUTBOUND_IP_CHANGED )); then save_state; fi
+}
+xray_apply_ip_strategy() { # $1 临时配置。未选择时不改（freedom 无 domainStrategy，routing 保持 AsIs）
+  local ds f=$1
+  ds=$(xray_domain_strategy)
+  [[ -n $ds ]] || return 0
+  jq --arg ds "$ds" '
+    .routing.domainStrategy = $ds
+    | .outbounds |= map(
+        if .tag == "direct" and .protocol == "freedom"
+        then .settings.domainStrategy = $ds
+        else . end)
+  ' "$f" >"${f}.ip" && mv -f "${f}.ip" "$f"
+}
+hy2_outbound_yaml() { # 无落地转发时追加。Hy2 是静态 Go 程序，只用 direct.mode，不改系统解析
+  local mode name
+  mode=$(hy2_direct_mode)
+  [[ -n $mode ]] || return 0
+  name=$(hy2_outbound_name "$mode")
+  cat <<HY
+
+outbounds:
+  - name: ${name}
+    type: direct
+    direct:
+      mode: ${mode}
+HY
+}
+singbox_apply_ip_strategy() { # $1 临时配置。TUIC / AnyTLS 走 sing-box 的同一选择
+  local st f=$1
+  st=$(sb_ip_strategy)
+  [[ -n $st ]] || return 0
+  if sb_resolver_is_new; then
+    jq --arg st "$st" '
+      .dns = {servers: [{type: "local", tag: "local"}]}
+      | .outbounds |= map(
+          if .tag == "direct" and .type == "direct"
+          then .domain_resolver = {server: "local", strategy: $st}
+          else . end)
+    ' "$f" >"${f}.ip" && mv -f "${f}.ip" "$f"
+  else
+    jq --arg st "$st" '
+      .outbounds |= map(
+          if .tag == "direct" and .type == "direct"
+          then .domain_strategy = $st
+          else . end)
+    ' "$f" >"${f}.ip" && mv -f "${f}.ip" "$f"
+  fi
+}
+
 # NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
 PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
 write_xray_config() {
@@ -2772,6 +2968,8 @@ write_xray_config() {
       return 2
     fi
   fi
+  ensure_outbound_ip
+  xray_apply_ip_strategy "$tmp" || die "写入 Xray 出站地址族失败。"
   if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2; rm -f "$tmp" "${tmp}.log"
     die "Xray 配置校验失败（xray run -test），未应用新配置。"
@@ -2831,6 +3029,7 @@ gen_hy2_cert() {
 }
 
 write_hy2_config() {
+  ensure_outbound_ip
   [[ -n $HY2_PASS ]] || HY2_PASS=$(rand_pass)
   [[ -f $HY_CRT && -f $HY_KEY ]] || gen_hy2_cert
   # 证书 CN 与当前 SNI 不一致时重新生成
@@ -2854,7 +3053,12 @@ masquerade:
     url: https://${SNI}/
     rewriteHost: true
 HY
-  relay_hy2_yaml >>"${HY_CONF}.tmp"
+  # 落地转发时第一条 outbound 必须是 socks5（否则 Hy2 会改走直连）。直连时用 direct.mode。
+  if relay_active; then
+    relay_hy2_yaml >>"${HY_CONF}.tmp"
+  else
+    hy2_outbound_yaml >>"${HY_CONF}.tmp"
+  fi
   local grp="root"; id hysteria >/dev/null 2>&1 && grp=hysteria
   chown "root:${grp}" "${HY_CONF}.tmp" "$HY_KEY" "$HY_CRT"
   chmod 640 "${HY_CONF}.tmp" "$HY_KEY"; chmod 644 "$HY_CRT"
@@ -4027,6 +4231,8 @@ write_singbox_config() {
         final: "direct"
       }
     }' >"$tmp" || die "生成 sing-box 配置失败。"
+  ensure_outbound_ip
+  singbox_apply_ip_strategy "$tmp" || die "写入 sing-box 出站地址族失败。"
   if ! "$SB_BIN" check -c "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2; rm -f "$tmp" "${tmp}.log"
     die "sing-box 配置校验失败，未应用新配置。"
@@ -6214,6 +6420,8 @@ usage() {
   --no-tune           跳过 sysctl 网络调优
   --tune-preset <名>  安装/调优使用的预设（默认 bbr-fq，见下方「网络调优」）
   -h, --help          显示帮助
+
+双栈（同时有 IPv4 和 IPv6）写入节点配置时询问出站策略：IPv4优先 / IPv6优先 / 仅IPv4 / 仅IPv6（记在 state.env，之后沿用；--auto 默认 IPv4优先；只有一种地址时不询问）。
 
 NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙·fail2ban·Swap；调优可选）:
   --nat               启用 NAT 模式（Alpine 自动启用；LXC/OpenVZ 未指定时询问；之后 proxy 命令自动沿用）
