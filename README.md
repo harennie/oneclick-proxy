@@ -1,12 +1,20 @@
-# proxy 一键脚本 · VLESS-REALITY-Vision (ML-DSA-65) + Hysteria2
+# 哈人 · oneclick proxy · VLESS-REALITY + XHTTP + Hysteria2
 
-> 当前版本：**v1.2.2**（修复 `proxy sni --scan` 跳过环境预检时 `ARCH` 为空，RealiTLScanner 下载地址变成 `RealiTLScanner-linux-` 并返回 404。见文末「更新日志」）
+> 当前版本：**v1.3.0**（默认一次装好 VLESS+REALITY+Vision、VLESS+XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC v5 / AnyTLS 默认关闭，装完后可单独开关且不丢密钥。见文末「更新日志」）
 >
-> v1.2.1：修复 Alpine / LXC NAT 机上「安装为落地机」走了普通端口流程并自动调优的问题；菜单新增第 15 项「切换 NAT 模式」；NAT 模式不再把出口 IP 当作公网地址默认值。见文末「更新日志」
+> v1.2.2：修复 `proxy sni --scan` 跳过环境预检时 `ARCH` 为空，RealiTLScanner 下载地址变成 `RealiTLScanner-linux-` 并返回 404。
 >
-> v1.2.0：新增独立的「网络调优」功能 `proxy tune`：多种 BBR / 队列算法预设、按内存或带宽×延迟自动计算缓冲区、预览后再应用、可一键恢复，NAT / LXC / Alpine 也能用；新增「落地机」模式 `--land`（Shadowsocks 2022 出口 + 来源 IP 白名单）与中转机的「落地转发」`proxy land-add`。见下文「网络调优」「落地机 / 落地转发」与文末「更新日志」）
+> v1.2.1：修复 Alpine / LXC NAT 机上「安装为落地机」走了普通端口流程并自动调优的问题；菜单新增第 15 项「切换 NAT 模式」；NAT 模式不再把出口 IP 当作公网地址默认值。
+>
+> v1.2.0：新增独立的「网络调优」功能 `proxy tune`；新增「落地机」模式 `--land`（Shadowsocks 2022 出口 + 来源 IP 白名单）与中转机的「落地转发」`proxy land-add`。见下文「网络调优」「落地机 / 落地转发」与文末「更新日志」。
 
-单文件 Bash 脚本，一键部署 **VLESS + REALITY + XTLS-Vision**（含后量子签名 ML-DSA-65）和 **Hysteria2**（端口跳跃 + 证书指纹固定），自动优选 REALITY 目标网站（SNI），自带 nftables 防火墙、fail2ban 与保守的网络调优。交互风格参考 [233boy/v2ray](https://github.com/233boy/v2ray)：数字菜单、彩色输出、安装后可用 `proxy` 命令管理。
+单文件 Bash 脚本。默认一键部署三个协议，都不需要自己的域名：
+
+- **VLESS + REALITY + XTLS-Vision**（含后量子签名 ML-DSA-65）
+- **VLESS + XHTTP + REALITY**（与 Vision 共用同一把 Reality 密钥和 SNI，单独 TCP 端口）
+- **Hysteria2**（端口跳跃 + 证书指纹固定）
+
+可选协议默认不装：Trojan + REALITY、TUIC v5、AnyTLS。Shadowsocks 2022 仍然只出现在落地机模式里。自动优选 REALITY 目标网站（SNI），自带 nftables 防火墙、fail2ban 与保守的网络调优。交互风格参考 [233boy/v2ray](https://github.com/233boy/v2ray)：数字菜单、少量颜色、安装后可用 `proxy` 命令管理。终端不支持颜色、`TERM=dumb` 或设置了 `NO_COLOR` 时退回纯文本。
 
 ---
 
@@ -50,8 +58,17 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--force-sni` | 配合 `--sni`，检测不通过也强制使用 |
 | `--scan` | 高级：用 [RealiTLScanner](https://github.com/XTLS/RealiTLScanner) 扫描 VPS 附近 IP 寻找同机房目标（约 60 秒） |
 | `--port <N>` | VLESS-REALITY TCP 端口，默认 443（NAT 模式可写 `外部:内部`，如 `59221:443`） |
-| `--no-hy2` | 不安装 Hysteria2 |
+| `--no-hy2` / `--hy2` | 不安装 / 安装 Hysteria2（默认安装） |
 | `--hy2-port <N>` | Hysteria2 UDP 端口，默认 443（NAT 模式可写 `外部:内部`） |
+| `--no-reality` / `--reality` | 关闭 / 开启 VLESS + REALITY + Vision（默认开启） |
+| `--no-xhttp` / `--xhttp` | 关闭 / 开启 VLESS + XHTTP + REALITY（默认开启，不需要自己的域名） |
+| `--xhttp-port <N>` | XHTTP 的 TCP 端口，默认 8443（NAT 模式为外部端口，可写 `外部:内部`） |
+| `--trojan` / `--no-trojan` | 额外启用 / 关闭 Trojan + REALITY（默认不装） |
+| `--trojan-port <N>` | Trojan TCP 端口，默认 8444 |
+| `--tuic` / `--no-tuic` | 额外启用 / 关闭 TUIC v5（sing-box，自签证书，默认不装） |
+| `--tuic-port <N>` | TUIC UDP 端口，默认 8446 |
+| `--anytls` / `--no-anytls` | 额外启用 / 关闭 AnyTLS（sing-box，自签证书，默认不装） |
+| `--anytls-port <N>` | AnyTLS TCP 端口，默认 8445 |
 | `--hop <a-b\|none>` | Hysteria2 端口跳跃范围，默认 `20000-50000`，`none` 关闭（NAT 模式默认关闭，可写多段 `a-b,c-d`） |
 | `--name <名称>` | 节点名称（默认「国家-城市」） |
 | `--no-firewall` | 不配置 nftables 防火墙 |
@@ -76,7 +93,15 @@ NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239
 
 落地机示例：`bash proxy.sh --land --auto --land-allow 203.0.113.10`（只允许中转机 203.0.113.10 连接）
 
-管理子命令：`proxy info | sni | regen | port | user | update | status | speed | firewall | nat | tune | land | land-add | land-test | land-off | land-on | land-del | allow | uninstall`（加 `--auto` 可在脚本/自动化里免确认，例如 `proxy uninstall --auto`）。
+管理子命令：`proxy info | proto | sni | regen | port | user | update | status | speed | firewall | nat | tune | land | land-add | land-test | land-off | land-on | land-del | allow | uninstall`（加 `--auto` 可在脚本/自动化里免确认，例如 `proxy uninstall --auto`）。
+
+装完之后改协议（不删除已有 UUID、Reality 密钥、XHTTP 路径和各协议密码）：
+
+```bash
+proxy proto
+```
+
+菜单第 16 项「协议开关」作用相同。命令行也可以直接带开关重跑安装，例如 `proxy --no-xhttp`、`proxy --tuic`、`proxy --no-hy2`。关闭只停止对应监听，密钥留在 `state.env`。
 
 ---
 
@@ -95,10 +120,12 @@ NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239
   - **安装后 REALITY 自检**：用已安装的 xray 在 127.0.0.1 随机端口起一个临时客户端，按生成的链接参数连接本机节点并访问外网，打印通过 / 未通过（不影响安装；更换 SNI 后也会自动自检）。临时客户端限制 `GOMEMLIMIT`，128MB 的 NAT 小鸡也能跑。
 - **REALITY 目标网站自动优选**（见下文「为什么 SNI 规则很重要」）。
 - **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。
-- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，入站默认拒绝；放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、Xray/Hysteria2 端口及跳跃范围；检测到其它对外服务时会询问是否一并放行。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时询问是否停用（卸载时可恢复）。不会关闭 SELinux（写入文件后执行 `restorecon`）。
+- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，入站默认拒绝；放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时询问是否停用（卸载时可恢复）。不会关闭 SELinux（写入文件后执行 `restorecon`）。
 - **fail2ban**：sshd 监狱，10 分钟内失败 5 次封禁 1 小时（systemd 日志后端 + nftables 动作）。
-- **输出**：vless:// 链接（含 / 不含 pqv 两个版本）、hysteria2:// 链接（`mport`、`sni`、`insecure=1`、`pinSHA256`），终端二维码，mihomo（Clash.Meta）YAML 片段。
-- **管理菜单**：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载。
+- **XHTTP（默认开启）**：VLESS + XHTTP + REALITY。与 Vision 共用同一把 x25519、ShortId、SNI 和 ML-DSA-65 种子，单独监听 TCP 8443，`flow` 必须为空，路径为随机 `/` + 十六进制。服务端和客户端链接的 `mode` 都是 `stream-one`（REALITY 直连；客户端用 `auto` 时有已知握手失败）。不需要自己的域名，也不把自己的证书挂到 XHTTP 上。
+- **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
+- **输出**：每个已开启协议单独一块：名称、地址、端口各一行，链接本身最后单独一行。vless://（含 / 不含 pqv）、xhttp 的 vless://（`mode=stream-one`，无 flow）、hysteria2://（`mport`、`sni`、`insecure=1`、`pinSHA256`）、可选的 trojan:// / tuic:// / anytls://，终端二维码，mihomo（Clash.Meta）YAML 片段。
+- **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。原有项目全部留在主菜单、两列编号，第 16 项是「协议开关」。其余仍是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
 - **落地机 / 落地转发**：`--land` 把本机装成只跑 Shadowsocks 2022 的出口（落地机）；已安装的节点用 `proxy land-add 'ss://...'` 把出口切到落地机（中转），见下文。
 - **健壮性**：`set -o errexit -o pipefail -o errtrace` + 错误陷阱提示出错行；可重复运行（保留已有密钥，只更新组件与配置）；安装前检查端口占用；没有 IPv6 也能正常工作（链接使用 IPv4）；通过 shellcheck 检查。
 
@@ -150,7 +177,9 @@ Alpine 才需要先安装依赖：
 apk add bash curl && bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239.14.191
 ```
 
-结果：容器内 Xray（TCP）与 Hysteria2（UDP）都监听 443，分享链接为 `vless://…@156.239.14.191:59221…`、`hysteria2://…@156.239.14.191:59221/…`。`--port 59221:443` 效果相同。
+结果：容器内 Xray Reality（TCP）与 Hysteria2（UDP）都监听 443，分享链接为 `vless://…@156.239.14.191:59221…`、`hysteria2://…@156.239.14.191:59221/…`。`--port 59221:443` 效果相同。
+
+XHTTP 还需要第二条外部 TCP 端口（默认 8443，不能和 Vision 共用 TCP 443）。只有这一条映射时，脚本会警告并跳过 XHTTP，安装仍然成功（Reality + Hysteria2），不会整次失败。要装上 XHTTP，再映射一个 TCP 端口后执行 `proxy --xhttp`，或安装时写上 `--xhttp-port`。只要 Reality + Hysteria2 时加 `--no-xhttp`。
 
 ### 默认行为
 
@@ -418,14 +447,21 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 ### v2rayN（Windows）/ v2rayNG（Android）
 
 - 复制 `vless://` 链接 → 「从剪贴板导入」。新版 v2rayN 支持 `pqv`（ML-DSA-65 验证），旧版如果导入失败，请使用「不含 pqv」的那条链接（或扫描二维码，二维码默认就是不含 pqv 的版本，因为 pqv 太长放不进终端二维码）。
+- XHTTP 也是 `vless://`，参数里有 `type=xhttp`、`path=`、`mode=stream-one`，没有 `flow`。不要改成 `auto`，也不要填 `xtls-rprx-vision`。
+- Trojan + REALITY 是 `trojan://`，`security=reality`，v2rayNG 可以导入。
 - `hysteria2://` 链接同样可以直接导入，`mport` 参数即端口跳跃范围。
-- 核心请使用较新的 Xray-core（≥ 25.7，支持 mldsa65）。
+- **当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`。** 这两条给 v2rayN、sing-box 或 mihomo 用。
+- 核心请使用较新的 Xray-core（≥ 25.7，支持 mldsa65；XHTTP + REALITY 需要带 XHTTP 的版本）。
 
 ### mihomo / Clash Verge Rev / Clash Meta for Android
 
 把输出的 `proxies:` 片段粘贴进配置文件，并在 `proxy-groups` 里引用节点名称。要点：
 
 - VLESS：`reality-opts.public-key`、`reality-opts.short-id`，`client-fingerprint: chrome`，`flow: xtls-rprx-vision`；
+- XHTTP：`network: xhttp`，`xhttp-opts.path` / `mode: stream-one`，同样带 `reality-opts`，不要写 flow；
+- Trojan：`type: trojan`，`network: tcp`，`reality-opts` 与 Vision 相同；
+- TUIC：`type: tuic`，`udp: true`，`alpn: [h3]`，`skip-cert-verify: true`；
+- AnyTLS：`type: anytls`，`skip-cert-verify: true`，`client-fingerprint: chrome`；
 - Hysteria2：`ports: 20000-50000` 端口跳跃，`fingerprint:` 为证书 SHA256 指纹（固定证书，无需跳过证书验证）；
 - mihomo 目前不支持 REALITY 的 ML-DSA-65 验证（`pqv`），不影响连接（pqv 只是额外的可选校验）。
 
@@ -444,8 +480,10 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 
 脚本只能管理系统内的 nftables。**AWS EC2 / Lightsail、Google Cloud、Oracle Cloud、Azure、阿里云、腾讯云** 等还有控制台层面的安全组 / 防火墙，请手动放行：
 
-- TCP 443（或你设置的 VLESS 端口）
+- TCP 443（或你设置的 VLESS-REALITY 端口）
+- TCP 8443（XHTTP，若已开启）
 - UDP 443 以及 UDP 20000-50000（Hysteria2 + 端口跳跃）
+- 若打开了可选协议：TCP 8444（Trojan）、TCP 8445（AnyTLS）、UDP 8446（TUIC）
 
 Oracle Cloud 的官方镜像还自带 iptables 规则，如仍不通请一并检查。
 
@@ -462,16 +500,34 @@ proxy
 ```
 
 ```
-   状态: 运行中   SNI: …   模式: 普通 / NAT（自动检测）/ NAT（手动）
- 1) 安装 / 重新安装              8) 运行状态 / 日志
- 2) 查看链接 / 二维码 / Clash 配置  9) 网络测速 / 延迟提示
- 3) 更换 SNI                   10) 防火墙管理（NAT 模式为「NAT 信息 / 端口跳跃」）
- 4) 重新生成密钥 / UUID          11) 网络调优
- 5) 修改端口 / 端口跳跃           12) 添加 / 修改落地转发
- 6) 用户管理                    13) 安装为落地机
- 7) 更新 Xray / Hysteria2 / 脚本 14) 卸载
-                               15) 切换 NAT 模式（当前: 自动/开/关）
+█▀▀▀█ █▀▀▀█
+█ 哈 █ █ 人 █
+█▄▄▄█ █▄▄▄█
+oneclick proxy  ·····  v1.3.0
+
+IP        ▶ …              Xray      ▶ …
+Hysteria2 ▶ …              sing-box  ▶ 未安装
+状态      ▶ 运行中          模式      ▶ 普通
+
+════════════════════════════════
+         oneclick proxy
+════════════════════════════════
+ 1. 安装 / 重新安装                         9. 网络测速 / 延迟提示
+ 2. 查看链接 / 二维码 / Clash 配置          10. 防火墙管理
+ 3. 更换 SNI（重新优选目标网站）            11. 网络调优（BBR / 队列算法 / 缓冲区 / 恢复）
+ 4. 重新生成密钥 / UUID                    12. 添加 / 修改落地转发（本机作中转，出口走落地机）
+ 5. 修改端口 / 端口跳跃                     13. 安装为落地机（Shadowsocks 2022 出口，给其它中转机用）
+ 6. 用户管理（添加 / 删除）                 14. 卸载
+ 7. 更新 Xray / Hysteria2 / 脚本           15. 切换 NAT 模式（当前: 自动/开/关）
+ 8. 运行状态 / 日志                        16. 协议开关
+────────────────────────────────
+  0. 退出
+════════════════════════════════
 ```
+
+NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单仍是原来的 11 项（没有客户端直连协议），框标题同样是 `oneclick proxy`。
+
+**协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥，但不会把已关闭的协议重新打开。
 
 **切换 NAT 模式**（第 15 项，落地机菜单为第 11 项，v1.2.1）：`自动`（默认：Alpine 强制 NAT、LXC/OpenVZ 容器安装时询问、已安装的沿用原模式）/ `开`（强制 NAT 映射端口流程，等同 `--nat`）/ `关`（强制普通模式，等同 `--no-nat`；Alpine 不可用）。在第 1 或 13 项安装前选择即可；设置保存在 `state.env`（`NAT_PREF`），之后的修改端口等操作都按它执行。已安装时切换到不同模式会提示立即重新安装（保留密钥 / UUID）；命令行 `--nat` / `--no-nat` 优先并同步该设置。
 
@@ -551,6 +607,8 @@ proxy allow
 | `/root/proxy-info.txt` | 节点信息（600） |
 | `/usr/local/etc/xray/config.json` | Xray 配置 |
 | `/etc/hysteria/config.yaml` | Hysteria2 配置 |
+| `/usr/local/bin/sing-box` | TUIC / AnyTLS 核心（未启用时不安装） |
+| `/etc/sing-box/config.json` | sing-box 配置（自签证书从 Hysteria2 证书复制，CN = 所选 SNI） |
 | `/root/.proxy-oneclick/firewall.nft` | 本脚本的 nftables 规则 |
 | `/root/.proxy-oneclick/nat-hop.sh` | NAT 模式端口跳跃规则脚本（仅开启跳跃时） |
 | `/etc/systemd/system/proxy-oneclick-hop.service` / `/etc/init.d/proxy-oneclick-hop` | 开机加载端口跳跃规则（仅开启跳跃时） |
@@ -578,7 +636,7 @@ proxy uninstall
 proxy uninstall --auto
 ```
 
-会移除：Xray、Hysteria2（含 hysteria 用户）、nftables 表与 systemd 单元、sysctl / limits / journald 配置（并恢复调优前的参数值）、fail2ban 规则、`proxy` 命令、节点信息；可选择是否删除密钥与备份目录；安装时被停用的 firewalld / ufw 会询问是否恢复。安装时创建的 `/swapfile` 会保留（附删除方法）。NAT 模式还会移除 OpenRC 服务脚本、日志目录、端口跳跃规则，并恢复 `--dns64` 修改前的 `/etc/resolv.conf`。落地机还会移除白名单规则表与开机服务。最后别忘了在云控制台关闭不再需要的端口。
+会移除：Xray、Hysteria2（含 hysteria 用户）、sing-box（若装过 TUIC / AnyTLS）、nftables 表与 systemd 单元、sysctl / limits / journald 配置（并恢复调优前的参数值）、fail2ban 规则、`proxy` 命令、节点信息；可选择是否删除密钥与备份目录；安装时被停用的 firewalld / ufw 会询问是否恢复。安装时创建的 `/swapfile` 会保留（附删除方法）。NAT 模式还会移除 OpenRC 服务脚本、日志目录、端口跳跃规则，并恢复 `--dns64` 修改前的 `/etc/resolv.conf`。落地机还会移除白名单规则表与开机服务。最后别忘了在云控制台关闭不再需要的端口。
 
 ---
 
@@ -587,7 +645,11 @@ proxy uninstall --auto
 - 候选 SNI 列表是人工整理的，网站配置会变化；脚本每次都会实测，但某些地区可能全部不合格，此时请手动输入或使用 `--scan`。SG / PH 本地自建（非 CDN）的站点很少，通常会扩大到邻近地区。
 - 在容器 / OpenVZ 等环境中 BBR、Swap 及部分 sysctl 可能无法生效（脚本会逐项检测并说明跳过原因）。容器无法加载内核模块：BBR / fq 等需要宿主机已加载；OpenVZ 7 容器通常完全不能修改拥塞控制。
 - 不会安装第三方内核（如 XanMod 的 BBRv3）；已经在用这类内核时，脚本只识别并使用其提供的算法。
-- Hysteria2 目前只有一个共享密码，「用户管理」仅针对 VLESS。
+- Hysteria2 目前只有一个共享密码，「用户管理」只给 VLESS Reality / XHTTP 加用户，不含 Trojan、TUIC、AnyTLS。
+- 没有加入 NaiveProxy：它要单独的 naive 程序，并且需要一个能签发证书的自有域名（通常还要 Caddy 或 Nginx）。这和本脚本「不要求自己的域名、用 REALITY / 自签证书」的做法差得太远。
+- Shadowsocks 2022 不是主机上的客户端直连协议，只在落地机模式里作为出口。
+- 只有一条 NAT 映射时默认装不上 XHTTP（需要第二个外部 TCP 端口），脚本会跳过它并继续安装 Reality + Hysteria2。
+- TUIC / AnyTLS 的链接当前 v2rayNG 不能导入。
 - NAT 模式下端口跳跃需要整段转发 + DNAT 能力；只有零散几条映射或容器里没有 nftables/iptables 时无法跳跃（此时只用主端口）。
 - NAT 模式 Hysteria2 的逗号多段 `mport`（如 `10003-10009,10011-10020`）并非所有客户端都支持；不支持时可只使用主端口。
 - 服务商映射如果只转发 TCP，Hysteria2 必须另配一个 UDP 映射端口（`--nat-no-share`）。
@@ -598,6 +660,14 @@ proxy uninstall --auto
 ---
 
 ## 更新日志
+
+### v1.3.0
+- 默认一键（含 `--auto`）安装三个协议：VLESS + REALITY + Vision、VLESS + XHTTP + REALITY、Hysteria2。XHTTP 按 Xray 官方「steal others」最小示例：同一把 Reality 私钥 / SNI / ShortId，单独 TCP 端口（默认 8443），不填 flow，`xhttpSettings.mode` 与客户端链接都是 `stream-one`，路径随机并写入状态。不需要自己的域名。
+- 可选协议默认关闭，安装时不询问：Trojan + REALITY（Xray）、TUIC v5 与 AnyTLS（sing-box，自签证书 CN = 所选 SNI）。`--trojan` / `--tuic` / `--anytls` 或装完后的菜单第 16 项、`proxy proto` 再打开。关闭只停监听，不删 UUID、密钥、路径和密码。
+- NAT 只有一个映射端口时，XHTTP 放不下第二条 TCP，会警告并跳过，`--nat --auto --port 59221:443` 仍然得到 Reality + Hysteria2。`--no-xhttp` 可一开始就不装。
+- 旧的 `state.env` 里没有 `XHTTP_ENABLED` 时，`proxy sni` 不会突然打开 XHTTP；重新安装或菜单 / `--xhttp` 才会打开。
+- 没有把 Shadowsocks 2022 做成客户端直连入站，落地机用法不变。没有加 NaiveProxy（需要自有域名和单独服务）。
+- 菜单改成「哈人」字符 Logo，Logo 正下方小标题和双线框标题都是 `oneclick proxy`。原有 1–15 项全部留在主菜单两列里，第 16 项是协议开关。安装结束时每个协议的链接单独一块。
 
 ### v1.2.2
 - 修复：`proxy sni --scan` 不经过 preflight，`ARCH` 仍为空时 RealiTLScanner 下载地址变成 `RealiTLScanner-linux-` 并返回 HTTP 404。拼下载地址前若 `ARCH` 为空会先调用 `detect_os`。
