@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# proxy.sh —— VLESS + REALITY + Vision (ML-DSA-65) & Hysteria2 一键安装 / 管理脚本
+# proxy.sh —— VLESS + REALITY + Vision、VLESS + XHTTP + REALITY、Hysteria2 一键安装 / 管理脚本
+# 可选（默认不装）：Trojan + REALITY、TUIC v5、AnyTLS。Shadowsocks 2022 仅用于落地机。
 #
 # 用法:
 #   bash proxy.sh                 # 交互式菜单
@@ -23,7 +24,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.2.2"
+readonly SCRIPT_VERSION="1.3.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -42,6 +43,14 @@ readonly HY_DIR="/etc/hysteria"
 readonly HY_CONF="${HY_DIR}/config.yaml"
 readonly HY_CRT="${HY_DIR}/server.crt"
 readonly HY_KEY="${HY_DIR}/server.key"
+readonly SB_BIN="/usr/local/bin/sing-box"
+readonly SB_DIR="/etc/sing-box"
+readonly SB_CONF="${SB_DIR}/config.json"
+readonly SB_CRT="${SB_DIR}/server.crt"
+readonly SB_KEY="${SB_DIR}/server.key"
+readonly SB_UNIT="/etc/systemd/system/sing-box.service"
+readonly SB_RC="/etc/init.d/sing-box"
+readonly SB_LOG="/var/log/sing-box/sing-box.log"
 readonly FW_FILE="${STATE_DIR}/firewall.nft"
 readonly FW_UNIT="/etc/systemd/system/proxy-oneclick-fw.service"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-proxy-tune.conf"
@@ -88,6 +97,15 @@ OPT_FORCE_SNI=0
 OPT_PORT=""
 OPT_HY2=""          # 空=询问(交互)/默认启用(auto); 1/0
 OPT_HY2_PORT=""
+OPT_REALITY=""      # 空=沿用（默认开）; 1/0
+OPT_XHTTP=""        # 空=安装时默认开（状态里已有则沿用）; 1/0
+OPT_XHTTP_PORT=""
+OPT_TROJAN=""       # 空=默认关; 1/0
+OPT_TROJAN_PORT=""
+OPT_TUIC=""         # 空=默认关; 1/0
+OPT_TUIC_PORT=""
+OPT_ANYTLS=""       # 空=默认关; 1/0
+OPT_ANYTLS_PORT=""
 OPT_HOP=""          # "20000-50000" 或 "none"
 OPT_FIREWALL=1
 OPT_UPGRADE=""      # 空=默认（普通模式 1，NAT 模式 0）
@@ -126,21 +144,128 @@ IPFAM=4             # 探测 / 测速使用的地址族
 FETCH_IP=()         # 传给 curl 的地址族参数（IPv6-only 时为 -6）
 
 # ----------------------------- 输出 -----------------------------
-if [[ -t 1 ]]; then
-  C_RED=$'\e[31m' C_GREEN=$'\e[92m' C_YELLOW=$'\e[93m' C_BLUE=$'\e[94m' C_CYAN=$'\e[96m' C_MAG=$'\e[95m' C_BOLD=$'\e[1m' C_NONE=$'\e[0m'
+# 只用三种颜色：标题、成功、警告。终端不支持颜色、TERM=dumb 或设置了 NO_COLOR 时退回纯文本。
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-} != dumb ]]; then
+  C_TITLE=$'\e[36m' C_OK=$'\e[32m' C_WARN=$'\e[33m' C_DIM=$'\e[2m' C_BOLD=$'\e[1m' C_NONE=$'\e[0m'
 else
-  C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_MAG="" C_BOLD="" C_NONE=""
+  C_TITLE="" C_OK="" C_WARN="" C_DIM="" C_BOLD="" C_NONE=""
 fi
-_red()    { printf '%s%s%s\n' "$C_RED" "$*" "$C_NONE"; }
-_green()  { printf '%s%s%s\n' "$C_GREEN" "$*" "$C_NONE"; }
-_yellow() { printf '%s%s%s\n' "$C_YELLOW" "$*" "$C_NONE"; }
-_cyan()   { printf '%s%s%s\n' "$C_CYAN" "$*" "$C_NONE"; }
-info()  { printf '%s[信息]%s %s\n' "$C_BLUE" "$C_NONE" "$*"; }
-ok()    { printf '%s[完成]%s %s\n' "$C_GREEN" "$C_NONE" "$*"; }
-warn()  { printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_NONE" "$*" >&2; }
-die()   { printf '%s[错误]%s %s\n' "$C_RED" "$C_NONE" "$*" >&2; exit 1; }
-step()  { printf '\n%s==>%s %s%s%s\n' "$C_MAG" "$C_NONE" "$C_BOLD" "$*" "$C_NONE"; }
-hr()    { printf '%s\n' "------------------------------------------------------------"; }
+C_GREEN=$C_OK C_YELLOW=$C_WARN C_RED=$C_WARN C_BLUE="" C_CYAN=$C_TITLE C_MAG=$C_TITLE
+_red()    { printf '%s%s%s\n' "$C_WARN" "$*" "$C_NONE"; }
+_green()  { printf '%s%s%s\n' "$C_TITLE" "$*" "$C_NONE"; }
+_yellow() { printf '%s%s%s\n' "$C_WARN" "$*" "$C_NONE"; }
+_cyan()   { printf '%s%s%s\n' "$C_TITLE" "$*" "$C_NONE"; }
+info()  { printf '[信息] %s\n' "$*"; }
+ok()    { printf '%s[完成]%s %s\n' "$C_OK" "$C_NONE" "$*"; }
+warn()  { printf '%s[警告]%s %s\n' "$C_WARN" "$C_NONE" "$*" >&2; }
+die()   { printf '%s[错误]%s %s\n' "$C_WARN" "$C_NONE" "$*" >&2; exit 1; }
+step()  { printf '\n%s==>%s %s%s%s\n' "$C_TITLE" "$C_NONE" "$C_BOLD" "$*" "$C_NONE"; }
+# 终端列宽：ASCII 计 1，汉字计 2；制表符和箭头按 1 计，避免把细线画得过长
+ui_dw() {
+  local s=$1 i=0 c w=0 o
+  local n=${#s}
+  while (( i < n )); do
+    c=${s:i:1}
+    o=$(printf '%d' "'$c")
+    if (( o < 128 )); then w=$((w + 1))
+    elif (( o >= 0x2E80 && o <= 0xA4CF || o >= 0xAC00 && o <= 0xD7A3 || o >= 0xF900 && o <= 0xFAFF || o >= 0xFE10 && o <= 0xFE6F || o >= 0xFF00 && o <= 0xFF60 || o >= 0xFFE0 && o <= 0xFFE6 )); then w=$((w + 2))
+    else w=$((w + 1)); fi
+    i=$((i + 1))
+  done
+  printf '%s' "$w"
+}
+ui_pad() { # $1 文本 $2 目标列宽（已经更宽则原样返回，不截断）
+  local s=$1 w=$2 dw=$(( $2 - $(ui_dw "$1") ))
+  (( dw > 0 )) && printf '%s%*s' "$s" "$dw" "" || printf '%s' "$s"
+}
+ui_repeat() {
+  local ch=$1 n=$2 i s=""
+  for (( i = 0; i < n; i++ )); do s+=$ch; done
+  printf '%s' "$s"
+}
+ui_bar() { # $1 字符 $2 列数 $3=1 着色（写入文件时传 0）
+  local s; s=$(ui_repeat "$1" "$2")
+  if (( ${3:-1} )) && [[ -n $C_TITLE ]]; then printf '%s%s%s\n' "$C_TITLE" "$s" "$C_NONE"
+  else printf '%s\n' "$s"; fi
+}
+ui_center() { # $1 文本 $2 总列数 $3=1 着色
+  local t=$1 W=$2 dw left
+  dw=$(ui_dw "$t"); left=$(( (W - dw) / 2 )); (( left < 0 )) && left=0
+  if (( ${3:-1} )) && [[ -n $C_TITLE ]]; then printf '%s%*s%s%s\n' "$C_TITLE" "$left" "" "$t" "$C_NONE"
+  else printf '%*s%s\n' "$left" "" "$t"; fi
+}
+hr() { ui_bar '─' 62 1; }
+ui_logo() {
+  printf '%s' "$C_TITLE"
+  printf '%s\n' '█▀▀▀█ █▀▀▀█'
+  printf '%s\n' '█ 哈 █ █ 人 █'
+  printf '%s\n' '█▄▄▄█ █▄▄▄█'
+  printf '%s' "$C_NONE"
+  printf '%soneclick proxy%s  %s·····%s  %sv%s%s\n' "$C_BOLD" "$C_NONE" "$C_DIM" "$C_NONE" "$C_TITLE" "$SCRIPT_VERSION" "$C_NONE"
+}
+ui_ver_plain() { # $1 二进制 $2 xray|hy2|sb
+  local v=""
+  [[ -x $1 ]] || { printf '未安装'; return 0; }
+  case $2 in
+    xray) v=$("$1" version 2>/dev/null | awk 'NR==1{print $2}') || true ;;
+    hy2) v=$("$1" version 2>/dev/null | awk '/^Version:/{print $2}') || true ;;
+    sb) v=$("$1" version 2>/dev/null | awk 'NR==1{print $NF}') || true ;;
+  esac
+  printf '%s' "${v:-未知}"
+}
+ui_stat_row() { # 左标签 左值 右标签 右值；▶ 分隔，未安装用淡色
+  local show1 show2
+  if [[ $2 == 未安装 || $2 == 未检测 || $2 == 未设置 ]]; then show1=$(printf '%s%s%s' "$C_DIM" "$(ui_pad "$2" 16)" "$C_NONE")
+  elif [[ $2 == 运行中 ]]; then show1=$(printf '%s%s%s' "$C_OK" "$(ui_pad "$2" 16)" "$C_NONE")
+  else show1=$(ui_pad "$2" 16); fi
+  printf '%s%s%s %s▶%s %s' "$C_TITLE" "$(ui_pad "$1" 10)" "$C_NONE" "$C_OK" "$C_NONE" "$show1"
+  if [[ -n ${3-} ]]; then
+    if [[ $4 == 未安装 || $4 == 未检测 || $4 == 未设置 ]]; then show2=$(printf '%s%s%s' "$C_DIM" "$4" "$C_NONE")
+    elif [[ $4 == 运行中 ]]; then show2=$(printf '%s%s%s' "$C_OK" "$4" "$C_NONE")
+    else show2=$4; fi
+    printf '  %s%s%s %s▶%s %s' "$C_TITLE" "$(ui_pad "$3" 10)" "$C_NONE" "$C_OK" "$C_NONE" "$show2"
+  fi
+  printf '\n'
+}
+# 主菜单：全部项目两列排开。$1 标题，$2 末行（退出/返回），其后按顺序传项目文字
+ui_columns() {
+  local title=$1 zero=$2
+  shift 2
+  local -a items=("$@") lines=() out=()
+  local n=${#items[@]} lefts i j L R line lw=0 w maxw=62
+  lefts=$(( (n + 1) / 2 ))
+  for (( i = 0; i < lefts; i++ )); do
+    L=$(printf '%2d. %s' "$((i + 1))" "${items[i]}")
+    j=$(( i + lefts ))
+    if (( j < n )); then lines+=("$L"$'\t'"$(printf '%2d. %s' "$((j + 1))" "${items[j]}")")
+    else lines+=("$L"); fi
+    w=$(ui_dw "$L"); (( w > lw )) && lw=$w
+  done
+  lw=$(( lw + 2 ))
+  for line in "${lines[@]}"; do
+    if [[ $line == *$'\t'* ]]; then
+      L=${line%%$'\t'*}; R=${line#*$'\t'}
+      line=$(printf '  %s  %s' "$(ui_pad "$L" "$lw")" "$R")
+    else line=$(printf '  %s' "$line"); fi
+    out+=("$line")
+    w=$(ui_dw "$line"); (( w > maxw )) && maxw=$w
+  done
+  local zline; zline=$(printf '  %2d. %s' 0 "$zero")
+  w=$(ui_dw "$zline"); (( w > maxw )) && maxw=$w
+  w=$(ui_dw "$title"); (( w + 4 > maxw )) && maxw=$(( w + 4 ))
+  echo
+  ui_bar '═' "$maxw"
+  ui_center "$title" "$maxw"
+  ui_bar '═' "$maxw"
+  for line in "${out[@]}"; do printf '%s\n' "$line"; done
+  ui_bar '─' "$maxw"
+  printf '%s\n' "$zline"
+  ui_bar '═' "$maxw"
+}
+ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
+  if (( $1 )); then printf '%s▶ %s%s\n' "$C_OK" "$(ui_pad "$2" 28)$3" "$C_NONE"
+  else printf '%s  %s%s\n' "$C_DIM" "$(ui_pad "$2" 28)未开启" "$C_NONE"; fi
+}
 
 on_error() {
   local rc=$? line=$1 cmd=$2
@@ -171,9 +296,9 @@ ask() {
   local __var=$1 __prompt=$2 __def=${3-} __ans=""
   if (( OPT_AUTO )); then printf -v "$__var" '%s' "$__def"; return 0; fi
   if [[ -n $__def ]]; then
-    _tty_read __ans "${C_CYAN}${__prompt}${C_NONE} [默认: ${__def}]: "
+    _tty_read __ans "${C_TITLE}${__prompt}${C_NONE} ${C_DIM}[默认: ${__def}]${C_NONE}: "
   else
-    _tty_read __ans "${C_CYAN}${__prompt}${C_NONE}: "
+    _tty_read __ans "${C_TITLE}${__prompt}${C_NONE}: "
   fi
   [[ -z $__ans ]] && __ans=$__def
   printf -v "$__var" '%s' "$__ans"
@@ -183,7 +308,7 @@ confirm() {
   local prompt=$1 def=${2:-y} ans=""
   if (( OPT_AUTO )); then [[ $def == y ]]; return; fi
   local hint="[Y/n]"; [[ $def == n ]] && hint="[y/N]"
-  _tty_read ans "${C_CYAN}${prompt}${C_NONE} ${hint}: "
+  _tty_read ans "${C_TITLE}${prompt}${C_NONE} ${C_DIM}${hint}${C_NONE}: "
   ans=${ans:-$def}
   [[ $ans =~ ^[Yy]([Ee][Ss])?$ ]]
 }
@@ -261,7 +386,7 @@ openrc_ready() { # 非 OpenRC 引导的精简容器缺少 softlevel 时 rc-servi
     mkdir -p /run/openrc && touch /run/openrc/softlevel
   fi
 }
-svc_log_file() { case $1 in xray) printf '%s' "$XRAY_LOG" ;; hysteria-server) printf '%s' "$HY_LOG" ;; esac; }
+svc_log_file() { case $1 in xray) printf '%s' "$XRAY_LOG" ;; hysteria-server) printf '%s' "$HY_LOG" ;; sing-box) printf '%s' "$SB_LOG" ;; esac; }
 svc_exists() {
   if is_openrc; then [[ -x /etc/init.d/$1 ]]; else systemctl cat "$1" >/dev/null 2>&1; fi
 }
@@ -330,9 +455,21 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
             HOP_BACKEND VIRT DNS64_SET
-            LAND_MODE LAND_METHOD LAND_KEY LAND_ALLOW RELAY_LINK RELAY_ON RELAY_SOCKS NAT_PREF)
+            LAND_MODE LAND_METHOD LAND_KEY LAND_ALLOW RELAY_LINK RELAY_ON RELAY_SOCKS NAT_PREF
+            REALITY_ENABLED XHTTP_ENABLED XHTTP_PORT XHTTP_PATH XHTTP_EXT_PORT
+            TROJAN_ENABLED TROJAN_PORT TROJAN_PASS TROJAN_EXT_PORT
+            TUIC_ENABLED TUIC_PORT TUIC_PASS TUIC_EXT_PORT
+            ANYTLS_ENABLED ANYTLS_PORT ANYTLS_PASS ANYTLS_EXT_PORT)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
+# 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
+# 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。
+REALITY_ENABLED=1
+XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT=""
+TROJAN_ENABLED=0 TROJAN_PORT=8444 TROJAN_PASS="" TROJAN_EXT_PORT=""
+TUIC_ENABLED=0 TUIC_PORT=8446 TUIC_PASS="" TUIC_EXT_PORT=""
+ANYTLS_ENABLED=0 ANYTLS_PORT=8445 ANYTLS_PASS="" ANYTLS_EXT_PORT=""
+STATE_HAS_XHTTP=0
 EXTRA_TCP="" EXTRA_UDP="" DISABLED_FW="" SWAP_CREATED=0 SERVER_ADDR=""
 NAT_MODE=0 NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE=""
 HOP_BACKEND="" VIRT="" DNS64_SET=0
@@ -341,7 +478,8 @@ NAT_PREF=auto       # 菜单「切换 NAT 模式」：auto = 自动检测；on =
 NAT_SRC=""          # 本次安装 NAT_MODE 的来源：cli | manual | alpine | state | auto | detect
 
 load_state() {
-  [[ -f $STATE_FILE ]] || return 0
+  [[ -f $STATE_FILE ]] || { STATE_HAS_XHTTP=0; return 0; }
+  STATE_HAS_XHTTP=0
   local line k v
   while IFS= read -r line || [[ -n $line ]]; do
     [[ $line =~ ^([A-Z0-9_]+)=(.*)$ ]] || continue
@@ -349,6 +487,7 @@ load_state() {
     local known=0 key
     for key in "${STATE_KEYS[@]}"; do [[ $key == "$k" ]] && known=1 && break; done
     (( known )) || continue
+    [[ $k == XHTTP_ENABLED ]] && STATE_HAS_XHTTP=1
     # 值以 printf %q 格式保存，这里只允许安全字符集后再还原
     if [[ $v =~ ^\'(.*)\'$ ]]; then v=${BASH_REMATCH[1]}; fi
     printf -v "$k" '%s' "$v"
@@ -676,11 +815,13 @@ mem_limit_mb() {
   printf '%s' "$m"
 }
 # 低内存（< 256MB）时为 Go 程序设置 GOMEMLIMIT / GOGC，输出 "KEY=VAL" 行。
-# 总预算约为内存上限的 60%，启用 Hysteria2 时由 xray / hysteria 平分（软限制，超出时只是更积极地 GC）
+# 总预算约为内存上限的 60%。只开 Hysteria2 时由 xray / hysteria 平分（与旧版相同）；
+# 另外启用了 sing-box（TUIC / AnyTLS）时再多算一份（软限制，超出时只是更积极地 GC）
 go_mem_env() {
   local m n=1; m=$(mem_limit_mb)
   (( m > 0 && m < 256 )) || return 0
-  (( HY2_ENABLED )) && n=2
+  (( HY2_ENABLED )) && n=$((n + 1))
+  sb_needed && n=$((n + 1))
   local lim=$(( m * 60 / 100 / n )); (( lim < 24 )) && lim=24
   printf 'GOMEMLIMIT=%sMiB\nGOGC=50\n' "$lim"
 }
@@ -2171,7 +2312,11 @@ check_port_free() { # $1 proto $2 port $3 允许的进程名(正则)
   # 容器内缺少 CAP_SYS_PTRACE 时 ss 看不到进程名：若本脚本服务正在运行且配置的就是该端口，视为自身占用
   if [[ -z $owner ]]; then
     [[ $1 == tcp && $2 == "$XRAY_PORT" && xray =~ ^($3)$ ]] && svc_active xray && return 0
+    [[ $1 == tcp && $2 == "$XHTTP_PORT" && ${XHTTP_ENABLED:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
+    [[ $1 == tcp && $2 == "$TROJAN_PORT" && ${TROJAN_ENABLED:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
+    [[ $1 == tcp && $2 == "$ANYTLS_PORT" && ${ANYTLS_ENABLED:-0} == 1 && sing-box =~ ^($3)$ ]] && svc_active sing-box && return 0
     [[ $1 == udp && $2 == "$HY2_PORT" && hysteria =~ ^($3)$ ]] && svc_active hysteria-server && return 0
+    [[ $1 == udp && $2 == "$TUIC_PORT" && ${TUIC_ENABLED:-0} == 1 && sing-box =~ ^($3)$ ]] && svc_active sing-box && return 0
     [[ $1 == udp && $2 == "$XRAY_PORT" && ${LAND_MODE:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
   fi
   warn "${1^^} 端口 $2 已被占用（进程: ${owner:-未知}）。"
@@ -2210,7 +2355,7 @@ other_listen_ports() { # $1 = tcp|udp
     [[ $1 == udp && $users != *users:* && $port =~ ^[0-9]+$ ]] && (( port >= elo && port <= ehi )) && continue
     [[ $ip =~ ^(127\.|\[::1\]|::1|\[?fe80) ]] && continue
     [[ $ip == "127.0.0.53%lo" || $ip == 127.0.0.54 ]] && continue
-    [[ $users =~ \"(xray|hysteria|sshd|systemd-resolve|chronyd|dhclient|systemd-network)\" ]] && continue
+    [[ $users =~ \"(xray|hysteria|sing-box|sshd|systemd-resolve|chronyd|dhclient|systemd-network)\" ]] && continue
     [[ " $SSH_PORTS " == *" $port "* ]] && continue
     echo "$port"
   done | sort -un | tr '\n' ' ' || true
@@ -2380,6 +2525,14 @@ ensure_hy_user() {
 
 # 需要绑定 1024 以下端口时才申请 CAP_NET_BIND_SERVICE（老内核 / OpenVZ 不支持 ambient capabilities）
 need_bind_cap() { (( ${1:-0} > 0 && ${1:-0} < 1024 )); }
+xray_need_cap() {
+  if (( ${LAND_MODE:-0} )); then need_bind_cap "$XRAY_PORT"; return; fi
+  (( ${REALITY_ENABLED:-1} )) && need_bind_cap "$XRAY_PORT" && return 0
+  (( ${XHTTP_ENABLED:-0} )) && need_bind_cap "$XHTTP_PORT" && return 0
+  (( ${TROJAN_ENABLED:-0} )) && need_bind_cap "$TROJAN_PORT" && return 0
+  return 1
+}
+sb_needed() { (( ${TUIC_ENABLED:-0} || ${ANYTLS_ENABLED:-0} )); }
 
 write_xray_service() {
   local envs; envs=$(go_mem_env)
@@ -2400,7 +2553,7 @@ error_log="${XRAY_LOG}"
 respawn_delay=3
 respawn_max=0
 supervise_daemon_args="${sargs}"
-$(need_bind_cap "$XRAY_PORT" && echo 'capabilities="^cap_net_bind_service"')
+$(xray_need_cap && echo 'capabilities="^cap_net_bind_service"')
 
 depend() {
   want net
@@ -2429,7 +2582,7 @@ RC
       echo "[Service]"
       echo "User=nobody"
       echo "NoNewPrivileges=true"
-      if need_bind_cap "$XRAY_PORT"; then
+      if xray_need_cap; then
         echo "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
         echo "AmbientCapabilities=CAP_NET_BIND_SERVICE"
       fi
@@ -2537,14 +2690,14 @@ gen_xray_keys() { # 生成/重新生成全部 Xray 密钥
   fi
 }
 
-xray_clients_json() {
-  local list
-  list=$(jq -n --arg id "$UUID" '[{id:$id, flow:"xtls-rprx-vision", email:"main"}]')
+xray_clients_json() { # $1 = flow（默认 xtls-rprx-vision；XHTTP 传空字符串）
+  local flow=${1-xtls-rprx-vision} list
+  list=$(jq -n --arg id "$UUID" --arg flow "$flow" '[{id:$id, flow:$flow, email:"main"}]')
   if [[ -s $USERS_FILE ]]; then
     local u r
     while IFS=$'\t' read -r u r; do
       [[ -n $u ]] || continue
-      list=$(jq --arg id "$u" --arg e "$r" '. + [{id:$id, flow:"xtls-rprx-vision", email:$e}]' <<<"$list")
+      list=$(jq --arg id "$u" --arg e "$r" --arg flow "$flow" '. + [{id:$id, flow:$flow, email:$e}]' <<<"$list")
     done <"$USERS_FILE"
   fi
   printf '%s' "$list"
@@ -2553,8 +2706,10 @@ xray_clients_json() {
 # NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
 PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
 write_xray_config() {
-  local clients tmp seed=""
+  local clients tmp seed="" cplain tclients
   clients=$(xray_clients_json)
+  cplain=$(xray_clients_json "")
+  tclients=$(jq -n --arg p "${TROJAN_PASS:-}" '[{password:$p, email:"main"}]')
   pqv_active && seed=$MLDSA_SEED
   mkdir -p "$(dirname "$XRAY_CONF")"
   tmp=$(mktemp "$(dirname "$XRAY_CONF")/.config.XXXXXX"); mv -f "$tmp" "${tmp}.json"; tmp="${tmp}.json"
@@ -2562,30 +2717,43 @@ write_xray_config() {
     land_xray_json >"$tmp"
   else
   jq -n \
-    --argjson port "$XRAY_PORT" --argjson clients "$clients" \
+    --argjson port "$XRAY_PORT" --argjson clients "$clients" --argjson cplain "$cplain" --argjson tclients "$tclients" \
+    --argjson reality "${REALITY_ENABLED:-0}" --argjson xhttp "${XHTTP_ENABLED:-0}" --argjson trojan "${TROJAN_ENABLED:-0}" \
+    --argjson xport "${XHTTP_PORT:-0}" --argjson tport "${TROJAN_PORT:-0}" --arg xpath "${XHTTP_PATH:-/xhttp}" \
     --arg target "${SNI_TARGET:-$SNI:443}" --arg sni "$SNI" \
     --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$seed" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" '
+  def reality: {
+    show: false, target: $target, xver: 0,
+    serverNames: [$sni], privateKey: $priv, shortIds: [$sid]
+  } + (if $seed != "" then {mldsa65Seed: $seed} else {} end);
+  def sniff: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true};
   {
     log: ({loglevel: "warning"} + (if $nat == 1 then {access: "none"} else {} end)),
-    inbounds: [{
-      tag: "vless-reality",
-      port: $port,
-      protocol: "vless",
-      settings: {clients: $clients, decryption: "none"},
-      streamSettings: {
-        network: "raw",
-        security: "reality",
-        realitySettings: ({
-          show: false,
-          target: $target,
-          xver: 0,
-          serverNames: [$sni],
-          privateKey: $priv,
-          shortIds: [$sid]
-        } + (if $seed != "" then {mldsa65Seed: $seed} else {} end))
-      },
-      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
-    }],
+    inbounds: (
+      []
+      + (if $reality == 1 then [{
+          tag: "vless-reality", port: $port, protocol: "vless",
+          settings: {clients: $clients, decryption: "none"},
+          streamSettings: {network: "raw", security: "reality", realitySettings: reality},
+          sniffing: sniff
+        }] else [] end)
+      + (if $xhttp == 1 then [{
+          tag: "vless-xhttp", port: $xport, protocol: "vless",
+          settings: {clients: $cplain, decryption: "none"},
+          streamSettings: {
+            network: "xhttp", security: "reality",
+            xhttpSettings: {path: $xpath, mode: "stream-one"},
+            realitySettings: reality
+          },
+          sniffing: sniff
+        }] else [] end)
+      + (if $trojan == 1 then [{
+          tag: "trojan-reality", port: $tport, protocol: "trojan",
+          settings: {clients: $tclients},
+          streamSettings: {network: "raw", security: "reality", realitySettings: reality},
+          sniffing: sniff
+        }] else [] end)
+    ),
     outbounds: [
       {tag: "direct", protocol: "freedom"},
       {tag: "block", protocol: "blackhole"}
@@ -2599,6 +2767,10 @@ write_xray_config() {
     }
   }' >"$tmp"
     relay_inject "$tmp"   # 中转机：落地出站（保存在状态文件中，每次重新生成配置都会重新加入）
+    if [[ $(jq '.inbounds | length' "$tmp") == 0 ]]; then
+      rm -f "$tmp"
+      return 2
+    fi
   fi
   if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2; rm -f "$tmp" "${tmp}.log"
@@ -2623,7 +2795,11 @@ restart_xray() {
     svc_logs xray 20 >&2 || true
     die "Xray 启动失败，请查看上方日志。"
   fi
-  ok "Xray 运行中 ($( ((LAND_MODE)) && echo 'Shadowsocks 2022 TCP+UDP' || echo TCP) ${XRAY_PORT}$( ((NAT_MODE)) && [[ $XRAY_EXT_PORT != "$XRAY_PORT" ]] && echo "，外部端口 ${XRAY_EXT_PORT}"))"
+  if (( LAND_MODE )); then
+    ok "Xray 运行中 (Shadowsocks 2022 TCP+UDP ${XRAY_PORT}$( ((NAT_MODE)) && [[ $XRAY_EXT_PORT != "$XRAY_PORT" ]] && echo "，外部端口 ${XRAY_EXT_PORT}"))"
+  else
+    ok "Xray 运行中 ($(proto_xray_brief))"
+  fi
 }
 
 selinux_fix() {
@@ -2703,12 +2879,13 @@ restart_hy2() {
   fi
 }
 
-remove_hysteria() {
+remove_hysteria() { # $1 = purge：连证书目录一起删（卸载）。TUIC/AnyTLS 还在用时保留证书
   svc_disable_stop hysteria-server
   if have systemctl; then systemctl disable --now 'hysteria-server@*' >/dev/null 2>&1 || true; fi
   rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service "$HY_RC"
   rm -rf /etc/systemd/system/hysteria-server.service.d /var/log/hysteria
-  rm -f "$HY_BIN"; rm -rf "$HY_DIR"
+  rm -f "$HY_BIN" "$HY_CONF"
+  if [[ $1 == purge ]] || ! sb_needed; then rm -rf "$HY_DIR"; fi
   if id hysteria >/dev/null 2>&1; then userdel hysteria >/dev/null 2>&1 || deluser hysteria >/dev/null 2>&1 || true; fi
   if getent group hysteria >/dev/null 2>&1; then groupdel hysteria >/dev/null 2>&1 || delgroup hysteria >/dev/null 2>&1 || true; fi
   sd_reload
@@ -2748,11 +2925,23 @@ backup_firewall() {
 render_firewall() {
   local ssh_set tcp_ports udp_ports p
   ssh_set=$(tr ' ' ',' <<<"$SSH_PORTS")
-  tcp_ports="$XRAY_PORT"
-  for p in $EXTRA_TCP; do [[ ",$tcp_ports,$ssh_set," == *",$p,"* ]] || tcp_ports+=",$p"; done
+  tcp_ports=""
+  (( ${REALITY_ENABLED:-1} )) && tcp_ports="$XRAY_PORT"
+  fw_add_port() { # $1 列表变量名 $2 端口；TCP 不重复放行 SSH 端口
+    local cur=${!1-} p=$2
+    [[ -n $p && $p != 0 ]] || return 0
+    [[ ",$cur," == *",$p,"* ]] && return 0
+    [[ $1 == tcp_ports && ",$ssh_set," == *",$p,"* ]] && return 0
+    printf -v "$1" '%s' "${cur:+$cur,}$p"
+  }
+  (( ${XHTTP_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_PORT"
+  (( ${TROJAN_ENABLED:-0} )) && fw_add_port tcp_ports "$TROJAN_PORT"
+  (( ${ANYTLS_ENABLED:-0} )) && fw_add_port tcp_ports "$ANYTLS_PORT"
+  for p in $EXTRA_TCP; do fw_add_port tcp_ports "$p"; done
   udp_ports=""
   (( HY2_ENABLED )) && udp_ports="$HY2_PORT"
-  for p in $EXTRA_UDP; do [[ ",$udp_ports," == *",$p,"* ]] || udp_ports+="${udp_ports:+,}$p"; done
+  (( ${TUIC_ENABLED:-0} )) && fw_add_port udp_ports "$TUIC_PORT"
+  for p in $EXTRA_UDP; do fw_add_port udp_ports "$p"; done
   local hop=""
   (( HY2_ENABLED )) && [[ -n $HOP_RANGE ]] && hop=$HOP_RANGE
   {
@@ -2770,7 +2959,7 @@ render_firewall() {
     echo "    meta l4proto 58 accept comment \"ICMPv6\""
     echo "    ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept comment \"DHCPv6\""
     echo "    tcp dport { ${ssh_set} } accept comment \"SSH\""
-    echo "    tcp dport { ${tcp_ports} } accept"
+    [[ -n $tcp_ports ]] && echo "    tcp dport { ${tcp_ports} } accept"
     [[ -n $udp_ports ]] && echo "    udp dport { ${udp_ports} } accept"
     [[ -n $hop ]] && echo "    udp dport ${hop} accept comment \"hy2 port hopping\""
     echo "    ct status dnat accept"
@@ -2851,7 +3040,7 @@ UNIT
   nft delete table ip "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
   nft delete table ip6 "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
   systemctl restart proxy-oneclick-fw || { nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true; die "加载防火墙规则失败，已回滚。"; }
-  ok "nftables 规则已加载（入站默认拒绝）。已放行 SSH 端口: ${SSH_PORTS}；TCP ${XRAY_PORT}${EXTRA_TCP:+ $EXTRA_TCP}$( ((HY2_ENABLED)) && echo "；UDP ${HY2_PORT}${HOP_RANGE:+ + ${HOP_RANGE}}")${EXTRA_UDP:+；UDP $EXTRA_UDP}"
+  ok "nftables 规则已加载（入站默认拒绝）。已放行 SSH 端口: ${SSH_PORTS}；TCP ${XRAY_PORT}${EXTRA_TCP:+ $EXTRA_TCP}$( ((HY2_ENABLED)) && echo "；UDP ${HY2_PORT}${HOP_RANGE:+ + ${HOP_RANGE}}")${EXTRA_UDP:+；UDP $EXTRA_UDP}$(proto_fw_extra)"
 }
 
 remove_firewall() {
@@ -3032,8 +3221,8 @@ ask_extra_ports() {
   detect_ssh_ports
   t=$(other_listen_ports tcp); u=$(other_listen_ports udp)
   # 排除自身端口
-  t=$(for p in $t; do [[ $p == "$XRAY_PORT" ]] || echo "$p"; done | tr '\n' ' ')
-  u=$(for p in $u; do [[ $p == "$HY2_PORT" ]] || echo "$p"; done | tr '\n' ' ')
+  t=$(for p in $t; do [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" ]] || echo "$p"; done | tr '\n' ' ')
+  u=$(for p in $u; do [[ $p == "$HY2_PORT" || $p == "$TUIC_PORT" ]] || echo "$p"; done | tr '\n' ' ')
   t=${t% } u=${u% }
   if [[ -n $t || -n $u ]]; then
     warn "检测到本机还有其它服务在对外监听：${t:+TCP [$t] }${u:+UDP [$u]}"
@@ -3046,25 +3235,35 @@ ask_extra_ports() {
 
 cloud_fw_reminder() {
   echo
+  hr
   if (( NAT_MODE )); then
-    _yellow "【重要】NAT 机器：请确认服务商面板中的端口映射包含以下外部端口（链接地址: $(server_addr)）："
-    printf '   TCP %s → 本机 %s（VLESS-REALITY）\n' "$XRAY_EXT_PORT" "$XRAY_PORT"
+    printf '%s请确认服务商端口映射%s  地址 %s\n' "$C_WARN" "$C_NONE" "$(server_addr)"
+    (( REALITY_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  VLESS-REALITY\n' "$XRAY_EXT_PORT" "$XRAY_PORT"
+    (( XHTTP_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP\n' "$XHTTP_EXT_PORT" "$XHTTP_PORT"
+    (( TROJAN_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  Trojan\n' "$TROJAN_EXT_PORT" "$TROJAN_PORT"
+    (( ANYTLS_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  AnyTLS\n' "$ANYTLS_EXT_PORT" "$ANYTLS_PORT"
     if (( HY2_ENABLED )); then
-      printf '   UDP %s → 本机 %s（Hysteria2）\n' "$HY2_EXT_PORT" "$HY2_PORT"
-      [[ -n $HOP_RANGE ]] && printf '   UDP %s → 本机 %s（端口跳跃）\n' "$HOP_EXT_RANGE" "$HOP_RANGE"
+      printf 'UDP   %-7s → 本机 %-7s  Hysteria2\n' "$HY2_EXT_PORT" "$HY2_PORT"
+      [[ -n $HOP_RANGE ]] && printf 'UDP   %-7s → 本机 %-7s  端口跳跃\n' "$HOP_EXT_RANGE" "$HOP_RANGE"
     fi
+    (( TUIC_ENABLED )) && printf 'UDP   %-7s → 本机 %-7s  TUIC v5\n' "$TUIC_EXT_PORT" "$TUIC_PORT"
     if (( HY2_ENABLED )) && [[ $HY2_EXT_PORT == "$XRAY_EXT_PORT" ]]; then
-      echo "   Reality 与 Hysteria2 共用外部端口 ${XRAY_EXT_PORT}：该映射必须同时包含 TCP 和 UDP。"
+      echo "Reality 与 Hysteria2 共用外部端口 ${XRAY_EXT_PORT}，该映射必须同时包含 TCP 和 UDP。"
     else
-      echo "   若服务商只映射 TCP，Hysteria2 将无法使用（Reality 不受影响）。"
+      echo "若服务商只映射 TCP，Hysteria2 将无法使用。"
     fi
+    hr
     return 0
   fi
-  _yellow "【重要】请同时在云服务商控制台的安全组 / 防火墙中放行以下端口，否则无法连接："
-  printf '   TCP %s（VLESS-REALITY）\n' "$XRAY_PORT"
-  (( HY2_ENABLED )) && printf '   UDP %s%s（Hysteria2）\n' "$HY2_PORT" "${HOP_RANGE:+ 以及 UDP ${HOP_RANGE}（端口跳跃）}"
-  echo "   常见位置：AWS EC2 安全组 / Lightsail 网络 / GCP VPC 防火墙 / Oracle Cloud 安全列表 / Azure NSG / 阿里云·腾讯云 安全组"
-  echo "   （Oracle Cloud 镜像还自带 iptables 规则，如有需要请一并检查）"
+  printf '%s请在云服务商安全组放行%s\n' "$C_WARN" "$C_NONE"
+  (( REALITY_ENABLED )) && printf 'TCP   %-7s  VLESS-REALITY\n' "$XRAY_PORT"
+  (( XHTTP_ENABLED )) && printf 'TCP   %-7s  VLESS-XHTTP\n' "$XHTTP_PORT"
+  (( TROJAN_ENABLED )) && printf 'TCP   %-7s  Trojan\n' "$TROJAN_PORT"
+  (( ANYTLS_ENABLED )) && printf 'TCP   %-7s  AnyTLS\n' "$ANYTLS_PORT"
+  (( HY2_ENABLED )) && printf 'UDP   %-7s  Hysteria2%s\n' "$HY2_PORT" "${HOP_RANGE:+  以及 UDP ${HOP_RANGE}}"
+  (( TUIC_ENABLED )) && printf 'UDP   %-7s  TUIC v5\n' "$TUIC_PORT"
+  echo "位置：云控制台安全组。Oracle Cloud 镜像可能还有自带 iptables。"
+  hr
 }
 
 # ============================================================
@@ -3107,6 +3306,10 @@ server_addr() {
 # 链接中使用的（外部）端口：NAT 模式为服务商映射的外部端口
 pub_xray_port() { if (( NAT_MODE )) && [[ -n $XRAY_EXT_PORT ]]; then printf '%s' "$XRAY_EXT_PORT"; else printf '%s' "$XRAY_PORT"; fi; }
 pub_hy2_port() { if (( NAT_MODE )) && [[ -n $HY2_EXT_PORT ]]; then printf '%s' "$HY2_EXT_PORT"; else printf '%s' "$HY2_PORT"; fi; }
+pub_xhttp_port() { if (( NAT_MODE )) && [[ -n $XHTTP_EXT_PORT ]]; then printf '%s' "$XHTTP_EXT_PORT"; else printf '%s' "$XHTTP_PORT"; fi; }
+pub_trojan_port() { if (( NAT_MODE )) && [[ -n $TROJAN_EXT_PORT ]]; then printf '%s' "$TROJAN_EXT_PORT"; else printf '%s' "$TROJAN_PORT"; fi; }
+pub_tuic_port() { if (( NAT_MODE )) && [[ -n $TUIC_EXT_PORT ]]; then printf '%s' "$TUIC_EXT_PORT"; else printf '%s' "$TUIC_PORT"; fi; }
+pub_anytls_port() { if (( NAT_MODE )) && [[ -n $ANYTLS_EXT_PORT ]]; then printf '%s' "$ANYTLS_EXT_PORT"; else printf '%s' "$ANYTLS_PORT"; fi; }
 pub_hop() { # NAT 模式只认实际生效的外部跳跃段，绝不回落到默认 HOP_RANGE
   if (( ${NAT_MODE:-0} )); then printf '%s' "${HOP_EXT_RANGE:-}"; return 0; fi
   printf '%s' "${HOP_RANGE:-}"
@@ -3129,11 +3332,40 @@ hy2_link() {
   printf 'hysteria2://%s@%s:%s/?%s#%s' "$(urlencode "$HY2_PASS")" "$addr" "$(pub_hy2_port)" "$q" "$(urlencode "${NODE_NAME}-Hy2")"
 }
 
+vless_xhttp_link() { # $1 uuid $2 名称 $3 是否包含 pqv(1/0)
+  local addr q
+  addr=$(host_fmt "$(server_addr)")
+  q="encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}"
+  [[ ${3:-1} == 1 ]] && pqv_active && q+="&pqv=${MLDSA_VERIFY}"
+  q+="&type=xhttp&path=$(urlencode "$XHTTP_PATH")&mode=stream-one"
+  printf 'vless://%s@%s:%s?%s#%s' "$1" "$addr" "$(pub_xhttp_port)" "$q" "$(urlencode "$2")"
+}
+trojan_link() {
+  local addr q
+  addr=$(host_fmt "$(server_addr)")
+  q="security=reality&sni=${SNI}&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none"
+  pqv_active && q+="&pqv=${MLDSA_VERIFY}"
+  printf 'trojan://%s@%s:%s?%s#%s' "$(urlencode "$TROJAN_PASS")" "$addr" "$(pub_trojan_port)" "$q" "$(urlencode "${NODE_NAME}-Trojan")"
+}
+tuic_link() {
+  local addr q
+  addr=$(host_fmt "$(server_addr)")
+  q="congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${SNI}&allow_insecure=1&insecure=1"
+  printf 'tuic://%s:%s@%s:%s?%s#%s' "$(urlencode "$UUID")" "$(urlencode "$TUIC_PASS")" "$addr" "$(pub_tuic_port)" "$q" "$(urlencode "${NODE_NAME}-TUIC")"
+}
+anytls_link() {
+  local addr q
+  addr=$(host_fmt "$(server_addr)")
+  q="security=tls&type=tcp&sni=${SNI}&fp=chrome&insecure=1&allowInsecure=1"
+  printf 'anytls://%s@%s:%s?%s#%s' "$(urlencode "$ANYTLS_PASS")" "$addr" "$(pub_anytls_port)" "$q" "$(urlencode "${NODE_NAME}-AnyTLS")"
+}
+
 mihomo_yaml() {
   local addr pin_hex
   addr=$(server_addr)
   pin_hex=$(tr -d ':' <<<"$HY2_PIN" | tr 'A-F' 'a-f')
   echo "proxies:"
+  if (( REALITY_ENABLED )); then
   cat <<Y
   - name: "${NODE_NAME}-Reality"
     type: vless
@@ -3172,6 +3404,7 @@ Y
 Y
     done <"$USERS_FILE"
   fi
+  fi
   if (( HY2_ENABLED )); then
     cat <<Y
   - name: "${NODE_NAME}-Hy2"
@@ -3191,6 +3424,71 @@ Y
       - h3
 Y
   fi
+  if (( XHTTP_ENABLED )); then
+    cat <<Y
+  - name: "${NODE_NAME}-XHTTP"
+    type: vless
+    server: ${addr}
+    port: $(pub_xhttp_port)
+    uuid: ${UUID}
+    network: xhttp
+    tls: true
+    udp: true
+    servername: ${SNI}
+    client-fingerprint: chrome
+    xhttp-opts:
+      path: ${XHTTP_PATH}
+      mode: stream-one
+    reality-opts:
+      public-key: ${PUB_KEY}
+      short-id: ${SHORT_ID}
+Y
+  fi
+  if (( TROJAN_ENABLED )); then
+    cat <<Y
+  - name: "${NODE_NAME}-Trojan"
+    type: trojan
+    server: ${addr}
+    port: $(pub_trojan_port)
+    password: "${TROJAN_PASS}"
+    network: tcp
+    udp: true
+    sni: ${SNI}
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: ${PUB_KEY}
+      short-id: ${SHORT_ID}
+Y
+  fi
+  if (( TUIC_ENABLED )); then
+    cat <<Y
+  - name: "${NODE_NAME}-TUIC"
+    type: tuic
+    server: ${addr}
+    port: $(pub_tuic_port)
+    uuid: ${UUID}
+    password: "${TUIC_PASS}"
+    sni: ${SNI}
+    alpn: [h3]
+    congestion-controller: bbr
+    udp-relay-mode: native
+    skip-cert-verify: true
+    udp: true
+Y
+  fi
+  if (( ANYTLS_ENABLED )); then
+    cat <<Y
+  - name: "${NODE_NAME}-AnyTLS"
+    type: anytls
+    server: ${addr}
+    port: $(pub_anytls_port)
+    password: "${ANYTLS_PASS}"
+    sni: ${SNI}
+    client-fingerprint: chrome
+    skip-cert-verify: true
+    udp: true
+Y
+  fi
 }
 
 print_qr() { # $1 链接
@@ -3201,67 +3499,129 @@ print_qr() { # $1 链接
   fi
 }
 
-build_info() { # 输出完整信息（无颜色），用于保存文件
-  local vl vl_short hy
-  vl=$(vless_link "$UUID" "${NODE_NAME}-Reality" 1)
-  echo "================ proxy-oneclick 节点信息 ================"
-  echo "生成时间: $(date '+%F %T %Z')"
-  echo "服务器:   $(server_addr)"
-  echo "SNI:      ${SNI}"
-  if (( NAT_MODE )); then
-    echo "NAT 模式: 映射端口 ${NAT_PORTS}（外部[:内部]）   虚拟化: ${VIRT:-未知}"
+# 一块协议信息：标题、名称、地址、端口各一行，链接单独占最后一行（整行都是链接，方便复制）。
+# $1=1 时标题用标题色、说明用淡色；写入文件时传 0，不夹带转义序列。
+node_link_head() { # $1=1 着色 $2 标题 $3 名称 $4 地址 $5 端口
+  local W=62
+  echo
+  ui_bar '═' "$W" "$1"
+  ui_center "$2" "$W" "$1"
+  ui_bar '─' "$W" "$1"
+  printf '名称  %s\n' "$3"
+  printf '地址  %s\n' "$4"
+  printf '端口  %s\n' "$5"
+}
+node_link_end() { ui_bar '═' 62 "$1"; }
+node_link_note() {
+  [[ -n $2 ]] || return 0
+  if (( $1 )); then printf '%s%s%s\n' "$C_DIM" "$2" "$C_NONE"; else printf '%s\n' "$2"; fi
+}
+node_link_uri() { printf '%s\n' "$1"; }
+print_node_links() { # $1=1 屏幕着色并附二维码；$1=0 纯文本
+  local paint=${1:-0} hp qr
+  if (( REALITY_ENABLED )); then
+    node_link_head "$paint" "VLESS + REALITY + Vision" "${NODE_NAME}-Reality" "$(server_addr)" "$(pub_xray_port)  TCP"
+    if pqv_active; then
+      node_link_note "$paint" "含 pqv"
+      node_link_uri "$(vless_link "$UUID" "${NODE_NAME}-Reality" 1)"
+      node_link_note "$paint" "不含 pqv"
+      qr=$(vless_link "$UUID" "${NODE_NAME}-Reality" 0)
+      node_link_uri "$qr"
+    else
+      qr=$(vless_link "$UUID" "${NODE_NAME}-Reality" 1)
+      node_link_uri "$qr"
+    fi
+    (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
   fi
-  echo
-  echo "---------- VLESS + REALITY + Vision ----------"
-  echo "地址: $(server_addr)   端口: $(pub_xray_port) (TCP)$( ((NAT_MODE)) && echo "   本机监听: ${XRAY_PORT}")"
-  echo "UUID: ${UUID}"
-  echo "流控: xtls-rprx-vision    传输: tcp    安全: reality"
-  echo "SNI:  ${SNI}    指纹(fp): chrome"
-  echo "公钥(pbk): ${PUB_KEY}"
-  echo "ShortId(sid): ${SHORT_ID}"
-  if pqv_active; then echo "ML-DSA-65 验证公钥(pqv): 已包含在链接中（很长，可选，客户端不支持时可删除 &pqv=... 部分）"
-  elif [[ -n $MLDSA_VERIFY ]]; then echo "ML-DSA-65 (pqv): 已关闭（目标 ${SNI} 证书链不足 3500 字节）"; fi
-  echo
-  if pqv_active; then echo "链接（含 pqv 后量子签名验证）:"; else echo "链接:"; fi
-  echo "$vl"
-  if pqv_active; then
-    vl_short=$(vless_link "$UUID" "${NODE_NAME}-Reality" 0)
-    echo
-    echo "链接（不含 pqv，兼容性更好 / 二维码使用此链接）:"
-    echo "$vl_short"
+  if (( XHTTP_ENABLED )); then
+    node_link_head "$paint" "VLESS + XHTTP + REALITY" "${NODE_NAME}-XHTTP" "$(server_addr)" "$(pub_xhttp_port)  TCP"
+    node_link_note "$paint" "mode stream-one，不要填 flow"
+    if pqv_active; then
+      node_link_note "$paint" "含 pqv"
+      node_link_uri "$(vless_xhttp_link "$UUID" "${NODE_NAME}-XHTTP" 1)"
+      node_link_note "$paint" "不含 pqv"
+      qr=$(vless_xhttp_link "$UUID" "${NODE_NAME}-XHTTP" 0)
+      node_link_uri "$qr"
+    else
+      qr=$(vless_xhttp_link "$UUID" "${NODE_NAME}-XHTTP" 1)
+      node_link_uri "$qr"
+    fi
+    (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
+  fi
+  if (( HY2_ENABLED )); then
+    hp=$(pub_hop)
+    node_link_head "$paint" "Hysteria2" "${NODE_NAME}-Hy2" "$(server_addr)" "$(pub_hy2_port)  UDP${hp:+  跳跃 ${hp}}"
+    qr=$(hy2_link)
+    node_link_uri "$qr"
+    if [[ -n $hp ]]; then
+      node_link_note "$paint" "官方客户端 / sing-box 多端口写法"
+      hy2_link | sed -E "s#@([^/]+):$(pub_hy2_port)/#@\\1:$(pub_hy2_port),${hp}/#; s#&mport=[0-9,-]+##"
+    fi
+    (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
+  fi
+  if (( TROJAN_ENABLED )); then
+    node_link_head "$paint" "Trojan + REALITY" "${NODE_NAME}-Trojan" "$(server_addr)" "$(pub_trojan_port)  TCP"
+    qr=$(trojan_link)
+    node_link_uri "$qr"
+    (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
+  fi
+  if (( TUIC_ENABLED )); then
+    node_link_head "$paint" "TUIC v5" "${NODE_NAME}-TUIC" "$(server_addr)" "$(pub_tuic_port)  UDP"
+    node_link_note "$paint" "v2rayNG 不能导入，请用 v2rayN / sing-box / mihomo"
+    qr=$(tuic_link)
+    node_link_uri "$qr"
+    (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
+  fi
+  if (( ANYTLS_ENABLED )); then
+    node_link_head "$paint" "AnyTLS" "${NODE_NAME}-AnyTLS" "$(server_addr)" "$(pub_anytls_port)  TCP"
+    node_link_note "$paint" "v2rayNG 不能导入，请用 v2rayN / sing-box / mihomo"
+    qr=$(anytls_link)
+    node_link_uri "$qr"
+    (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
   fi
   if [[ -s $USERS_FILE ]]; then
-    echo
-    echo "---------- 额外用户 ----------"
     local u r
     while IFS=$'\t' read -r u r; do
       [[ -n $u ]] || continue
-      echo "[$r] $(vless_link "$u" "${NODE_NAME}-${r}" 0)"
+      if (( REALITY_ENABLED )); then
+        node_link_head "$paint" "额外用户 ${r} · Reality" "${NODE_NAME}-${r}" "$(server_addr)" "$(pub_xray_port)  TCP"
+        qr=$(vless_link "$u" "${NODE_NAME}-${r}" 0)
+        node_link_uri "$qr"
+        (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
+      fi
+      if (( XHTTP_ENABLED )); then
+        node_link_head "$paint" "额外用户 ${r} · XHTTP" "${NODE_NAME}-XHTTP-${r}" "$(server_addr)" "$(pub_xhttp_port)  TCP"
+        qr=$(vless_xhttp_link "$u" "${NODE_NAME}-XHTTP-${r}" 0)
+        node_link_uri "$qr"
+        (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
+      fi
     done <"$USERS_FILE"
   fi
-  if (( HY2_ENABLED )); then
-    hy=$(hy2_link)
-    echo
-    echo "---------- Hysteria2 ----------"
-    echo "地址: $(server_addr)   端口: $(pub_hy2_port) (UDP)$(hp=$(pub_hop); [[ -n $hp ]] && echo "   端口跳跃: $hp")$( ((NAT_MODE)) && echo "   本机监听: ${HY2_PORT}")"
-    (( NAT_MODE )) && [[ -z $(pub_hop) ]] && echo "（NAT 模式：端口跳跃未启用）"
-    echo "密码: ${HY2_PASS}"
-    echo "SNI:  ${SNI}   (自签证书，insecure=1 + pinSHA256 证书指纹校验)"
-    echo "pinSHA256: ${HY2_PIN}"
-    echo
-    echo "$hy"
-    if [[ -n $(pub_hop) ]]; then
-      echo
-      echo "官方 Hysteria2 客户端 / sing-box 多端口写法（端口跳跃写在地址里）:"
-      hy2_link | sed -E "s#@([^/]+):$(pub_hy2_port)/#@\\1:$(pub_hy2_port),$(pub_hop)/#; s#&mport=[0-9,-]+##"
-      echo
-    fi
+}
+
+build_info() { # 输出完整信息（无颜色），用于保存文件
+  echo "proxy-oneclick 节点信息"
+  echo "生成时间  $(date '+%F %T %Z')"
+  echo "服务器    $(server_addr)"
+  echo "SNI       ${SNI}"
+  if (( NAT_MODE )); then
+    echo "NAT       ${NAT_PORTS}（外部[:内部]）  虚拟化 ${VIRT:-未知}"
   fi
+  print_node_links 0
   echo
-  echo "---------- mihomo (Clash.Meta / Clash Verge Rev) ----------"
+  ui_bar '─' 62 0
+  echo "mihomo / Clash.Meta"
   mihomo_yaml
   echo
-  echo "========================================================"
+  ui_bar '─' 62 0
 }
 
 save_info() {
@@ -3274,32 +3634,18 @@ show_info() {
   (( INSTALLED )) || die "尚未安装，请先执行安装。"
   if (( LAND_MODE )); then land_show_info; return; fi
   save_info
-  local vl vl_qr
-  vl=$(vless_link "$UUID" "${NODE_NAME}-Reality" 1)
-  vl_qr=$(vless_link "$UUID" "${NODE_NAME}-Reality" 0)
   echo
-  hr; _green "  VLESS + REALITY + Vision   (${SNI})"; hr
-  printf '  地址: %s  端口: %s  UUID: %s\n' "$(server_addr)" "$(pub_xray_port)" "$UUID"
-  printf '  pbk: %s  sid: %s  fp: chrome\n' "$PUB_KEY" "$SHORT_ID"
+  ui_logo
+  print_node_links 1
   echo
-  if pqv_active; then _cyan "  链接（含 pqv）："; else _cyan "  链接："; fi
-  echo "$vl"
-  if pqv_active; then
-    echo; _cyan "  链接（不含 pqv，兼容性更好）："; echo "$vl_qr"
-  fi
-  if pqv_active; then echo; _cyan "  二维码（不含 pqv，pqv 太长无法放入终端二维码）："; else echo; _cyan "  二维码："; fi
-  print_qr "$vl_qr"
-  if (( HY2_ENABLED )); then
-    local hy; hy=$(hy2_link)
-    echo; hr; _green "  Hysteria2   (UDP $(pub_hy2_port)$(hp=$(pub_hop); [[ -n $hp ]] && echo "，跳跃 $hp"))"; hr
-    echo "$hy"
-    echo; print_qr "$hy"
-  fi
-  echo; hr; _green "  mihomo / Clash.Meta 配置片段"; hr
+  ui_bar '═' 62
+  ui_center "mihomo / Clash.Meta" 62
+  ui_bar '─' 62
   mihomo_yaml
-  echo; hr
-  printf '  以上信息已保存到 %s（权限 600）。随时执行 %sproxy info%s 再次查看。\n' "$INFO_FILE" "$C_GREEN" "$C_NONE"
-  hr
+  echo
+  ui_bar '─' 62
+  printf '以上信息已保存到 %s（权限 600）。再次查看：proxy info\n' "$INFO_FILE"
+  ui_bar '═' 62
 }
 
 # ============================================================
@@ -3329,9 +3675,434 @@ default_node_name() {
   printf '%s' "$n" | tr -cd 'A-Za-z0-9_.-'
 }
 
+# ============================================================
+#     协议：默认 Reality + XHTTP + Hy2；可选 Trojan / TUIC / AnyTLS
+# ============================================================
+# XHTTP 采用 Xray 官方「VLESS + XHTTP + REALITY」：与 Vision 共用同一把 Reality 密钥和 SNI，
+# 单独 TCP 端口，不需要自己的域名。mode 固定 stream-one（REALITY 直连；避免客户端 auto 握手失败）。
+# TUIC v5 / AnyTLS 由 sing-box 提供，自签证书（CN = 所选 SNI），不要求自有域名。
+# Trojan 走 Xray + REALITY。Shadowsocks 2022 只存在于落地机，这里不加直连入站。
+xray_inbound_needed() {
+  (( ${REALITY_ENABLED:-0} || ${XHTTP_ENABLED:-0} || ${TROJAN_ENABLED:-0} )) && return 0
+  relay_active && (( ${HY2_ENABLED:-0} )) && return 0
+  return 1
+}
+proto_xray_brief() {
+  local s=""
+  (( REALITY_ENABLED )) && s+="REALITY TCP ${XRAY_PORT}"
+  (( XHTTP_ENABLED )) && s+="${s:+ / }XHTTP TCP ${XHTTP_PORT}"
+  (( TROJAN_ENABLED )) && s+="${s:+ / }Trojan TCP ${TROJAN_PORT}"
+  [[ -n $s ]] || s="无入站"
+  printf '%s' "$s"
+}
+proto_fw_extra() {
+  local s=""
+  (( XHTTP_ENABLED )) && s+="；TCP ${XHTTP_PORT}（XHTTP）"
+  (( TROJAN_ENABLED )) && s+="；TCP ${TROJAN_PORT}（Trojan）"
+  (( ANYTLS_ENABLED )) && s+="；TCP ${ANYTLS_PORT}（AnyTLS）"
+  (( TUIC_ENABLED )) && s+="；UDP ${TUIC_PORT}（TUIC）"
+  printf '%s' "$s"
+}
+ensure_proto_secrets() {
+  [[ $XHTTP_PATH == /* && $XHTTP_PATH =~ ^/[A-Za-z0-9_-]+$ ]] || XHTTP_PATH="/$(rand_hex 8)"
+  [[ -n $TROJAN_PASS ]] || TROJAN_PASS=$(rand_pass)
+  [[ -n $TUIC_PASS ]] || TUIC_PASS=$(rand_pass)
+  [[ -n $ANYTLS_PASS ]] || ANYTLS_PASS=$(rand_pass)
+}
+resolve_install_protos() {
+  if [[ -n $OPT_REALITY ]]; then REALITY_ENABLED=$OPT_REALITY; fi
+  if [[ -n $OPT_XHTTP ]]; then XHTTP_ENABLED=$OPT_XHTTP
+  elif (( ! STATE_HAS_XHTTP )); then XHTTP_ENABLED=1
+  fi
+  if [[ -n $OPT_TROJAN ]]; then TROJAN_ENABLED=$OPT_TROJAN; fi
+  if [[ -n $OPT_TUIC ]]; then TUIC_ENABLED=$OPT_TUIC; fi
+  if [[ -n $OPT_ANYTLS ]]; then ANYTLS_ENABLED=$OPT_ANYTLS; fi
+  return 0
+}
+confirm_xhttp() {
+  if [[ -n $OPT_XHTTP ]]; then XHTTP_ENABLED=$OPT_XHTTP; return 0; fi
+  (( OPT_AUTO )) && return 0
+  if confirm "是否安装 VLESS + XHTTP（REALITY，不需要自己的域名）？" "$([[ ${XHTTP_ENABLED:-0} == 1 ]] && echo y || echo n)"; then
+    XHTTP_ENABLED=1
+  else
+    XHTTP_ENABLED=0
+  fi
+}
+proto_any_enabled() { (( REALITY_ENABLED || XHTTP_ENABLED || HY2_ENABLED || TROJAN_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )); }
+
+NAT_USED_TCP="" NAT_USED_UDP=""
+LOCAL_USED_TCP="" LOCAL_USED_UDP=""
+nat_mark_used() { if [[ $1 == tcp ]]; then NAT_USED_TCP+=" $2 "; else NAT_USED_UDP+=" $2 "; fi; }
+local_mark_used() { if [[ $1 == tcp ]]; then LOCAL_USED_TCP+=" $2 "; else LOCAL_USED_UDP+=" $2 "; fi; }
+nat_used_hit() { local bag; [[ $1 == tcp ]] && bag=$NAT_USED_TCP || bag=$NAT_USED_UDP; [[ " $bag " == *" $2 "* ]]; }
+local_used_hit() { local bag; [[ $1 == tcp ]] && bag=$LOCAL_USED_TCP || bag=$LOCAL_USED_UDP; [[ " $bag " == *" $2 "* ]]; }
+nat_seed_used() {
+  NAT_USED_TCP="" NAT_USED_UDP=""
+  if (( REALITY_ENABLED )) && [[ -n $XRAY_EXT_PORT ]]; then nat_mark_used tcp "$XRAY_EXT_PORT"; fi
+  if (( HY2_ENABLED )) && [[ -n $HY2_EXT_PORT ]]; then nat_mark_used udp "$HY2_EXT_PORT"; fi
+  return 0
+}
+local_seed_used() {
+  LOCAL_USED_TCP="" LOCAL_USED_UDP=""
+  if (( REALITY_ENABLED )) && [[ -n $XRAY_PORT ]]; then local_mark_used tcp "$XRAY_PORT"; fi
+  if (( HY2_ENABLED )) && [[ -n $HY2_PORT ]]; then local_mark_used udp "$HY2_PORT"; fi
+  return 0
+}
+nat_first_for() { # $1 tcp|udp；后面的参数是额外跳过的端口
+  local p x skip
+  while read -r p; do
+    nat_used_hit "$1" "$p" && continue
+    skip=0
+    for x in "${@:2}"; do [[ -n $x && $p == "$x" ]] && skip=1; done
+    (( skip )) && continue
+    echo "$p"; return 0
+  done < <(nat_all_ext)
+  return 1
+}
+nat_pick_mapped() { # $1 proto $2 ext变量 $3 内部端口变量 $4 --xx-port $5 名称 $6 允许占用的进程名
+  local proto=$1 ext_var=$2 int_var=$3 opt=$4 label=$5 allow=$6
+  local p def="" saved=${!ext_var-}
+  if [[ -n $opt ]]; then def=$(opt_ext "$opt")
+  elif [[ -n $saved ]] && nat_usable "$saved" && ! nat_used_hit "$proto" "$saved"; then def=$saved
+  else def=$(nat_first_for "$proto") || def=""; fi
+  if [[ -z $def ]]; then
+    if [[ -n $opt ]]; then die "无法使用外部端口 $(opt_ext "$opt") 作为 ${label}（需包含在 --nat-ports 中，且不能与已占用的 ${proto^^} 端口相同）。"; fi
+    warn "没有空闲的映射端口给 ${label}，本次不启用（已有密钥保留）。请再映射一个 ${proto^^} 端口后，用菜单「协议开关」或对应参数打开。"
+    return 1
+  fi
+  while :; do
+    if [[ -n $opt ]] || (( OPT_AUTO )); then p=$def
+    else
+      ask p "${label} 使用的外部端口（${proto^^}，可选: $(nat_ext_list)）" "$def"
+      p=$(sanitize_port_input "$p"); p=${p// /}
+    fi
+    if nat_usable "$p" && ! nat_used_hit "$proto" "$p"; then
+      local ip; ip=$(ext2int "$p")
+      if check_port_free "$proto" "$ip" "$allow"; then
+        printf -v "$ext_var" '%s' "$p"
+        printf -v "$int_var" '%s' "$ip"
+        nat_mark_used "$proto" "$p"
+        return 0
+      fi
+    else
+      warn "端口 ${p:-空} 不可用（不在映射中、已排除，或该 ${proto^^} 端口已被其它协议占用）。"
+    fi
+    { [[ -n $opt ]] || (( OPT_AUTO )); } && die "无法使用外部端口 ${p:-空} 作为 ${label}。"
+    def=$(nat_first_for "$proto" "$p") || { warn "没有其它可用端口，已跳过 ${label}。"; return 1; }
+  done
+}
+local_pick() { # $1 proto $2 变量 $3 --xx-port $4 名称 $5 允许的进程名 $6 默认端口
+  local proto=$1 var=$2 opt=$3 label=$4 allow=$5 def=$6
+  local p
+  p=$(opt_ext "${opt:-${!var:-$def}}")
+  while :; do
+    if [[ -z $opt ]] && (( ! OPT_AUTO )); then
+      ask p "${label} 监听端口 (${proto^^})" "$p"
+      p=$(sanitize_port_input "$p"); p=${p// /}
+    fi
+    if ! is_port "$p"; then
+      { [[ -n $opt ]] || (( OPT_AUTO )); } && die "端口无效: ${p:-空}"
+      warn "端口无效。"; p=$def; continue
+    fi
+    if local_used_hit "$proto" "$p"; then
+      { [[ -n $opt ]] || (( OPT_AUTO )); } && die "端口 ${p} 与其它协议冲突。"
+      warn "端口 ${p} 已被其它协议占用。"; continue
+    fi
+    if ! check_port_free "$proto" "$p" "$allow"; then
+      { [[ -n $opt ]] || (( OPT_AUTO )); } && die "${proto^^} 端口 ${p} 已被占用。"
+      continue
+    fi
+    printf -v "$var" '%s' "$p"
+    local_mark_used "$proto" "$p"
+    return 0
+  done
+}
+choose_extra_local() {
+  confirm_xhttp
+  local_seed_used
+  if (( XHTTP_ENABLED )); then local_pick tcp XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}"; fi
+  if (( TROJAN_ENABLED )); then local_pick tcp TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" "${TROJAN_PORT:-8444}"; fi
+  if (( ANYTLS_ENABLED )); then local_pick tcp ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" "${ANYTLS_PORT:-8445}"; fi
+  if (( TUIC_ENABLED )); then local_pick udp TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" "${TUIC_PORT:-8446}"; fi
+  proto_any_enabled || die "至少需要启用一个协议（Reality / XHTTP / Hysteria2 / Trojan / TUIC / AnyTLS）。"
+}
+choose_extra_nat() {
+  confirm_xhttp
+  nat_seed_used
+  if (( XHTTP_ENABLED )); then nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" || XHTTP_ENABLED=0; fi
+  if (( TROJAN_ENABLED )); then nat_pick_mapped tcp TROJAN_EXT_PORT TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" || TROJAN_ENABLED=0; fi
+  if (( ANYTLS_ENABLED )); then nat_pick_mapped tcp ANYTLS_EXT_PORT ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" || ANYTLS_ENABLED=0; fi
+  if (( TUIC_ENABLED )); then nat_pick_mapped udp TUIC_EXT_PORT TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" || TUIC_ENABLED=0; fi
+  if (( HY2_ENABLED )) && [[ -n $HOP_EXT_RANGE ]]; then
+    local filtered; filtered=$(nat_hop_filter "$HOP_EXT_RANGE")
+    if (( $(segs_count "$filtered") >= 2 )); then
+      [[ $filtered != "$HOP_EXT_RANGE" ]] && info "端口跳跃已避开其它协议占用的端口: ${filtered}"
+      HOP_EXT_RANGE=$filtered; HOP_RANGE=$(nat_segs_ext2int "$filtered")
+    else
+      warn "其它协议占用后，跳跃范围不足 2 个端口，端口跳跃已关闭。"
+      HOP_RANGE="" HOP_EXT_RANGE="" HOP_BACKEND=""
+    fi
+  fi
+  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口时放不下 XHTTP，请再加一条映射，或先用 Reality + Hysteria2（--no-xhttp）。"
+}
+
+ensure_sb_user() {
+  id sing-box >/dev/null 2>&1 && return 0
+  if have useradd; then
+    useradd -r -M -s "$(command -v nologin 2>/dev/null || echo /bin/false)" sing-box >/dev/null 2>&1 || true
+  elif have adduser; then
+    addgroup -S sing-box >/dev/null 2>&1 || true
+    adduser -S -D -H -h /var/empty -s /sbin/nologin -G sing-box sing-box >/dev/null 2>&1 || true
+  fi
+  id sing-box >/dev/null 2>&1 || warn "无法创建 sing-box 用户，将以 root 运行。"
+}
+sb_asset_name() { # $1 版本号（不含 v）
+  local ver=$1 libc="" arch
+  [[ $OS_ID == alpine ]] && libc="-musl"
+  case $ARCH in
+    amd64) arch=amd64 ;;
+    arm64) arch=arm64 ;;
+    armv7) arch=armv7 ;;
+    *) die "当前架构 ${ARCH} 没有对应的 sing-box 安装包。" ;;
+  esac
+  printf 'sing-box-%s-linux-%s%s.tar.gz' "$ver" "$arch" "$libc"
+}
+sb_need_cap() {
+  (( TUIC_ENABLED )) && need_bind_cap "$TUIC_PORT" && return 0
+  (( ANYTLS_ENABLED )) && need_bind_cap "$ANYTLS_PORT" && return 0
+  return 1
+}
+write_singbox_service() {
+  local envs user="root" grp="root"; envs=$(go_mem_env)
+  if id sing-box >/dev/null 2>&1; then user=sing-box; grp=$(id -gn sing-box); fi
+  if is_openrc; then
+    local sargs="" e
+    for e in $envs; do sargs+=" --env ${e}"; done
+    cat >"$SB_RC" <<RC
+#!/sbin/openrc-run
+# 由 proxy-oneclick 生成
+name="sing-box"
+description="sing-box (TUIC / AnyTLS)"
+supervisor=supervise-daemon
+command="${SB_BIN}"
+command_args="run -c ${SB_CONF}"
+command_user="${user}:${grp}"
+directory="${SB_DIR}"
+output_log="${SB_LOG}"
+error_log="${SB_LOG}"
+respawn_delay=3
+respawn_max=0
+supervise_daemon_args="${sargs}"
+$(sb_need_cap && echo 'capabilities="^cap_net_bind_service"')
+
+depend() {
+  want net
+  after net firewall
+}
+
+start_pre() {
+  checkpath -d -m 0755 -o "\${command_user}" /var/log/sing-box
+  checkpath -f -m 0644 -o "\${command_user}" "${SB_LOG}"
+  if [ "\$(wc -c <"${SB_LOG}")" -gt 2097152 ]; then
+    tail -n 500 "${SB_LOG}" >"${SB_LOG}.tmp" && cat "${SB_LOG}.tmp" >"${SB_LOG}"; rm -f "${SB_LOG}.tmp"
+  fi
+}
+RC
+    chmod 755 "$SB_RC"
+  else
+    rm -rf /etc/systemd/system/sing-box.service.d
+    {
+      echo "# 由 proxy-oneclick 生成"
+      echo "[Unit]"
+      echo "Description=sing-box (TUIC / AnyTLS)"
+      echo "After=network-online.target"
+      echo "Wants=network-online.target"
+      echo
+      echo "[Service]"
+      echo "User=${user}"
+      echo "Group=${grp}"
+      echo "WorkingDirectory=${SB_DIR}"
+      echo "NoNewPrivileges=true"
+      if sb_need_cap; then
+        echo "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+        echo "AmbientCapabilities=CAP_NET_BIND_SERVICE"
+      fi
+      local e; for e in $envs; do echo "Environment=${e}"; done
+      echo "ExecStart=${SB_BIN} run -c ${SB_CONF}"
+      echo "Restart=on-failure"
+      echo "RestartSec=3"
+      echo "LimitNOFILE=65535"
+      echo
+      echo "[Install]"
+      echo "WantedBy=multi-user.target"
+    } >"$SB_UNIT"
+    systemctl daemon-reload
+  fi
+}
+install_singbox() {
+  step "安装 / 更新 sing-box（TUIC v5 / AnyTLS）"
+  mktmp
+  local tag ver asset url sum want cur="" bin dg
+  tag=$(gh_latest_tag SagerNet/sing-box)
+  [[ -n $tag ]] || { github_hint; die "获取 sing-box 最新版本号失败。"; }
+  ver=${tag#v}
+  [[ -x $SB_BIN ]] && cur=$("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')
+  if [[ $cur == "$ver" ]]; then
+    ok "sing-box 已是最新版本 ${ver}，跳过下载。"
+  else
+    asset=$(sb_asset_name "$ver")
+    url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
+    info "下载 ${asset} ..."
+    fetch -o "${TMP_DIR}/${asset}" "$url" || { github_hint; die "下载 sing-box 失败。"; }
+    want=$(curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${tag}" 2>/dev/null \
+      | jq -r --arg n "$asset" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null) || want=""
+    want=${want#sha256:}
+    sum=$(sha256sum "${TMP_DIR}/${asset}" | awk '{print $1}')
+    if [[ -n $want && $want != null ]]; then
+      [[ $want == "$sum" ]] || die "sing-box SHA256 校验失败（期望 ${want}，实际 ${sum}），已中止。"
+      ok "SHA256 校验通过。"
+    else
+      warn "未能取得 sing-box 的 SHA256，跳过校验。"
+    fi
+    dg="${TMP_DIR}/sb-unpack"; rm -rf "$dg"; mkdir -p "$dg"
+    tar -xzf "${TMP_DIR}/${asset}" -C "$dg" || die "解压 sing-box 失败。"
+    bin=$(find "$dg" -type f -name sing-box | head -n1)
+    [[ -n $bin ]] || die "压缩包中没有 sing-box 可执行文件。"
+    chmod 755 "$bin"
+    "$bin" version >/dev/null 2>&1 || die "下载的 sing-box 无法运行（架构或 musl/glibc 不匹配？当前 ${ARCH} / ${OS_ID:-未知}）。"
+    install -m 755 "$bin" "${SB_BIN}.new" && mv -f "${SB_BIN}.new" "$SB_BIN"
+  fi
+  ensure_sb_user
+  write_singbox_service
+  ok "sing-box 已安装: $("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')"
+}
+sb_copy_cert() {
+  mkdir -p "$HY_DIR" "$SB_DIR"
+  [[ -f $HY_CRT && -f $HY_KEY ]] || gen_hy2_cert
+  if ! openssl x509 -noout -subject -in "$HY_CRT" 2>/dev/null | grep -q "CN *= *${SNI}\$"; then gen_hy2_cert; fi
+  cp -f "$HY_CRT" "$SB_CRT"
+  cp -f "$HY_KEY" "$SB_KEY"
+  local grp="root"
+  id sing-box >/dev/null 2>&1 && grp=$(id -gn sing-box)
+  chown "root:${grp}" "$SB_CRT" "$SB_KEY" 2>/dev/null || true
+  chmod 644 "$SB_CRT"; chmod 640 "$SB_KEY"
+}
+write_singbox_config() {
+  sb_needed || return 0
+  [[ -x $SB_BIN ]] || die "未找到 sing-box，无法写入 TUIC / AnyTLS 配置。"
+  ensure_proto_secrets
+  sb_copy_cert
+  local tmp="${SB_CONF}.tmp"
+  jq -n \
+    --argjson tuic "${TUIC_ENABLED:-0}" --argjson any "${ANYTLS_ENABLED:-0}" \
+    --argjson tport "${TUIC_PORT:-0}" --argjson aport "${ANYTLS_PORT:-0}" \
+    --arg uuid "$UUID" --arg tpw "$TUIC_PASS" --arg apw "$ANYTLS_PASS" \
+    --arg crt "$SB_CRT" --arg key "$SB_KEY" --argjson nets "$PRIV_NETS_JSON" '
+    {
+      log: {level: "warn"},
+      inbounds: (
+        []
+        + (if $tuic == 1 then [{
+            type: "tuic", tag: "tuic-in", listen_port: $tport,
+            users: [{name: "main", uuid: $uuid, password: $tpw}],
+            congestion_control: "bbr", zero_rtt_handshake: false,
+            tls: {enabled: true, certificate_path: $crt, key_path: $key, alpn: ["h3"]}
+          }] else [] end)
+        + (if $any == 1 then [{
+            type: "anytls", tag: "anytls-in", listen_port: $aport,
+            users: [{name: "main", password: $apw}],
+            tls: {enabled: true, certificate_path: $crt, key_path: $key}
+          }] else [] end)
+      ),
+      outbounds: [
+        {type: "direct", tag: "direct"}
+      ],
+      route: {
+        rules: [
+          {action: "sniff"},
+          {ip_cidr: $nets, action: "reject"},
+          {protocol: "bittorrent", action: "reject"}
+        ],
+        final: "direct"
+      }
+    }' >"$tmp" || die "生成 sing-box 配置失败。"
+  if ! "$SB_BIN" check -c "$tmp" >"${tmp}.log" 2>&1; then
+    cat "${tmp}.log" >&2; rm -f "$tmp" "${tmp}.log"
+    die "sing-box 配置校验失败，未应用新配置。"
+  fi
+  rm -f "${tmp}.log"
+  chmod 640 "$tmp"
+  mv -f "$tmp" "$SB_CONF"
+  selinux_fix "$SB_DIR"
+  ok "sing-box 配置已生成: ${SB_CONF}"
+}
+restart_singbox() {
+  sb_needed || return 0
+  sd_reload
+  svc_enable sing-box
+  svc_restart sing-box || true
+  sleep 1
+  if ! svc_active sing-box; then
+    svc_logs sing-box 20 >&2 || true
+    die "sing-box 启动失败，请查看上方日志。"
+  fi
+  ok "sing-box 运行中 ($( ((TUIC_ENABLED)) && echo -n "TUIC UDP $([[ -n $TUIC_EXT_PORT && $NAT_MODE == 1 ]] && echo "$TUIC_EXT_PORT" || echo "$TUIC_PORT")")$( ((TUIC_ENABLED && ANYTLS_ENABLED)) && echo -n " / ")$( ((ANYTLS_ENABLED)) && echo -n "AnyTLS TCP $([[ -n $ANYTLS_EXT_PORT && $NAT_MODE == 1 ]] && echo "$ANYTLS_EXT_PORT" || echo "$ANYTLS_PORT")"))"
+}
+remove_singbox() {
+  svc_disable_stop sing-box
+  rm -f "$SB_UNIT" "$SB_RC" "$SB_BIN"
+  rm -rf "$SB_DIR" /etc/systemd/system/sing-box.service.d /var/log/sing-box
+  if id sing-box >/dev/null 2>&1; then userdel sing-box >/dev/null 2>&1 || deluser sing-box >/dev/null 2>&1 || true; fi
+  if getent group sing-box >/dev/null 2>&1; then groupdel sing-box >/dev/null 2>&1 || delgroup sing-box >/dev/null 2>&1 || true; fi
+  sd_reload
+}
+apply_proto_services() { # 按开关写配置并启停。不删除已有密钥。
+  ensure_proto_secrets
+  if direct_mode; then
+    xray_inbound_needed && write_xray_service
+    (( HY2_ENABLED )) && [[ -x $HY_BIN ]] && write_hy2_service
+  fi
+  if xray_inbound_needed; then
+    local rc=0
+    write_xray_config || rc=$?
+    if (( rc == 2 )); then
+      svc_disable_stop xray
+      warn "Xray 没有需要监听的入站，已停止（密钥保留）。"
+    elif (( rc != 0 )); then
+      exit "$rc"
+    else
+      restart_xray
+    fi
+  else
+    svc_disable_stop xray
+  fi
+  if (( HY2_ENABLED )); then
+    [[ -x $HY_BIN ]] || install_hysteria
+    write_hy2_config
+    restart_hy2
+  else
+    svc_disable_stop hysteria-server
+    remove_nat_hop
+  fi
+  if sb_needed; then
+    [[ -x $SB_BIN ]] || install_singbox
+    write_singbox_service
+    write_singbox_config
+    restart_singbox
+  else
+    svc_disable_stop sing-box
+  fi
+  apply_firewall
+  save_state
+  save_info
+}
+
+
 choose_ports() {
   local p
-  # Xray 端口
+  # Xray / 落地机端口（关掉 Reality 时保留原端口，方便以后再打开）
+  if (( LAND_MODE || REALITY_ENABLED )); then
   p=${OPT_PORT:-$XRAY_PORT}
   while :; do
     if [[ -z $OPT_PORT ]]; then ask p "${XRAY_LABEL:-VLESS-REALITY} 监听端口 ($( ((LAND_MODE)) && echo TCP+UDP || echo TCP))" "$p"; p=$(sanitize_port_input "$p"); p=${p// /}; fi
@@ -3341,13 +4112,14 @@ choose_ports() {
     if check_port_free tcp "$p" "xray" && { (( ! LAND_MODE )) || check_port_free udp "$p" "xray"; }; then XRAY_PORT=$p; break; fi
     (( OPT_AUTO )) || [[ -n $OPT_PORT ]] && die "端口 $p 已被占用，请释放或使用 --port 指定其它端口。"
   done
+  fi
   (( ! LAND_MODE )) || { HY2_ENABLED=0; return 0; }
   # Hysteria2
   if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
   elif (( ! OPT_AUTO )); then
     if confirm "是否同时安装 Hysteria2（UDP，弱网/高丢包下表现更好）？" "$([[ $HY2_ENABLED == 1 ]] && echo y || echo n)"; then HY2_ENABLED=1; else HY2_ENABLED=0; fi
   fi
-  (( HY2_ENABLED )) || return 0
+  if (( ! HY2_ENABLED )); then HOP_RANGE=""; else
   p=${OPT_HY2_PORT:-$HY2_PORT}
   while :; do
     [[ -z $OPT_HY2_PORT ]] && { ask p "Hysteria2 监听端口 (UDP)" "$p"; p=$(sanitize_port_input "$p"); p=${p// /}; }
@@ -3369,6 +4141,8 @@ choose_ports() {
     fi
     (( OPT_AUTO )) || [[ -n $OPT_HOP ]] && die "端口跳跃范围无效: $hop"
   done
+  fi
+  choose_extra_local
 }
 
 # ============================================================
@@ -3496,7 +4270,7 @@ nat_busy_ext_ports() {
                ss -Hulnp 2>/dev/null | awk '!/"hysteria"/{n=split($4,a,":"); print a[n]}'; } | sort -un); do
     [[ $p =~ ^[0-9]+$ ]] || continue
     # 本脚本自己的服务（ss 看不到进程名时也要识别出来）
-    if [[ $p == "$XRAY_PORT" || $p == "$HY2_PORT" ]] && { svc_active xray || svc_active hysteria-server; }; then continue; fi
+    if [[ $p == "$XRAY_PORT" || $p == "$HY2_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || $p == "$TUIC_PORT" ]] && { svc_active xray || svc_active hysteria-server || svc_active sing-box; }; then continue; fi
     e=$(int2ext "$p") && out+="$e "
   done
   printf '%s' "${out% }"
@@ -3519,8 +4293,20 @@ valid_segs() {
   [[ -n $1 && $1 =~ ^[0-9,-]+$ ]] || return 1
   for seg in ${1//,/ }; do parse_port_span "$seg" >/dev/null || return 1; done
 }
-# 端口跳跃可用的外部端口：已映射、未排除、不是 Reality 独占的端口
-nat_hop_ok() { nat_usable "$1" && { (( $1 != XRAY_EXT_PORT )) || (( $1 == HY2_EXT_PORT )); }; }
+# 端口跳跃可用的外部端口：已映射、未排除、不是某个 TCP 协议独占的端口
+# （Reality 与 Hy2 共用同一外部端口时仍可跳跃，与旧版一致）
+nat_hop_ok() {
+  nat_usable "$1" || return 1
+  local blocked=0
+  if (( REALITY_ENABLED )) && [[ -n ${XRAY_EXT_PORT:-} && $1 == "$XRAY_EXT_PORT" ]]; then blocked=1; fi
+  if (( XHTTP_ENABLED )) && [[ -n ${XHTTP_EXT_PORT:-} && $1 == "$XHTTP_EXT_PORT" ]]; then blocked=1; fi
+  if (( TROJAN_ENABLED )) && [[ -n ${TROJAN_EXT_PORT:-} && $1 == "$TROJAN_EXT_PORT" ]]; then blocked=1; fi
+  if (( ANYTLS_ENABLED )) && [[ -n ${ANYTLS_EXT_PORT:-} && $1 == "$ANYTLS_EXT_PORT" ]]; then blocked=1; fi
+  if (( ! blocked )); then return 0; fi
+  if (( HY2_ENABLED )) && [[ $1 == "${HY2_EXT_PORT:-}" ]]; then return 0; fi
+  if (( TUIC_ENABLED )) && [[ $1 == "${TUIC_EXT_PORT:-}" ]]; then return 0; fi
+  return 1
+}
 nat_hop_filter() { # 输出过滤后的外部端口段（自动拆分）
   local q
   segs_expand "$1" | sort -un | while read -r q; do nat_hop_ok "$q" && echo "$q"; done | segs_compress
@@ -3610,9 +4396,12 @@ nat_ask_internal() {
 
 # 从 --port / --hy2-port（外部[:内部]）推导映射列表
 nat_ports_from_opts() {
-  local l=""
-  [[ -n $OPT_PORT ]] && l=$OPT_PORT
-  [[ -n $OPT_HY2_PORT && $OPT_HY2_PORT != "$OPT_PORT" ]] && l+="${l:+,}$OPT_HY2_PORT"
+  local l="" x
+  for x in "$OPT_PORT" "$OPT_HY2_PORT" "$OPT_XHTTP_PORT" "$OPT_TROJAN_PORT" "$OPT_TUIC_PORT" "$OPT_ANYTLS_PORT"; do
+    [[ -n $x ]] || continue
+    [[ ",$l," == *",$x,"* ]] && continue
+    l+="${l:+,}$x"
+  done
   printf '%s' "$l"
 }
 opt_ext() { printf '%s' "${1%%:*}"; }   # "52430:443" → 52430
@@ -3667,7 +4456,10 @@ choose_nat_ports() {
   [[ -n $NAT_EXCLUDE ]] && info "排除的外部端口: ${NAT_EXCLUDE}"
   nat_first_usable >/dev/null || die "映射端口 ${NAT_PORTS} 中没有可用端口（全部被排除）。"
 
-  # 3) VLESS-REALITY（TCP）
+  # 3) VLESS-REALITY（TCP）。落地机始终走这里；节点模式在关掉 Reality 时跳过
+  if (( ! LAND_MODE && ! REALITY_ENABLED )); then
+    XRAY_EXT_PORT=""
+  else
   def=$(opt_ext "${OPT_PORT:-}")
   if [[ -z $def ]]; then
     if nat_usable "${XRAY_EXT_PORT:-0}"; then def=$XRAY_EXT_PORT; else def=$(nat_first_usable); fi
@@ -3682,6 +4474,7 @@ choose_nat_ports() {
     { [[ -n $OPT_PORT ]] || (( OPT_AUTO )); } && die "无法使用外部端口 ${p} 作为 ${XRAY_LABEL:-VLESS-REALITY} 端口（NAT 模式下 --port 表示外部端口，需包含在 --nat-ports 中）。"
     def=$(nat_first_usable "$p") || def=""
   done
+  fi
   if (( LAND_MODE )); then # 落地机：只有一个 SS2022 端口（TCP+UDP）
     check_port_free udp "$XRAY_PORT" "xray" || warn "UDP ${XRAY_PORT} 已被占用，Shadowsocks 的 UDP 转发可能无法使用。"
     HY2_ENABLED=0 HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT="" HOP_BACKEND=""
@@ -3693,7 +4486,7 @@ choose_nat_ports() {
   elif (( ! OPT_AUTO )); then
     if confirm "是否同时安装 Hysteria2（UDP；需要服务商映射 UDP）？" "$([[ $HY2_ENABLED == 1 ]] && echo y || echo n)"; then HY2_ENABLED=1; else HY2_ENABLED=0; fi
   fi
-  (( HY2_ENABLED )) || { HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT=""; return 0; }
+  if (( ! HY2_ENABLED )); then HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT="" HOP_BACKEND=""; else
   local other share
   other=$(nat_first_usable "$XRAY_EXT_PORT") || other=""
   if [[ -n $OPT_HY2_PORT ]]; then share=0; [[ $(opt_ext "$OPT_HY2_PORT") == "$XRAY_EXT_PORT" ]] && share=1
@@ -3703,17 +4496,20 @@ choose_nat_ports() {
     local sdef=y; [[ -n $HY2_EXT_PORT && $HY2_EXT_PORT != "$XRAY_EXT_PORT" ]] && sdef=n
     if confirm "服务商的映射是否同时转发 TCP 和 UDP？是则 Hysteria2 与 Reality 共用外部端口 ${XRAY_EXT_PORT}（节省映射名额）" "$sdef"; then share=1; else share=0; fi
   fi
+  if (( ! REALITY_ENABLED )); then share=0; [[ -n $other ]] || other=$(nat_first_usable || true); fi
   if (( share )); then
     def=$XRAY_EXT_PORT
     [[ -z $OPT_NAT_SHARE && -z $OPT_HY2_PORT ]] && info "默认 Hysteria2 与 Reality 共用外部端口 ${XRAY_EXT_PORT}（需服务商同时映射 TCP+UDP；如只映射 TCP，请加 --nat-no-share 并提供第二个端口）。"
   else
     if [[ -z $other ]]; then
       warn "没有第二个可用映射端口，且未确认 TCP+UDP 共用，已关闭 Hysteria2。"
-      HY2_ENABLED=0 HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT=""; return 0
+      HY2_ENABLED=0 HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT="" HOP_BACKEND=""
+    else
+      def=$other
+      nat_usable "${HY2_EXT_PORT:-0}" && [[ $HY2_EXT_PORT != "$XRAY_EXT_PORT" ]] && def=$HY2_EXT_PORT
     fi
-    def=$other
-    nat_usable "${HY2_EXT_PORT:-0}" && [[ $HY2_EXT_PORT != "$XRAY_EXT_PORT" ]] && def=$HY2_EXT_PORT
   fi
+  if (( HY2_ENABLED )); then
   [[ -n $OPT_HY2_PORT ]] && def=$(opt_ext "$OPT_HY2_PORT")
   while :; do
     if [[ -n $OPT_HY2_PORT ]] || (( OPT_AUTO )); then p=$def
@@ -3763,6 +4559,9 @@ choose_nat_ports() {
   else
     HOP_BACKEND=""
   fi
+  fi
+  fi
+  choose_extra_nat
 }
 
 # NAT 模式说明：为什么跳过调优 / 防火墙 / fail2ban / Swap
@@ -3828,14 +4627,17 @@ do_install() {
   preflight      # decide_nat_mode：命令行 / 菜单设置 / Alpine / 已安装 / 自动检测，端口设置前确定 NAT_MODE
   resolve_mode
   take_lock
-  if (( was_land )); then
-    info "由落地机改装为 Reality / Hysteria2 节点：移除落地机白名单规则，停止 Shadowsocks，重新生成节点配置。"
+    if (( was_land )); then
+    info "由落地机改装为 Reality / XHTTP / Hysteria2 节点：移除落地机白名单规则，停止 Shadowsocks，重新生成节点配置。"
     land_fw_remove
     if is_openrc; then rc-service xray stop >/dev/null 2>&1 9>&- || true   # 避免旧的 SS 端口被当作「其它已监听端口」放行
     else systemctl stop xray >/dev/null 2>&1 || true; fi
     HY2_ENABLED=1
+    REALITY_ENABLED=1
+    [[ -n $OPT_XHTTP ]] || XHTTP_ENABLED=1
     if (( ! NAT_MODE )); then XRAY_PORT=443 HY2_PORT=443 HOP_RANGE="20000-50000"; fi
   fi
+  resolve_install_protos
   if (( INSTALLED )) && (( ! OPT_AUTO )); then
     warn "检测到已安装。重新安装将保留现有密钥/UUID/密码，仅更新组件与配置。"
     confirm "继续重新安装？" y || return 0
@@ -3865,6 +4667,7 @@ do_install() {
   else
     choose_ports
     NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE="" HOP_BACKEND=""
+    XHTTP_EXT_PORT="" TROJAN_EXT_PORT="" TUIC_EXT_PORT="" ANYTLS_EXT_PORT=""
     remove_nat_hop
   fi
   [[ -n $OPT_NAME ]] && NODE_NAME=$OPT_NAME
@@ -3908,17 +4711,36 @@ do_install() {
   mldsa_decide
   save_state
 
-  write_xray_config
-  restart_xray
+  ensure_proto_secrets
+  save_state
+  if xray_inbound_needed; then
+    local rc=0
+    write_xray_config || rc=$?
+    if (( rc == 2 )); then svc_disable_stop xray
+    elif (( rc != 0 )); then exit "$rc"
+    else restart_xray; fi
+  else
+    info "未启用 Xray 入站，停止 Xray（UUID / 密钥保留）。"
+    svc_disable_stop xray
+  fi
 
   if (( HY2_ENABLED )); then
     install_hysteria
     write_hy2_config
     save_state
     restart_hy2
-  elif [[ -x $HY_BIN ]]; then
+  elif [[ -x $HY_BIN || -f $HY_UNIT || -f $HY_RC ]]; then
     info "已关闭 Hysteria2，移除相关组件 ..."
     remove_hysteria
+  fi
+  if sb_needed; then
+    install_singbox
+    write_singbox_config
+    save_state
+    restart_singbox
+  elif [[ -x $SB_BIN || -f $SB_UNIT || -f $SB_RC ]]; then
+    info "已关闭 TUIC / AnyTLS，停止 sing-box（密码保留）。"
+    svc_disable_stop sing-box
   fi
 
   apply_firewall
@@ -3926,11 +4748,15 @@ do_install() {
   INSTALLED=1
   save_state
   self_install
-  ( trap - ERR; set +e; reality_selftest ) || true
+  ( trap - ERR; set +e; reality_selftest; xhttp_selftest ) || true
   show_info
   cloud_fw_reminder
   echo
-  _green "安装完成！客户端配置方法见 README；管理菜单：proxy"
+  echo
+  ui_bar '═' 62
+  ui_center "安装完成" 62
+  printf '%s管理菜单：proxy%s\n' "$C_OK" "$C_NONE"
+  ui_bar '═' 62
 }
 
 # ============================================================
@@ -3940,6 +4766,7 @@ do_install() {
 # （VLESS + Vision + REALITY + pqv）连接本机 127.0.0.1:XRAY_PORT，再经它访问外网。
 # 只打印结果，不影响安装；客户端限制 GOMEMLIMIT，128MB 小鸡也可运行。
 reality_selftest() {
+  (( ${REALITY_ENABLED:-1} )) || return 0
   [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XRAY_PORT ]] || { warn "跳过 REALITY 自检（缺少 xray 或参数）。"; return 0; }
   mktmp
   local dir port="" i pid code="" url ok_url="" rc=1
@@ -4002,6 +4829,62 @@ reality_selftest() {
       warn "  可查看: proxy status（Xray 日志），或更换 SNI: proxy sni"
       grep -vi 'privatekey\|seed' "${dir}/client.log" 2>/dev/null | tail -n 3 | sed 's/^/    /' || true
     fi
+  fi
+  rm -rf "$dir"
+  return 0
+}
+
+xhttp_selftest() {
+  (( ${XHTTP_ENABLED:-0} )) || return 0
+  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PORT && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
+  mktmp
+  local dir port="" i pid code="" url ok_url="" rc=1
+  dir=$(mktemp -d "${TMP_DIR}/xhttp-self.XXXXXX") || { warn "跳过 XHTTP 自检（无法创建临时目录）。"; return 0; }
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    port=$(( 20000 + RANDOM % 40000 ))
+    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "${HY2_PORT:-}" ]] && continue
+    port_in_use tcp "$port" || break
+  done
+  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$XHTTP_PORT" --arg sni "$SNI" \
+      --arg pbk "$PUB_KEY" --arg sid "$SHORT_ID" --arg path "$XHTTP_PATH" \
+      --arg pqv "$(pqv_active && printf '%s' "$MLDSA_VERIFY")" '
+    {
+      log: {loglevel: "warning"},
+      inbounds: [{listen: "127.0.0.1", port: $sport, protocol: "socks", settings: {udp: false}}],
+      outbounds: [{
+        protocol: "vless",
+        settings: {vnext: [{address: "127.0.0.1", port: $port, users: [{id: $id, encryption: "none", flow: ""}]}]},
+        streamSettings: {network: "xhttp", security: "reality",
+          xhttpSettings: {path: $path, mode: "stream-one"},
+          realitySettings: ({serverName: $sni, fingerprint: "chrome", publicKey: $pbk, shortId: $sid}
+            + (if $pqv != "" then {mldsa65Verify: $pqv} else {} end))}
+      }]
+    }' >"${dir}/client.json" 2>/dev/null; then
+    rm -rf "$dir"; warn "跳过 XHTTP 自检（生成临时配置失败）。"; return 0
+  fi
+  chmod 600 "${dir}/client.json"
+  info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${XHTTP_PORT}（mode stream-one，SNI ${SNI}）..."
+  env GOMEMLIMIT=24MiB GOGC=50 "$XRAY_BIN" run -config "${dir}/client.json" >"${dir}/client.log" 2>&1 &
+  pid=$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    kill -0 "$pid" 2>/dev/null || break
+    port_in_use tcp "$port" && break
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    for url in "https://www.gstatic.com/generate_204" "https://cp.cloudflare.com/generate_204" "https://www.apple.com/library/test/success.html"; do
+      code=$(curl -s -o /dev/null --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" -w '%{http_code}' "$url" 2>/dev/null) || true
+      if [[ $code =~ ^[23][0-9][0-9]$ ]]; then rc=0 ok_url=$url; break; fi
+    done
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if (( rc == 0 )); then
+    local h=${ok_url#https://}; h=${h%%/*}
+    ok "XHTTP 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
+  else
+    warn "XHTTP 自检未通过。可查看 proxy status；客户端链接里的 mode 必须是 stream-one，path 必须与服务端一致。"
+    grep -vi 'privatekey\|seed' "${dir}/client.log" 2>/dev/null | tail -n 3 | sed 's/^/    /' || true
   fi
   rm -rf "$dir"
   return 0
@@ -4116,26 +4999,25 @@ land_outbound_json() { # $1 方法 $2 密钥 $3 地址 $4 端口 $5 tag
     '{tag: $t, protocol: "shadowsocks", settings: {servers: [{address: $a, port: $p, method: $m, password: $k}]}}'
 }
 
-land_build_info() {
-  local link; link=$(land_link)
-  echo "================ proxy-oneclick 落地机信息 ================"
-  echo "生成时间: $(date '+%F %T %Z')"
-  echo "协议:     Shadowsocks 2022（Xray，TCP+UDP）"
-  echo "地址:     $(server_addr)   端口: $(pub_xray_port)$( ((NAT_MODE)) && echo "（本机监听 ${XRAY_PORT}）")"
-  echo "加密:     ${LAND_METHOD}"
-  echo "密钥:     ${LAND_KEY}"
-  echo "白名单:   ${LAND_ALLOW:-未设置（任何 IP 均可连接，建议只允许中转机）}"
+land_print_links() { # $1=1 屏幕着色
+  local paint=${1:-0} link
+  link=$(land_link)
+  node_link_head "$paint" "Shadowsocks 2022" "$NODE_NAME" "$(server_addr)" "$(pub_xray_port)  TCP+UDP"
+  node_link_note "$paint" "$LAND_METHOD"
+  if [[ -n $LAND_ALLOW ]]; then node_link_note "$paint" "来源白名单  ${LAND_ALLOW}"
+  else node_link_note "$paint" "来源白名单未设置，建议 proxy allow 只允许中转机"; fi
+  node_link_uri "$link"
   echo
-  echo "---------- ss:// 链接（SIP002）----------"
-  echo "$link"
+  ui_bar '─' 62 "$paint"
+  if (( paint )); then printf '%s中转机命令%s\n' "$C_TITLE" "$C_NONE"; else echo "中转机命令"; fi
+  printf "proxy land-add '%s'\n" "$link"
   echo
-  echo "---------- 中转机一键命令（中转机需已用本脚本安装节点）----------"
-  echo "proxy land-add '${link}'"
-  echo
-  echo "---------- Xray 出站（outbound）片段：可直接粘贴到其它 Xray 中转配置的 outbounds ----------"
+  ui_bar '─' 62 "$paint"
+  if (( paint )); then printf '%sXray 出站%s\n' "$C_TITLE" "$C_NONE"; else echo "Xray 出站"; fi
   land_outbound_json "$LAND_METHOD" "$LAND_KEY" "$(server_addr)" "$(pub_xray_port)" "$(land_tag_of "$NODE_NAME" "$(server_addr)")"
   echo
-  echo "---------- mihomo (Clash.Meta) ----------"
+  ui_bar '─' 62 "$paint"
+  if (( paint )); then printf '%smihomo / Clash.Meta%s\n' "$C_TITLE" "$C_NONE"; else echo "mihomo / Clash.Meta"; fi
   cat <<Y
 proxies:
   - name: "${NODE_NAME}"
@@ -4146,27 +5028,26 @@ proxies:
     password: "${LAND_KEY}"
     udp: true
 Y
-  echo "========================================================"
+}
+land_build_info() {
+  echo "proxy-oneclick 落地机信息"
+  echo "生成时间  $(date '+%F %T %Z')"
+  echo "服务器    $(server_addr)"
+  land_print_links 0
+  echo
+  ui_bar '─' 62 0
 }
 land_show_info() {
   load_state
   (( INSTALLED && LAND_MODE )) || die "本机尚未安装为落地机。"
   land_build_info >"${INFO_FILE}.tmp"; chmod 600 "${INFO_FILE}.tmp"; mv -f "${INFO_FILE}.tmp" "$INFO_FILE"
-  local link; link=$(land_link)
   echo
-  hr; _green "  落地机  Shadowsocks 2022 (${LAND_METHOD})"; hr
-  printf '  地址: %s  端口: %s (TCP+UDP)%s\n' "$(server_addr)" "$(pub_xray_port)" "$( ((NAT_MODE)) && echo "  本机监听: ${XRAY_PORT}")"
-  printf '  密钥: %s\n' "$LAND_KEY"
-  if [[ -n $LAND_ALLOW ]]; then printf '  来源白名单: %s%s\n' "$LAND_ALLOW" "$(land_fw_active && echo '（Xray 路由 + nftables）' || echo '（Xray 路由）')"
-  else printf '  来源白名单: %s未设置%s（任何人拿到链接都能用；建议 proxy allow 设置为中转机 IP）\n' "$C_YELLOW" "$C_NONE"; fi
-  echo; _cyan "  ss:// 链接："; echo "$link"
-  echo; _cyan "  在中转机上执行（中转机需已用本脚本安装 Reality / Hy2 节点）："
-  echo "  proxy land-add '${link}'"
-  echo; _cyan "  Xray 出站片段（手动配置其它中转时粘贴到 outbounds，并设为默认出站）："
-  land_outbound_json "$LAND_METHOD" "$LAND_KEY" "$(server_addr)" "$(pub_xray_port)" "$(land_tag_of "$NODE_NAME" "$(server_addr)")"
-  echo; hr
-  printf '  以上信息已保存到 %s（权限 600）。随时执行 %sproxy info%s 再次查看。\n' "$INFO_FILE" "$C_GREEN" "$C_NONE"
-  hr
+  ui_logo
+  land_print_links 1
+  echo
+  ui_bar '═' 62
+  printf '以上信息已保存到 %s（权限 600）。再次查看：proxy info\n' "$INFO_FILE"
+  ui_bar '═' 62
 }
 
 # ---------- 落地机 nftables 白名单（非 NAT 容器且有 nft 时） ----------
@@ -4414,7 +5295,8 @@ do_install_land() {
 
   # 清理节点模式的组件（若之前装过）
   RELAY_ON=0
-  [[ -x $HY_BIN || -f $HY_UNIT || -f $HY_RC ]] && { info "移除 Hysteria2 ..."; remove_hysteria; }
+  [[ -x $HY_BIN || -f $HY_UNIT || -f $HY_RC ]] && { info "移除 Hysteria2 ..."; remove_hysteria purge; }
+  [[ -x $SB_BIN || -f $SB_UNIT || -f $SB_RC ]] && { info "移除 sing-box（TUIC / AnyTLS）..."; remove_singbox; }
   remove_nat_hop
   if [[ -f $FW_FILE || -f $FW_UNIT ]]; then info "移除节点模式的 nftables 规则 ..."; remove_firewall; fi
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; fi
@@ -4671,16 +5553,7 @@ need_installed() {
 apply_all() { # 重新生成配置并重启（在修改参数后调用）
   if (( LAND_MODE )); then land_apply; return; fi
   save_state
-  if direct_mode; then
-    write_xray_service
-    (( HY2_ENABLED )) && [[ -x $HY_BIN ]] && write_hy2_service
-  fi
-  write_xray_config
-  restart_xray
-  if (( HY2_ENABLED )); then write_hy2_config; restart_hy2; fi
-  apply_firewall
-  save_state
-  save_info
+  apply_proto_services
 }
 
 menu_change_sni() {
@@ -4701,11 +5574,15 @@ menu_change_sni() {
 menu_regen_keys() {
   need_installed
   if (( LAND_MODE )); then land_menu_key; return; fi
-  warn "将重新生成 UUID、x25519 密钥、ShortId、ML-DSA-65 密钥及 Hysteria2 密码/证书，所有旧客户端将失效！"
+  warn "将重新生成 UUID、x25519 密钥、ShortId、ML-DSA-65 密钥、XHTTP 路径，以及 Hysteria2 / Trojan / TUIC / AnyTLS 密码。所有旧客户端将失效。已关闭的协议也会换新密钥，但不会被重新打开。"
   (( OPT_AUTO )) || confirm "确认重新生成？" n || return 0
   gen_xray_keys
   HY2_PASS=$(rand_pass)
-  if (( HY2_ENABLED )); then gen_hy2_cert; fi
+  XHTTP_PATH="/$(rand_hex 8)"
+  TROJAN_PASS=$(rand_pass)
+  TUIC_PASS=$(rand_pass)
+  ANYTLS_PASS=$(rand_pass)
+  if (( HY2_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )); then gen_hy2_cert; fi
   apply_all
   ok "已重新生成全部密钥。"
   show_info
@@ -4720,6 +5597,8 @@ menu_change_ports() {
   choose_ports_interactive
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
+  if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
+  if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
   ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}$( ((HY2_ENABLED)) && echo "，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}")"
   cloud_fw_reminder
@@ -4734,6 +5613,8 @@ menu_change_ports_nat() {
   OPT_PORT=$s1 OPT_HY2_PORT=$s2 OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
+  if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
+  if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
   ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}$( ((HY2_ENABLED)) && echo "，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}")"
   cloud_fw_reminder
@@ -4770,16 +5651,26 @@ menu_users() {
         [[ -n $nu ]] || nu=$("$XRAY_BIN" uuid)
         [[ $nu =~ ^[0-9a-fA-F-]{36}$ ]] || { warn "UUID 格式无效。"; continue; }
         printf '%s\t%s\n' "$nu" "$remark" >>"$USERS_FILE"; chmod 600 "$USERS_FILE"
-        write_xray_config; restart_xray; save_info
+        if xray_inbound_needed; then write_xray_config; restart_xray; fi
+        save_info
         ok "已添加用户 ${remark}"
-        vless_link "$nu" "${NODE_NAME}-${remark}" 0; echo
-        print_qr "$(vless_link "$nu" "${NODE_NAME}-${remark}" 0)" ;;
+        if (( REALITY_ENABLED )); then
+          node_link_head 1 "额外用户 ${remark} · Reality" "${NODE_NAME}-${remark}" "$(server_addr)" "$(pub_xray_port)  TCP"
+          node_link_uri "$(vless_link "$nu" "${NODE_NAME}-${remark}" 0)"
+          echo; print_qr "$(vless_link "$nu" "${NODE_NAME}-${remark}" 0)"
+        fi
+        if (( XHTTP_ENABLED )); then
+          node_link_head 1 "额外用户 ${remark} · XHTTP" "${NODE_NAME}-XHTTP-${remark}" "$(server_addr)" "$(pub_xhttp_port)  TCP"
+          node_link_uri "$(vless_xhttp_link "$nu" "${NODE_NAME}-XHTTP-${remark}" 0)"
+          echo; print_qr "$(vless_xhttp_link "$nu" "${NODE_NAME}-XHTTP-${remark}" 0)"
+        fi ;;
       2)
         (( i > 0 )) || { warn "没有可删除的用户。"; continue; }
         local n; ask n "输入要删除的序号" ""
         if ! [[ $n =~ ^[0-9]+$ ]] || (( n < 1 || n > i )); then warn "序号无效。"; continue; fi
         sed -i "${n}d" "$USERS_FILE"
-        write_xray_config; restart_xray; save_info
+        if xray_inbound_needed; then write_xray_config; restart_xray; fi
+        save_info
         ok "已删除。" ;;
       3)
         (( i > 0 )) || { warn "没有额外用户。"; continue; }
@@ -4799,11 +5690,13 @@ menu_update() {
   echo "  1) 更新 Xray-core   2) 更新 Hysteria2   3) 更新本脚本   4) 全部更新   0) 返回"
   local c; ask c "请选择" "4"
   case $c in
-    1) install_xray; write_xray_config; restart_xray ;;
+    1) install_xray; if xray_inbound_needed; then write_xray_config; restart_xray; else info "当前没有 Xray 入站，已跳过。"; fi ;;
     2) (( HY2_ENABLED )) || { warn "未启用 Hysteria2。"; return 0; }; install_hysteria; write_hy2_config; restart_hy2 ;;
     3) update_script ;;
-    4) install_xray; write_xray_config; restart_xray
+    4) install_xray
+       if xray_inbound_needed; then write_xray_config; restart_xray; fi
        if (( HY2_ENABLED )); then install_hysteria; write_hy2_config; restart_hy2; fi
+       if sb_needed; then install_singbox; write_singbox_config; restart_singbox; fi
        update_script ;;
     *) return 0 ;;
   esac
@@ -4837,8 +5730,8 @@ menu_status() {
   load_state
   [[ -n $INIT_SYS ]] || detect_init
   echo; hr; _green "  服务状态$( ((LAND_MODE)) && echo '（落地机）')$( ((NAT_MODE)) && echo '（NAT 模式）')"; hr
-  local s svcs="xray hysteria-server proxy-oneclick-fw fail2ban"
-  if (( NAT_MODE )); then svcs="xray hysteria-server"; [[ -n $HOP_RANGE ]] && svcs+=" proxy-oneclick-hop"; fi
+  local s svcs="xray hysteria-server sing-box proxy-oneclick-fw fail2ban"
+  if (( NAT_MODE )); then svcs="xray hysteria-server sing-box"; [[ -n $HOP_RANGE ]] && svcs+=" proxy-oneclick-hop"; fi
   if (( LAND_MODE )); then svcs="xray"; [[ -f $LAND_FW_UNIT || -f $LAND_FW_RC ]] && svcs+=" proxy-oneclick-land-fw"; fi
   for s in $svcs; do
     local st; st=$(svc_state "$s")
@@ -4849,6 +5742,19 @@ menu_status() {
   done
   [[ -x $XRAY_BIN ]] && printf '  Xray 版本:      %s\n' "$("$XRAY_BIN" version | awk 'NR==1{print $2}')"
   [[ -x $HY_BIN ]] && printf '  Hysteria2 版本: %s\n' "$("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
+  [[ -x $SB_BIN ]] && printf '  sing-box 版本:  %s\n' "$("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')"
+  if (( ! LAND_MODE )); then
+    echo
+    printf '%s已装协议%s\n' "$C_TITLE" "$C_NONE"
+    ui_proto_line "$REALITY_ENABLED" "VLESS + REALITY + Vision" "TCP $(pub_xray_port)"
+    ui_proto_line "$XHTTP_ENABLED" "VLESS + XHTTP + REALITY" "TCP $(pub_xhttp_port)"
+    ui_proto_line "$HY2_ENABLED" "Hysteria2" "UDP $(pub_hy2_port)"
+    hr
+    printf '%s可选协议%s\n' "$C_TITLE" "$C_NONE"
+    ui_proto_line "$TROJAN_ENABLED" "Trojan + REALITY" "TCP $(pub_trojan_port)"
+    ui_proto_line "$TUIC_ENABLED" "TUIC v5" "UDP $(pub_tuic_port)"
+    ui_proto_line "$ANYTLS_ENABLED" "AnyTLS" "TCP $(pub_anytls_port)"
+  fi
   if (( LAND_MODE )); then
     printf '  落地机:         Shadowsocks 2022 %s，端口 %s (TCP+UDP)%s\n' "$LAND_METHOD" "$(pub_xray_port)" "$( ((NAT_MODE)) && echo " → 本机 ${XRAY_PORT}")"
     printf '  来源白名单:     %s\n' "${LAND_ALLOW:-未设置（不限制）}$([[ -n $LAND_ALLOW ]] && { land_fw_active && echo '（Xray 路由 + nftables）' || echo '（Xray 路由）'; })"
@@ -4906,12 +5812,16 @@ menu_status() {
 nat_status_lines() {
   printf '  公网地址:       %s\n' "${SERVER_ADDR:-未设置}"
   printf '  映射端口:       %s%s\n' "${NAT_PORTS:-未设置}" "${NAT_EXCLUDE:+（排除 ${NAT_EXCLUDE}）}"
-  printf '  Reality:        外部 TCP %s → 本机 %s\n' "${XRAY_EXT_PORT:-?}" "$XRAY_PORT"
+  (( REALITY_ENABLED )) && printf '  Reality:        外部 TCP %s → 本机 %s\n' "${XRAY_EXT_PORT:-?}" "$XRAY_PORT"
+  (( XHTTP_ENABLED )) && printf '  XHTTP:          外部 TCP %s → 本机 %s\n' "${XHTTP_EXT_PORT:-?}" "$XHTTP_PORT"
+  (( TROJAN_ENABLED )) && printf '  Trojan:         外部 TCP %s → 本机 %s\n' "${TROJAN_EXT_PORT:-?}" "$TROJAN_PORT"
+  (( ANYTLS_ENABLED )) && printf '  AnyTLS:         外部 TCP %s → 本机 %s\n' "${ANYTLS_EXT_PORT:-?}" "$ANYTLS_PORT"
   if (( HY2_ENABLED )); then
     printf '  Hysteria2:      外部 UDP %s → 本机 %s%s\n' "${HY2_EXT_PORT:-?}" "$HY2_PORT" "$([[ $HY2_EXT_PORT == "$XRAY_EXT_PORT" ]] && echo '（与 Reality 共用端口）')"
     if [[ -n $HOP_RANGE ]]; then printf '  端口跳跃:       外部 UDP %s → 本机 %s（%s）\n' "$HOP_EXT_RANGE" "$HOP_RANGE" "${HOP_BACKEND:-?}"
     else printf '  端口跳跃:       关闭\n'; fi
   fi
+  (( TUIC_ENABLED )) && printf '  TUIC:           外部 UDP %s → 本机 %s\n' "${TUIC_EXT_PORT:-?}" "$TUIC_PORT"
   printf '  虚拟化 / init:  %s / %s\n' "${VIRT:-未知}" "${INIT_SYS:-未知}"
   local envs; envs=$(go_mem_env); envs=${envs//$'\n'/ }
   printf '  内存:           %s MB%s\n' "$(mem_limit_mb)" "${envs:+（${envs}）}"
@@ -5042,7 +5952,8 @@ do_uninstall() {
   rm -f "$XRAY_BIN"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
   sd_reload
   ok "Xray 已移除"
-  remove_hysteria; ok "Hysteria2 已移除"
+  remove_hysteria purge; ok "Hysteria2 已移除"
+  remove_singbox; ok "sing-box 已移除"
   remove_nat_hop
   remove_firewall; land_fw_remove; ok "防火墙 / 端口跳跃 / 落地机白名单规则已移除"
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; ok "fail2ban 规则已移除（fail2ban 软件包保留）"; fi
@@ -5075,6 +5986,82 @@ do_uninstall() {
 # ============================================================
 #                        菜单 / 参数
 # ============================================================
+proto_ensure_port() { # $1 reality|xhttp|hy2|trojan|tuic|anytls ；失败时调用方应把开关改回
+  local kind=$1
+  if (( NAT_MODE )); then
+    nat_seed_used
+    case $kind in
+      reality) NAT_USED_TCP=${NAT_USED_TCP// $XRAY_EXT_PORT /}; nat_pick_mapped tcp XRAY_EXT_PORT XRAY_PORT "" "VLESS-REALITY" "xray" ;;
+      xhttp) NAT_USED_TCP=${NAT_USED_TCP// $XHTTP_EXT_PORT /}; nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "" "VLESS-XHTTP（REALITY）" "xray" ;;
+      trojan) NAT_USED_TCP=${NAT_USED_TCP// $TROJAN_EXT_PORT /}; nat_pick_mapped tcp TROJAN_EXT_PORT TROJAN_PORT "" "Trojan（REALITY）" "xray" ;;
+      anytls) NAT_USED_TCP=${NAT_USED_TCP// $ANYTLS_EXT_PORT /}; nat_pick_mapped tcp ANYTLS_EXT_PORT ANYTLS_PORT "" "AnyTLS" "sing-box" ;;
+      hy2) NAT_USED_UDP=${NAT_USED_UDP// $HY2_EXT_PORT /}; nat_pick_mapped udp HY2_EXT_PORT HY2_PORT "" "Hysteria2" "hysteria" ;;
+      tuic) NAT_USED_UDP=${NAT_USED_UDP// $TUIC_EXT_PORT /}; nat_pick_mapped udp TUIC_EXT_PORT TUIC_PORT "" "TUIC v5" "sing-box" ;;
+    esac
+  else
+    local_seed_used
+    case $kind in
+      reality) LOCAL_USED_TCP=${LOCAL_USED_TCP// $XRAY_PORT /}; local_pick tcp XRAY_PORT "" "VLESS-REALITY" "xray" "${XRAY_PORT:-443}" ;;
+      xhttp) LOCAL_USED_TCP=${LOCAL_USED_TCP// $XHTTP_PORT /}; local_pick tcp XHTTP_PORT "" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}" ;;
+      trojan) LOCAL_USED_TCP=${LOCAL_USED_TCP// $TROJAN_PORT /}; local_pick tcp TROJAN_PORT "" "Trojan（REALITY）" "xray" "${TROJAN_PORT:-8444}" ;;
+      anytls) LOCAL_USED_TCP=${LOCAL_USED_TCP// $ANYTLS_PORT /}; local_pick tcp ANYTLS_PORT "" "AnyTLS" "sing-box" "${ANYTLS_PORT:-8445}" ;;
+      hy2) LOCAL_USED_UDP=${LOCAL_USED_UDP// $HY2_PORT /}; local_pick udp HY2_PORT "" "Hysteria2" "hysteria" "${HY2_PORT:-443}" ;;
+      tuic) LOCAL_USED_UDP=${LOCAL_USED_UDP// $TUIC_PORT /}; local_pick udp TUIC_PORT "" "TUIC v5" "sing-box" "${TUIC_PORT:-8446}" ;;
+    esac
+  fi
+}
+menu_proto() {
+  need_node
+  [[ -n $OS_ID ]] || detect_os
+  [[ -n $VIRT ]] || detect_virt
+  while :; do
+    local on=开 off=关
+    echo
+    ui_logo
+    printf '%s关闭只停止监听，不删除 UUID、密钥和密码。%s\n' "$C_DIM" "$C_NONE"
+    ui_columns "oneclick proxy" "返回" \
+      "VLESS + REALITY + Vision  $([[ $REALITY_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
+      "VLESS + XHTTP + REALITY  $([[ $XHTTP_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
+      "Hysteria2  $([[ $HY2_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
+      "Trojan + REALITY  $([[ $TROJAN_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
+      "TUIC v5  $([[ $TUIC_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
+      "AnyTLS  $([[ $ANYTLS_ENABLED == 1 ]] && echo "$on" || echo "$off")"
+    local c kind var
+    ask c "请选择" "0"
+    case $c in
+      1) kind=reality; var=REALITY_ENABLED ;;
+      2) kind=xhttp; var=XHTTP_ENABLED ;;
+      3) kind=hy2; var=HY2_ENABLED ;;
+      4) kind=trojan; var=TROJAN_ENABLED ;;
+      5) kind=tuic; var=TUIC_ENABLED ;;
+      6) kind=anytls; var=ANYTLS_ENABLED ;;
+      *) return 0 ;;
+    esac
+    if (( ${!var} )); then
+      printf -v "$var" 0
+      if ! proto_any_enabled; then
+        printf -v "$var" 1
+        warn "至少保留一个协议。"
+        continue
+      fi
+      info "已关闭（密钥保留）。"
+    else
+      printf -v "$var" 1
+      if ! proto_ensure_port "$kind"; then
+        printf -v "$var" 0
+        warn "没有可用端口，保持关闭。"
+        continue
+      fi
+      info "已开启。"
+    fi
+    if [[ $kind == hy2 && $HY2_ENABLED == 1 && ! -x $HY_BIN ]]; then install_hysteria; fi
+    if [[ $kind == hy2 && $HY2_ENABLED == 0 ]]; then svc_disable_stop hysteria-server; remove_nat_hop; fi
+    apply_proto_services
+    ok "协议状态已更新。"
+    show_info
+  done
+}
+
 show_menu() {
   load_state
   clear 2>/dev/null || true
@@ -5082,34 +6069,37 @@ show_menu() {
   if (( LAND_MODE )); then show_land_menu; return; fi
   local menu10="防火墙管理"; (( NAT_MODE )) && menu10="NAT 信息 / 端口跳跃"
   local mode_lbl; mode_lbl=$(nat_mode_label)
-  local st="${C_RED}未安装${C_NONE}"
-  if (( INSTALLED )); then
-    if svc_active xray; then st="${C_GREEN}运行中${C_NONE}"; else st="${C_YELLOW}已安装 (Xray 未运行)${C_NONE}"; fi
-  fi
-  cat <<MENU
-${C_CYAN}============================================================${C_NONE}
-   ${C_BOLD}proxy 一键脚本 v${SCRIPT_VERSION}${C_NONE}  VLESS-REALITY-Vision + Hysteria2
-   状态: ${st}${SNI:+   SNI: ${C_GREEN}${SNI}${C_NONE}}   模式: ${mode_lbl}$( ((NAT_MODE && INSTALLED)) && printf '\n   %sNAT 模式%s  地址: %s  映射: %s' "$C_YELLOW" "$C_NONE" "${SERVER_ADDR:-?}" "${NAT_PORTS:-?}")
-${C_CYAN}============================================================${C_NONE}
-   ${C_GREEN}1)${C_NONE} 安装 / 重新安装
-   ${C_GREEN}2)${C_NONE} 查看链接 / 二维码 / Clash 配置
-   ${C_GREEN}3)${C_NONE} 更换 SNI（重新优选目标网站）
-   ${C_GREEN}4)${C_NONE} 重新生成密钥 / UUID
-   ${C_GREEN}5)${C_NONE} 修改端口 / 端口跳跃
-   ${C_GREEN}6)${C_NONE} 用户管理（添加 / 删除）
-   ${C_GREEN}7)${C_NONE} 更新 Xray / Hysteria2 / 脚本
-   ${C_GREEN}8)${C_NONE} 运行状态 / 日志
-   ${C_GREEN}9)${C_NONE} 网络测速 / 延迟提示
-  ${C_GREEN}10)${C_NONE} ${menu10}
-  ${C_GREEN}11)${C_NONE} 网络调优（BBR / 队列算法 / 缓冲区 / 恢复）
-  ${C_GREEN}12)${C_NONE} 添加 / 修改落地转发（本机作中转，出口走落地机）
-  ${C_GREEN}13)${C_NONE} 安装为落地机（Shadowsocks 2022 出口，给其它中转机用）
-  ${C_GREEN}14)${C_NONE} 卸载
-  ${C_GREEN}15)${C_NONE} 切换 NAT 模式（当前: $(nat_pref_text)）
-   ${C_GREEN}0)${C_NONE} 退出
-${C_CYAN}------------------------------------------------------------${C_NONE}
-MENU
-  local c act=""; ask c "请输入数字" ""
+  local st_word
+  if (( ! INSTALLED )); then st_word="未安装"
+  elif svc_active xray || { (( HY2_ENABLED )) && svc_active hysteria-server; } || { sb_needed && svc_active sing-box; }; then
+    st_word="运行中"
+  else st_word="已安装"; fi
+  echo
+  ui_logo
+  echo
+  ui_stat_row "IP" "${SERVER_ADDR:-${PUBLIC_IP4:-${PUBLIC_IP6:-未检测}}}" "Xray" "$(ui_ver_plain "$XRAY_BIN" xray)"
+  ui_stat_row "Hysteria2" "$(ui_ver_plain "$HY_BIN" hy2)" "sing-box" "$(ui_ver_plain "$SB_BIN" sb)"
+  ui_stat_row "状态" "$st_word" "模式" "$mode_lbl"
+  [[ -n $SNI ]] && ui_stat_row "SNI" "$SNI"
+  (( NAT_MODE && INSTALLED )) && ui_stat_row "地址" "${SERVER_ADDR:-未设置}" "映射" "${NAT_PORTS:-未设置}"
+  ui_columns "oneclick proxy" "退出" \
+    "安装 / 重新安装" \
+    "查看链接 / 二维码 / Clash 配置" \
+    "更换 SNI（重新优选目标网站）" \
+    "重新生成密钥 / UUID" \
+    "修改端口 / 端口跳跃" \
+    "用户管理（添加 / 删除）" \
+    "更新 Xray / Hysteria2 / 脚本" \
+    "运行状态 / 日志" \
+    "网络测速 / 延迟提示" \
+    "$menu10" \
+    "网络调优（BBR / 队列算法 / 缓冲区 / 恢复）" \
+    "添加 / 修改落地转发（本机作中转，出口走落地机）" \
+    "安装为落地机（Shadowsocks 2022 出口，给其它中转机用）" \
+    "卸载" \
+    "切换 NAT 模式（当前: $(nat_pref_text)）" \
+    "协议开关"
+  local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
     1) act=do_install ;;
@@ -5127,6 +6117,7 @@ MENU
     13) OPT_LAND=1; act=do_install ;;
     14) act=do_uninstall ;;
     15) act=menu_nat_pref ;;
+    16) act=menu_proto ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -5147,31 +6138,30 @@ run_menu_act() {
 }
 
 show_land_menu() {
-  local st="${C_RED}未安装${C_NONE}"
-  if (( INSTALLED )); then
-    if svc_active xray; then st="${C_GREEN}运行中${C_NONE}"; else st="${C_YELLOW}已安装 (Xray 未运行)${C_NONE}"; fi
-  fi
-  cat <<MENU
-${C_CYAN}============================================================${C_NONE}
-   ${C_BOLD}proxy 一键脚本 v${SCRIPT_VERSION}${C_NONE}  ${C_YELLOW}落地机${C_NONE}（Shadowsocks 2022）
-   状态: ${st}   端口: $(pub_xray_port) (TCP+UDP)   加密: ${LAND_METHOD#2022-blake3-}
-   白名单: ${LAND_ALLOW:-未设置（不限制）}   模式: $(nat_mode_label)$( ((NAT_MODE)) && printf '\n   %sNAT 模式%s  地址: %s  映射: %s' "$C_YELLOW" "$C_NONE" "${SERVER_ADDR:-?}" "${NAT_PORTS:-?}")
-${C_CYAN}============================================================${C_NONE}
-   ${C_GREEN}1)${C_NONE} 安装 / 重新安装（落地机）
-   ${C_GREEN}2)${C_NONE} 查看 ss:// 链接 / 中转机命令 / Xray 出站片段
-   ${C_GREEN}3)${C_NONE} 修改来源 IP 白名单
-   ${C_GREEN}4)${C_NONE} 修改端口
-   ${C_GREEN}5)${C_NONE} 更换密钥 / 加密方式
-   ${C_GREEN}6)${C_NONE} 更新 Xray / 脚本
-   ${C_GREEN}7)${C_NONE} 运行状态 / 日志
-   ${C_GREEN}8)${C_NONE} 网络调优（BBR / 队列算法 / 缓冲区 / 恢复）
-   ${C_GREEN}9)${C_NONE} 改装为 Reality / Hysteria2 节点
-  ${C_GREEN}10)${C_NONE} 卸载
-  ${C_GREEN}11)${C_NONE} 切换 NAT 模式（当前: $(nat_pref_text)）
-   ${C_GREEN}0)${C_NONE} 退出
-${C_CYAN}------------------------------------------------------------${C_NONE}
-MENU
-  local c act=""; ask c "请输入数字" ""
+  local st_word
+  if (( ! INSTALLED )); then st_word="未安装"
+  elif svc_active xray; then st_word="运行中"
+  else st_word="已安装"; fi
+  echo
+  ui_logo
+  echo
+  ui_stat_row "IP" "${SERVER_ADDR:-${PUBLIC_IP4:-${PUBLIC_IP6:-未检测}}}" "Xray" "$(ui_ver_plain "$XRAY_BIN" xray)"
+  ui_stat_row "状态" "$st_word" "模式" "$(nat_mode_label)"
+  ui_stat_row "加密" "${LAND_METHOD#2022-blake3-}" "白名单" "${LAND_ALLOW:-未设置}"
+  (( NAT_MODE )) && ui_stat_row "地址" "${SERVER_ADDR:-未设置}" "映射" "${NAT_PORTS:-未设置}"
+  ui_columns "oneclick proxy" "退出" \
+    "安装 / 重新安装（落地机）" \
+    "查看 ss:// 链接 / 中转机命令 / Xray 出站片段" \
+    "修改来源 IP 白名单" \
+    "修改端口" \
+    "更换密钥 / 加密方式" \
+    "更新 Xray / 脚本" \
+    "运行状态 / 日志" \
+    "网络调优（BBR / 队列算法 / 缓冲区 / 恢复）" \
+    "改装为 Reality / Hysteria2 节点" \
+    "卸载" \
+    "切换 NAT 模式（当前: $(nat_pref_text)）"
+  local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
     1) act=do_install ;;
@@ -5193,7 +6183,7 @@ MENU
 
 usage() {
   cat <<USAGE
-proxy 一键脚本 v${SCRIPT_VERSION} —— VLESS + REALITY + Vision (ML-DSA-65) & Hysteria2
+哈人 / oneclick proxy v${SCRIPT_VERSION} —— VLESS + REALITY + XHTTP + Hysteria2
 
 用法: bash proxy.sh [选项]        （安装后可直接使用 proxy [命令/选项]）
 
@@ -5205,6 +6195,18 @@ proxy 一键脚本 v${SCRIPT_VERSION} —— VLESS + REALITY + Vision (ML-DSA-65
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
   --no-hy2            不安装 Hysteria2
   --hy2-port <端口>   Hysteria2 UDP 端口（默认 443）
+  --no-reality        不启用 VLESS + REALITY + Vision（默认启用）
+  --no-xhttp          不启用 VLESS + XHTTP + REALITY（默认启用，免自己的域名）
+  --xhttp-port <端口> XHTTP 的 TCP 端口（默认 8443；NAT 模式为外部端口）
+  --trojan            额外启用 Trojan + REALITY（默认不装）
+  --no-trojan         关闭 Trojan
+  --trojan-port <端口> Trojan TCP 端口（默认 8444）
+  --tuic              额外启用 TUIC v5（sing-box，自签证书，默认不装）
+  --no-tuic           关闭 TUIC
+  --tuic-port <端口>  TUIC UDP 端口（默认 8446）
+  --anytls            额外启用 AnyTLS（sing-box，自签证书，默认不装）
+  --no-anytls         关闭 AnyTLS
+  --anytls-port <端口> AnyTLS TCP 端口（默认 8445）
   --hop <a-b|none>    Hysteria2 端口跳跃范围（默认 20000-50000，none 关闭）
   --name <名称>       节点名称（默认 国家-城市）
   --no-firewall       不配置 nftables 防火墙
@@ -5261,6 +6263,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
 管理命令:
   proxy               打开交互菜单
   proxy info          查看链接 / 二维码 / mihomo 配置
+  proxy proto         单独打开或关闭协议（不删除已有密钥）
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
   proxy port          修改端口
@@ -5290,6 +6293,25 @@ parse_args() {
       --no-hy2) OPT_HY2=0 ;;
       --hy2) OPT_HY2=1 ;;
       --hy2-port) is_port_opt "${2-}" || die "--hy2-port 参数无效"; OPT_HY2_PORT=$2; shift ;;
+      --hy2-port=*) OPT_HY2_PORT=${1#*=}; is_port_opt "$OPT_HY2_PORT" || die "--hy2-port 参数无效" ;;
+      --reality) OPT_REALITY=1 ;;
+      --no-reality) OPT_REALITY=0 ;;
+      --xhttp) OPT_XHTTP=1 ;;
+      --no-xhttp) OPT_XHTTP=0 ;;
+      --xhttp-port) is_port_opt "${2-}" || die "--xhttp-port 参数无效"; OPT_XHTTP_PORT=$2; shift ;;
+      --xhttp-port=*) OPT_XHTTP_PORT=${1#*=}; is_port_opt "$OPT_XHTTP_PORT" || die "--xhttp-port 参数无效" ;;
+      --trojan) OPT_TROJAN=1 ;;
+      --no-trojan) OPT_TROJAN=0 ;;
+      --trojan-port) is_port_opt "${2-}" || die "--trojan-port 参数无效"; OPT_TROJAN_PORT=$2; shift ;;
+      --trojan-port=*) OPT_TROJAN_PORT=${1#*=}; is_port_opt "$OPT_TROJAN_PORT" || die "--trojan-port 参数无效" ;;
+      --tuic) OPT_TUIC=1 ;;
+      --no-tuic) OPT_TUIC=0 ;;
+      --tuic-port) is_port_opt "${2-}" || die "--tuic-port 参数无效"; OPT_TUIC_PORT=$2; shift ;;
+      --tuic-port=*) OPT_TUIC_PORT=${1#*=}; is_port_opt "$OPT_TUIC_PORT" || die "--tuic-port 参数无效" ;;
+      --anytls) OPT_ANYTLS=1 ;;
+      --no-anytls) OPT_ANYTLS=0 ;;
+      --anytls-port) is_port_opt "${2-}" || die "--anytls-port 参数无效"; OPT_ANYTLS_PORT=$2; shift ;;
+      --anytls-port=*) OPT_ANYTLS_PORT=${1#*=}; is_port_opt "$OPT_ANYTLS_PORT" || die "--anytls-port 参数无效" ;;
       --hop) [[ ${2-} == none ]] || is_range "${2-}" || valid_segs "${2-}" || die "--hop 参数无效（例如 20000-50000 或 none）"; OPT_HOP=$2; shift ;;
       --no-hop) OPT_HOP=none ;;
       --name) [[ -n ${2-} ]] || die "--name 需要参数"; OPT_NAME=$(tr -cd 'A-Za-z0-9_.-' <<<"$2"); shift ;;
@@ -5347,6 +6369,7 @@ parse_args() {
       -v|--version|version) echo "$SCRIPT_VERSION"; exit 0 ;;
       install) OPT_ACTION=install ;;
       info|link|links|qr) OPT_ACTION=info ;;
+      proto|protos|protocol) OPT_ACTION=proto ;;
       sni) OPT_ACTION=sni ;;
       regen|rekey) OPT_ACTION=regen ;;
       port|ports) OPT_ACTION=port ;;
@@ -5363,7 +6386,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT ]]; }; then
     OPT_ACTION=install
   fi
   # 只给了 --land-allow：修改落地机白名单
@@ -5376,6 +6399,10 @@ parse_args() {
   # 普通模式下 --port / --hy2-port 只接受单个端口；NAT 模式的 外部:内部 写法在安装时再校验
   if [[ $OPT_NAT != 1 ]]; then
     [[ -z $OPT_PORT || $OPT_PORT != *:* || -f $STATE_FILE ]] || die "--port 的 外部:内部 写法仅用于 NAT 模式（--nat）。"
+    local _po
+    for _po in "$OPT_HY2_PORT" "$OPT_XHTTP_PORT" "$OPT_TROJAN_PORT" "$OPT_TUIC_PORT" "$OPT_ANYTLS_PORT"; do
+      [[ -z $_po || $_po != *:* || -f $STATE_FILE ]] || die "外部:内部 端口写法仅用于 NAT 模式（--nat）。"
+    done
   fi
   return 0
 }
@@ -5405,6 +6432,7 @@ main() {
   case $OPT_ACTION in
     install) do_install ;;
     info) show_info ;;
+    proto) menu_proto ;;
     sni) menu_change_sni ;;
     regen) menu_regen_keys ;;
     port) menu_change_ports ;;
