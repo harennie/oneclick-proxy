@@ -1,6 +1,6 @@
 # oneclick proxy
 
-单文件 Bash 脚本，一键在 VPS 上安装代理节点，不需要自己的域名。有已经解析到本机的自有域名时，可以另外申请一张公开证书；不申请时，安装方式和现在一样。证书签好之后，还可以另开两条给 CDN 用的线路（XHTTP+TLS、WebSocket+TLS），默认关闭，不替换 REALITY。
+单文件 Bash 脚本，一键在 VPS 上安装代理节点，不需要自己的域名。有已经解析到本机的自有域名时，可以另外申请证书；不申请时，安装方式和现在一样。默认是 Let's Encrypt 单域名。也可以改成通配符、多域名、ZeroSSL，或只给 CDN 用的 Cloudflare 源站证书。证书签好之后，还可以另开两条给 CDN 用的线路（XHTTP+TLS、WebSocket+TLS），默认关闭，不替换 REALITY。
 
 ## 一键安装
 
@@ -61,9 +61,15 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--ws-port <N>` | 这条线路的回源 TCP 端口，默认 2087。端口范围同上 |
 | `--hop <a-b\|none>` | Hysteria2 端口跳跃范围，默认 `20000-50000`，`none` 关闭（NAT 模式默认关闭，可写多段 `a-b,c-d`） |
 | `--name <名称>` | 节点名称（默认「国家-城市」） |
-| `--cert-domain <域名>` | 可选：为已解析到本机的自有域名申请 Let's Encrypt 证书。订阅只走 HTTPS；Hysteria2 / TUIC / AnyTLS 改用该证书和域名。REALITY 仍借用伪装站点。NAT 模式不可用 |
-| `--cert-email <邮箱>` | 可选，登记给 Let's Encrypt；不填则不登记邮箱 |
-| `--sub-port <端口>` | 订阅 HTTPS 端口，默认 8447（不能是 80，也不能占用已开启协议的 TCP 端口） |
+| `--cert-domain <域名>` | 可选：申请证书。不写 `--cert-kind` 时是 Let's Encrypt 单域名 HTTP-01。订阅只走 HTTPS；Hysteria2 / TUIC / AnyTLS 改用该证书和域名。REALITY 仍借用伪装站点。NAT 模式不可用 |
+| `--cert-kind <种类>` | `le`（默认）\| `wildcard` \| `multi` \| `zerossl` \| `zerossl-wildcard` \| `zerossl-multi` \| `cf-origin`。通配符走 DNS-01。`cf-origin` 是 Cloudflare 源站证书，只有 Cloudflare 信任，只能给两条 CDN 线路 |
+| `--cert-names <列表>` | 多域名或源站证书的名字，逗号分隔 |
+| `--cert-link <主机名>` | 通配符证书写进链接的具体名字，默认是根域名 |
+| `--cert-email <邮箱>` | 可选，登记给证书机构；不填则不登记邮箱 |
+| `--cf-dns-token <令牌>` | Cloudflare API 令牌，只用于通配符的 DNS-01。权限要有 Zone → DNS → 编辑，以及 Zone → Zone → 读取。不是 Origin CA Key |
+| `--cf-origin-key <钥匙>` | Cloudflare Origin CA Key。写了就申请源站证书 |
+| `--zerossl-kid <id>` / `--zerossl-hmac <key>` | ZeroSSL 的 EAB 凭据，必须成对。在 <https://app.zerossl.com/developer> 生成 |
+| `--sub-port <端口>` | 订阅 HTTPS 端口，默认 8447（不能是 80，也不能占用已开启协议的 TCP 端口）。源站证书不会打开订阅 |
 | `--no-cert` | 关闭已申请的证书，Hysteria2 / TUIC / AnyTLS 改回自签。开着的 CDN 线路一并关掉（不能改用自签） |
 | `--no-firewall` | 不配置 nftables 防火墙 |
 | `--no-upgrade` | 跳过系统软件包升级 |
@@ -87,7 +93,11 @@ NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239
 
 落地机示例：`bash proxy.sh --land --auto --land-allow 203.0.113.10`（只允许中转机 203.0.113.10 连接）
 
-申请证书示例：`bash proxy.sh --auto --cert-domain example.com`（域名的解析必须全部指向这台机器；见「申请证书」）
+申请证书示例：`bash proxy.sh --auto --cert-domain example.com`（默认 Let's Encrypt 单域名，解析必须全部指向这台机器；见「申请证书」）
+
+通配符示例：`bash proxy.sh --cert-kind wildcard --cert-domain example.com --cf-dns-token <令牌>`
+
+源站证书示例：`bash proxy.sh --cert-kind cf-origin --cf-origin-key <钥匙> --cert-domain cdn.example.com --xhttp-tls`
 
 CDN 线路示例：`bash proxy.sh --auto --cert-domain example.com --xhttp-tls --ws-tls`（两条都可选，也可以只开一条。见「经过 CDN 的两条线路」）
 
@@ -129,13 +139,13 @@ proxy proto
   - 官方脚本遇到 GitHub API 限流（403）时，会自动改为“指定最新版本号”重试。
   - **安装后 REALITY 自检**：用已安装的 xray 在 127.0.0.1 随机端口起一个临时客户端，按生成的链接参数连接本机节点并访问外网，打印通过 / 未通过（不影响安装；更换 SNI 后也会自动自检）。临时客户端限制 `GOMEMLIMIT`，128MB 的 NAT 小鸡也能跑。
 - **REALITY 目标网站自动优选**（见下文「为什么 SNI 规则很重要」）。
-- **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。
-- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，入站默认拒绝；放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有申请了证书时才额外放行 TCP 80（续期用的 HTTP-01，不提供订阅）和订阅 HTTPS 端口。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时询问是否停用（卸载时可恢复）。不会关闭 SELinux（写入文件后执行 `restorecon`）。
+- **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。Cloudflare 源站证书不会交给 Hysteria2。
+- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，入站默认拒绝；放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有 HTTP-01（Let's Encrypt / ZeroSSL 的单域名或多域名）才额外放行 TCP 80。只有公开证书才放行订阅 HTTPS 端口。通配符 DNS-01 和 Cloudflare 源站证书不放行 80，源站证书也不开订阅。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时询问是否停用（卸载时可恢复）。不会关闭 SELinux（写入文件后执行 `restorecon`）。
 - **fail2ban**：sshd 监狱，10 分钟内失败 5 次封禁 1 小时（systemd 日志后端 + nftables 动作）。
 - **XHTTP（默认开启）**：VLESS + XHTTP + REALITY。与 Vision 共用同一把 x25519、ShortId、SNI 和 ML-DSA-65 种子，单独监听 TCP 8443，`flow` 必须为空，路径为随机 `/` + 十六进制。服务端和客户端链接的 `mode` 都是 `stream-one`（REALITY 直连；客户端用 `auto` 时有已知握手失败）。不需要自己的域名，也不把自己的证书挂到 XHTTP 上。这条和下面的「XHTTP + TLS（CDN）」是两条入站，互不替换。
-- **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
-- **CDN 上的两条线路（默认关闭）**：VLESS + XHTTP + TLS（TCP 2083，`mode=packet-up`）和 VLESS + WebSocket + TLS（TCP 2087）。都用公开证书，不是 REALITY。打开时脚本会打印 DNS、橙色云朵、回源端口、加密模式和客户端链接该怎么填。详见「经过 CDN 的两条线路」。
-- **输出**：每个已开启协议单独一块：名称、地址、端口各一行，链接本身最后单独一行。vless://（含 / 不含 pqv）、xhttp 的 vless://（`mode=stream-one`，无 flow）、hysteria2://（未申请证书时带 `mport`、`sni`、`insecure=1`、`pinSHA256`；申请之后地址和 SNI 为自有域名，不再带 insecure / pin）、可选的 trojan:// / tuic:// / anytls://。打开 CDN 线路后另有两条 vless://（`security=tls`，没有 flow / pbk / sid / pqv / insecure）。终端二维码，mihomo（Clash.Meta）YAML 片段。申请证书后另有仅 HTTPS 的订阅地址。
+- **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。Cloudflare 源站证书不会交给它们。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
+- **CDN 上的两条线路（默认关闭）**：VLESS + XHTTP + TLS（TCP 2083，`mode=packet-up`）和 VLESS + WebSocket + TLS（TCP 2087）。用公开证书，或只用这两条时改用 Cloudflare 源站证书。都不是 REALITY。打开时脚本会打印 DNS、橙色云朵、回源端口、加密模式和客户端链接该怎么填。详见「经过 CDN 的两条线路」。
+- **输出**：每个已开启协议单独一块：名称、地址、端口各一行，链接本身最后单独一行。vless://（含 / 不含 pqv）、xhttp 的 vless://（`mode=stream-one`，无 flow）、hysteria2://（未申请证书时带 `mport`、`sni`、`insecure=1`、`pinSHA256`；申请之后地址和 SNI 为自有域名，不再带 insecure / pin）、可选的 trojan:// / tuic:// / anytls://。打开 CDN 线路后另有两条 vless://（`security=tls`，没有 flow / pbk / sid / pqv / insecure）。终端二维码，mihomo（Clash.Meta）YAML 片段。申请公开证书后另有仅 HTTPS 的订阅地址。源站证书没有订阅。
 - **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」，第 17 项是「申请证书」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
 - **落地机 / 落地转发**：`--land` 把本机装成只跑 Shadowsocks 2022 的出口（落地机）；已安装的节点用 `proxy land-add 'ss://...'` 把出口切到落地机（中转），见下文。
 - **健壮性**：`set -o errexit -o pipefail -o errtrace` + 错误陷阱提示出错行；可重复运行（保留已有密钥，只更新组件与配置）；安装前检查端口占用；没有 IPv6 也能正常工作（链接使用 IPv4）；通过 shellcheck 检查。
@@ -211,7 +221,7 @@ XHTTP 还需要第二条外部 TCP 端口（默认 8443，不能和 Vision 共�
 | geoip / geosite 数据文件 | 节省约 20MB 磁盘；内网屏蔽改为内置的私有网段列表 |
 | 时间同步服务 | 容器使用宿主机时钟（Alpine 虚拟机会安装 chrony） |
 | `--scan`、大规模 SNI 检测 | 小内存机器上 SNI 候选限制为 12 个、并发 3 |
-| 申请证书、CDN 上的 XHTTP+TLS / WebSocket+TLS | HTTP-01 需要公网 80 能访问到本机，CDN 也要能连到回源端口。NAT 小鸡通常没有这些映射。不带 `--cert-domain`、`--xhttp-tls`、`--ws-tls` 时安装方式不变 |
+| 申请证书、CDN 上的 XHTTP+TLS / WebSocket+TLS | 证书和 CDN 都要能从公网访问到这台机器。NAT 小鸡通常没有这些映射。通配符、ZeroSSL 和源站证书同样不在 NAT 上申请。不带证书参数、`--xhttp-tls`、`--ws-tls` 时安装方式不变 |
 
 ### 小内存 / 小硬盘
 
@@ -226,7 +236,7 @@ XHTTP 还需要第二条外部 TCP 端口（默认 8443，不能和 Vision 共�
 - **OpenRC（Alpine）**：服务由 `supervise-daemon` 托管（崩溃自动重启），以 `nobody` / `hysteria` 用户运行；监听 1024 以下端口时只授予 `cap_net_bind_service`。日志在 `/var/log/xray/xray.log` 与 `/var/log/hysteria/hysteria.log`（超过 2MB 在启动时截断），`proxy status` 中可直接查看。
 - **管理**：菜单第 10 项（或 `proxy nat`）为「NAT 信息 / 端口跳跃」，可查看映射关系、修改映射端口、开关端口跳跃；`proxy port` 会按映射端口重新询问。
 - 已安装为 NAT 模式后，再次运行脚本或 `proxy` 会自动沿用 NAT 模式；`--no-nat` 可切回普通模式。
-- **申请证书不可用，CDN 上的两条线路也不可用**。Let's Encrypt 的 HTTP-01 要能从公网访问本机的 TCP 80，Cloudflare 也要能连到回源端口，NAT 小鸡通常没有这些映射。Alpine 在本脚本里始终是 NAT，因此也不能申请、也不能开这两条。已经申请过证书再切到 NAT 时，证书会关掉，CDN 线路停止，Hysteria2 / TUIC / AnyTLS 改回自签。不带 `--cert-domain`、`--xhttp-tls`、`--ws-tls` 时不会询问，安装输出与现在相同。
+- **申请证书不可用，CDN 上的两条线路也不可用**。不管是 Let's Encrypt、ZeroSSL、通配符还是 Cloudflare 源站证书，都要求公网能访问到这台机器；NAT 小鸡通常没有这些映射。Alpine 在本脚本里始终是 NAT，因此也不能申请、也不能开这两条。已经申请过证书再切到 NAT 时，证书会关掉，CDN 线路停止，Hysteria2 / TUIC / AnyTLS 改回自签。不带证书参数、`--xhttp-tls`、`--ws-tls` 时不会询问，安装输出与现在相同。
 
 ---
 
@@ -487,7 +497,7 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 
 `/root/proxy-info.txt` 中额外提供了官方多端口写法：`hysteria2://密码@IP:443,20000-50000/?sni=...&insecure=1&pinSHA256=...`。
 
-没有自有域名时，Hysteria2 / TUIC / AnyTLS 仍是上面的自签证书（`insecure`、`pinSHA256`、`skip-cert-verify`）。申请公开证书之后，这三条的地址和 SNI 改为你的域名，按正常证书校验，不要再开允许不安全。REALITY / XHTTP / Trojan 始终借用伪装站点，不使用这张证书。CDN 上的 XHTTP+TLS / WebSocket+TLS 使用这张证书。见下文「申请证书」和「经过 CDN 的两条线路」。
+没有自有域名时，Hysteria2 / TUIC / AnyTLS 仍是上面的自签证书（`insecure`、`pinSHA256`、`skip-cert-verify`）。申请公开证书之后，这三条的地址和 SNI 改为你的域名，按正常证书校验，不要再开允许不安全。Cloudflare 源站证书不会交给这三条，它们仍用自签。REALITY / XHTTP / Trojan 始终借用伪装站点，不使用这张证书。CDN 上的 XHTTP+TLS / WebSocket+TLS 使用公开证书或源站证书。见下文「申请证书」和「经过 CDN 的两条线路」。
 
 ---
 
@@ -495,7 +505,7 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 
 默认不申请，也不需要域名。REALITY 继续借用伪装站点；Hysteria2 / TUIC / AnyTLS 继续用自签证书（CN = 所选 SNI）。
 
-域名已经解析到这台机器时，可以申请 Let's Encrypt 证书：
+不写种类时，仍是 Let's Encrypt 单域名，走 HTTP-01：
 
 ```bash
 bash proxy.sh --auto --cert-domain example.com
@@ -507,9 +517,19 @@ bash proxy.sh --auto --cert-domain example.com
 proxy cert
 ```
 
-菜单第 17 项作用相同。交互安装会询问一次，默认「否」。`--auto` 不带 `--cert-domain` 不会申请。已经申请过的，重装时会沿用。`proxy --no-cert` 用来关闭。
+菜单第 17 项作用相同。里面先选种类，再按该种类的说明往下做。交互安装只会问一次要不要申请默认的 Let's Encrypt 单域名，默认「否」。`--auto` 不带域名、也不带 `--cert-kind` 时不会申请。已经申请过的，重装时如果没有写 `--cert-kind`、`--cert-domain` 或 `--cert-names`，种类不变；证书还有效就跳过重新申请。只写了 `--cert-domain`、没写 `--cert-kind` 时，按默认的 Let's Encrypt 单域名处理。`proxy --no-cert` 用来关闭。
 
-证书生效之后：
+换一种证书：在 `proxy cert` 里另选种类，或带上新的 `--cert-kind`。脚本会先关掉旧的那张，再申请新的。Hysteria2 / TUIC / AnyTLS 在新证书签下来之前先回到自签。已经打开的 CDN 线路开关留着，但中间会停掉监听，新证书好了再挂上。REALITY 的端口、密钥和伪装站点不动。
+
+继续申请 Let's Encrypt 即表示同意其服务条款（<https://letsencrypt.org/repository/>）。邮箱可选（`--cert-email`），不填则不登记。
+
+### Let's Encrypt 单域名（默认）
+
+适合订阅 HTTPS，以及 Hysteria2、TUIC、AnyTLS。不适合通配符：HTTP-01 证明不了 `*.example.com`。
+
+域名的全部 A/AAAA 必须指向本机。申请和续期时关掉橙色云朵（灰色，仅 DNS），否则验证请求会打到 Cloudflare，本机 80 收不到。80 被占用时不会申请。只暂时占用 TCP 80，不改 REALITY 的端口。
+
+签好之后：
 
 - 订阅只提供 HTTPS：`https://域名:8447/sub/<token>`（v2rayN / v2rayNG / Shadowrocket，内容是分享链接的 base64）和同路径下的 `/clash`（mihomo）。明文 HTTP 不返回订阅内容。端口用 `--sub-port` 修改，不能是 80，也不能占用 REALITY / XHTTP / Trojan / AnyTLS / CDN 线路的 TCP 端口。
 - Hysteria2、TUIC、AnyTLS 出示这张证书。分享链接和 mihomo 配置里的地址、SNI 改为该域名，不再带 `insecure`、`allowInsecure`、`pinSHA256` 或 `skip-cert-verify`，也不再固定证书指纹。客户端按正常校验即可。
@@ -517,17 +537,69 @@ proxy cert
 - 若另外打开了 CDN 上的 XHTTP+TLS 或 WebSocket+TLS，这两条入站也出示这张证书。见下一节。
 - 伪装站点（`--sni`）只影响 REALITY。换 SNI 时，这三条协议的证书和链接不用跟着换。
 
-申请方式是 certbot 的 HTTP-01，只暂时占用 TCP 80，不改 REALITY 的监听端口。域名的全部 A/AAAA 记录都必须指向本机，否则拒绝申请。80 已被占用时不会申请。续期由 systemd timer（每天）或 OpenRC 的 `/etc/periodic/daily` 完成。续期成功后重启 Hysteria2、sing-box 和订阅服务。只有打开了 CDN 线路（存在 `/etc/proxy-oneclick/cdn-xray`）时，才把证书复制给 Xray 并重启 Xray。REALITY 入站不使用这张证书。
+续期由 systemd timer（每天）或 OpenRC 的 `/etc/periodic/daily` 完成，大约 90 天一轮，到期前约 30 天续。续期成功后重启 Hysteria2、sing-box 和订阅服务。只有打开了 CDN 线路（存在 `/etc/proxy-oneclick/cdn-xray`）时，才把证书复制给 Xray 并重启 Xray。REALITY 入站不使用这张证书。
 
-关闭：`proxy --no-cert`，或在 `proxy cert` 里选择关闭。Hysteria2 / TUIC / AnyTLS 改回自签证书，订阅停止。当时开着的 CDN 线路也会关掉。
+### 通配符（DNS-01）
 
-NAT 模式和落地机不能申请。不带证书参数时，这些环境的安装与现在相同。
+HTTP-01 不能签发通配符。选 `wildcard`（Let's Encrypt）或 `zerossl-wildcard`。证书里同时有 `*.example.com` 和 `example.com`。星号只覆盖一级子域名，不覆盖 `a.b.example.com`。
+
+```bash
+bash proxy.sh --cert-kind wildcard --cert-domain example.com --cf-dns-token <令牌>
+```
+
+`--cert-domain` 写根域名，不要写成 `*.example.com`。链接默认用根域名。要写进链接的是另一个被这张证书覆盖的名字时，加 `--cert-link cdn.example.com`。
+
+DNS：在 Cloudflare 给 `_acme-challenge` 添加 TXT，云朵必须是灰色。通配符和根域名是两条内容不同的 TXT，都要留下。名称只填 `_acme-challenge`，不要再套一层域名。API 令牌的权限是 Zone → DNS → 编辑，以及 Zone → Zone → 读取。这不是 Origin CA Key。令牌放在 `/etc/proxy-oneclick/cf-dns.token`（权限 600），不写入 `state.env`；命令行参数会出现在进程列表里。
+
+没有令牌时，脚本把 TXT 内容打在屏幕上，并等待 1.1.1.1 和 8.8.8.8 能查到。这种方式不能自动续期，到期前要再运行 `proxy cert` 添加一次。保存了令牌才会交给定时任务，而且续期不占用 80。
+
+这是公开证书。Hysteria2 / TUIC / AnyTLS 和订阅的变化与单域名相同。REALITY 不变。这个名字若开了橙色云朵，那几条直连协议不能再靠它，请改用服务器 IP，或用 `--cert-link` 指定一个仍是灰色云朵的子域名。
+
+### 多域名
+
+选 `multi` 或 `zerossl-multi`。几个名字在同一张证书上，走 HTTP-01。每个名字的 A/AAAA 都要指向本机，并且是灰色云朵。有一个失败，整张都不会下来。不能写 `*.域名`。
+
+```bash
+bash proxy.sh --cert-kind multi --cert-names www.example.com,api.example.com
+```
+
+链接和订阅用名单里的第一个名字。要用其中另一个，加上 `--cert-domain`，它必须出现在名单里。协议变化与单域名公开证书相同。REALITY 不变。
+
+### ZeroSSL
+
+`zerossl`、`zerossl-wildcard`、`zerossl-multi` 和上面三种 Let's Encrypt 证书是同一类公开证书，只是换了一家 CA。客户端仍按正常校验。
+
+必须有一对 EAB 凭据，在 <https://app.zerossl.com/developer> 生成，用 `--zerossl-kid` 和 `--zerossl-hmac` 一起传入。KID 和 HMAC 必须是同一对，HMAC 里的 `+` `/` `=` 要原样保留。凭据在 `/etc/proxy-oneclick/zerossl.eab`（权限 600），不写入 `state.env`。
+
+单域名和多域名仍要灰色云朵和 TCP 80。通配符仍要 DNS-01。建议加上 `--cert-email`；不填则不登记，若 ZeroSSL 拒绝注册，补上邮箱再试。
+
+### Cloudflare 源站证书
+
+选 `cf-origin`。只有 Cloudflare 信任它。浏览器直接打开会报不安全。Hysteria2、TUIC、AnyTLS 的客户端会拒绝。订阅 HTTPS 也不能用。
+
+只适合两条 CDN 线路（XHTTP+TLS、WebSocket+TLS），并且域名开着橙色云朵，加密模式选「完全（严格）」。脚本不会把这张证书装进 Hysteria2、TUIC、AnyTLS，也不会打开订阅。REALITY 不动。
+
+```bash
+bash proxy.sh --cert-kind cf-origin --cf-origin-key <钥匙> --cert-domain cdn.example.com --xhttp-tls
+```
+
+钥匙是 Origin CA Key：<https://dash.cloudflare.com/profile/api-tokens> 页面最下面。不是普通 API 令牌，也不是添加 TXT 的 DNS 令牌。保存在 `/etc/proxy-oneclick/cf-origin.key`（权限 600）。主机名必须属于这个账号里的区域。写了 `*.example.com` 时，根域名会一并放进证书。不占用 80，不走 certbot。有效期大约 15 年，不会自动续期；要换种类就重新申请，脚本会先关掉这一张。
+
+CDN 线路还没打开时，证书签好也不会被任何协议使用。到协议开关里打开 XHTTP+TLS 或 WebSocket+TLS。
+
+### 关闭
+
+`proxy --no-cert`，或在 `proxy cert` 里选择关闭。公开证书关掉后，Hysteria2 / TUIC / AnyTLS 改回自签，订阅停止，当时开着的 CDN 线路也会关掉。源站证书关掉后，CDN 线路停止；那三个协议本来就是自签。REALITY 不变。关闭时令牌和 EAB 文件先留着，方便下次再申请。卸载才会删掉。
+
+NAT 模式和落地机不能申请任何一种。不带证书参数时，这些环境的安装与现在相同。
+
+申请或续期失败时，脚本用中文说明该先改哪里：域名没指到本机、80 被占用、橙色云朵挡了 HTTP-01、TXT 没被公共 DNS 看到、令牌和 Origin CA Key 用反了、ZeroSSL 的 EAB 不成对、多域名里有一个名字失败、源站证书的主机名不在这个 Cloudflare 账号里。REALITY 不会因此改掉。
 
 ---
 
 ## 经过 CDN 的两条线路
 
-默认关闭，也不替换 REALITY、XHTTP+REALITY、Hysteria2、Trojan、TUIC、AnyTLS。两条都不是 REALITY：客户端连你自己的域名，CDN 再回源到本机的独立端口，本机用已经签好的公开证书终止 TLS。
+默认关闭，也不替换 REALITY、XHTTP+REALITY、Hysteria2、Trojan、TUIC、AnyTLS。两条都不是 REALITY：客户端连你自己的域名，CDN 再回源到本机的独立端口，本机用已经签好的证书终止 TLS。默认是公开证书。只给这两条用、并且开着橙色云朵时，可以改成 Cloudflare 源站证书；那张证书不能给 Hysteria2、TUIC、AnyTLS 或订阅。
 
 | 线路 | 默认端口 | 路径 | 客户端要点 |
 |---|---|---|---|
@@ -563,9 +635,7 @@ Cloudflare 免费代理只转发这几个 HTTPS 端口：443、2053、2083、208
 
 对不上号时，脚本用中文说明该先改哪里，而不是只丢一行命令失败。至少包括：域名没有解析到这台机器、80 或 443 被占用、证书没有签发、Cloudflare 521/522、回源证书和域名不一致、路径不一致、WebSocket 升级被拒绝。本机检查没过时，REALITY 和原来的协议保持原样。
 
-NAT 模式和落地机不能开。没有公开证书、或和 `--no-cert` 一起用时，也不会开。
-
-继续申请即表示同意 Let’s Encrypt 服务条款（<https://letsencrypt.org/repository/>）。邮箱可选（`--cert-email`），不填则不登记。
+NAT 模式和落地机不能开。没有证书（公开证书或源站证书），或和 `--no-cert` 一起用时，也不会开。
 
 ---
 
@@ -578,7 +648,7 @@ NAT 模式和落地机不能开。没有公开证书、或和 `--no-cert` 一起
 - UDP 443 以及 UDP 20000-50000（Hysteria2 + 端口跳跃）
 - 若打开了可选协议：TCP 8444（Trojan）、TCP 8445（AnyTLS）、UDP 8446（TUIC）
 - 若打开了 CDN 线路：TCP 2083（XHTTP+TLS）、TCP 2087（WebSocket+TLS），或你改过的回源端口。这是给 Cloudflare 回源用的，不是 REALITY
-- 申请了证书时另外放行：TCP 80（只给证书续期，不提供订阅）、TCP 8447（订阅 HTTPS，或你设置的 `--sub-port`）
+- HTTP-01 的单域名或多域名另外放行：TCP 80（只给证书续期，不提供订阅）、以及公开证书的 TCP 8447（订阅 HTTPS，或你设置的 `--sub-port`）。通配符 DNS-01 不需要 80。源站证书既不需要 80，也不开订阅
 
 Oracle Cloud 的官方镜像还自带 iptables 规则，如仍不通请一并检查。
 
@@ -625,7 +695,7 @@ NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜�
 
 **协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS，以及 CDN 上的 XHTTP+TLS（第 7 项）、WebSocket+TLS（第 8 项）。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径、CDN 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥和 CDN 路径，但不会把已关闭的协议重新打开。已申请公开证书时，重新生成密钥不会把 Hysteria2 / TUIC / AnyTLS 换回自签证书。打开 CDN 线路时会打印教程并做一次检查。想再看教程：`proxy cdn`。
 
-**申请证书**（第 17 项，或 `proxy cert`）：申请、续期、查看订阅链接，或关闭证书。见「申请证书」。
+**申请证书**（第 17 项，或 `proxy cert`）：选择种类并申请、续期、查看链接，或关闭证书。默认仍是 Let's Encrypt 单域名。见「申请证书」。
 
 **切换 NAT 模式**（第 15 项，落地机菜单为第 11 项）：`自动`（默认：Alpine 强制 NAT、LXC/OpenVZ 容器安装时询问、已安装的沿用原模式）/ `开`（强制 NAT 映射端口流程，等同 `--nat`）/ `关`（强制普通模式，等同 `--no-nat`；Alpine 不可用）。在第 1 或 13 项安装前选择即可；设置保存在 `state.env`（`NAT_PREF`），之后的修改端口等操作都按它执行。已安装时切换到不同模式会提示立即重新安装（保留密钥 / UUID）；命令行 `--nat` / `--no-nat` 优先并同步该设置。
 
@@ -706,11 +776,16 @@ proxy allow
 | `/usr/local/etc/xray/config.json` | Xray 配置 |
 | `/etc/hysteria/config.yaml` | Hysteria2 配置 |
 | `/usr/local/bin/sing-box` | TUIC / AnyTLS 核心（未启用时不安装） |
-| `/etc/sing-box/config.json` | sing-box 配置（未申请证书时用 Hysteria2 的自签证书，CN = 所选 SNI；申请之后用下面的公开证书） |
-| `/etc/letsencrypt/live/proxy-oneclick/` | Let's Encrypt 证书（仅申请之后） |
+| `/etc/sing-box/config.json` | sing-box 配置（未申请公开证书时用 Hysteria2 的自签证书，CN = 所选 SNI；公开证书申请之后用那张证书。源站证书不写到这里） |
+| `/etc/letsencrypt/live/proxy-oneclick/` | Let's Encrypt 或 ZeroSSL 证书（仅 ACME 申请之后；源站证书不在这里） |
 | `/etc/proxy-oneclick/certs/` | 复制出来的 `fullchain.pem` / `privkey.pem`（私钥 640，组 `proxy-cert`），以及订阅文件 `sub.json`、`sub.txt`、`sub-clash.yaml` |
-| `/usr/local/lib/proxy-oneclick/sub_https.py` | 订阅 HTTPS（只监听订阅端口，不监听 80） |
+| `/etc/proxy-oneclick/cf-dns.token` | Cloudflare DNS 令牌（600，仅通配符保存过令牌时）。不写入 `state.env` |
+| `/etc/proxy-oneclick/zerossl.eab` | ZeroSSL 的 EAB KID 和 HMAC（600） |
+| `/etc/proxy-oneclick/cf-origin.key` | Cloudflare Origin CA Key（600） |
+| `/usr/local/lib/proxy-oneclick/sub_https.py` | 订阅 HTTPS（只监听订阅端口，不监听 80；源站证书不会启动它） |
 | `/usr/local/lib/proxy-oneclick/cert-deploy.sh` | 续期后复制证书，并重启 Hysteria2、sing-box、订阅服务。仅当存在下面的标记文件时，才把证书拷给 Xray 并重启 Xray |
+| `/usr/local/lib/proxy-oneclick/dns-auth.sh` | 通配符 DNS-01：添加 TXT，或提示手工添加并等待公共 DNS |
+| `/usr/local/lib/proxy-oneclick/dns-cleanup.sh` | 删掉这次添加的那一条 TXT |
 | `/etc/proxy-oneclick/cdn-xray` | CDN 线路已打开的标记。没有这个文件时，续期不会重启 Xray |
 | `/usr/local/etc/xray/certs/` | 给 XHTTP+TLS / WebSocket+TLS 用的证书副本（私钥 640，组为 `nobody` 所在组）。REALITY 不读这里 |
 | `/etc/systemd/system/proxy-oneclick-sub.service` / `/etc/init.d/proxy-oneclick-sub` | 订阅 HTTPS 服务 |
@@ -764,9 +839,9 @@ proxy uninstall --auto
 - 落地转发只改变本机 Xray / Hysteria2 代理流量的出口，本机系统自身的流量（apt、脚本下载等）仍然直连。
 - 落地机只支持 Shadowsocks 2022；中转机 `land-add` 只接受 SS2022 链接。Xray 26.x 会对 Shadowsocks 打印弃用提示（官方推荐 VLESS Encryption），将来如被移除需要改用其它协议。
 - NAT 容器落地机的白名单只由 Xray 路由实现（非白名单连接会被接受后丢弃，而不是在防火墙层拒绝）。
-- 申请证书需要公网能访问本机 TCP 80（HTTP-01）。NAT / Alpine 不能申请。续期同样需要 80 空闲，并且能从公网访问。
-- 订阅只走 HTTPS，不在 80 上提供内容。token 放在路径里，请把订阅地址当作密钥。
-- 公开证书大约 90 天轮换一次，所以 Hysteria2 / TUIC / AnyTLS 在使用这张证书时不固定指纹。没有域名时仍用自签证书和 `pinSHA256`。
-- REALITY 不使用这张证书，继续借用伪装站点。不要把 REALITY 放进 CDN。
-- CDN 上的 XHTTP+TLS / WebSocket+TLS 需要自有域名、公开证书，以及 Cloudflare 允许代理的回源端口。NAT / Alpine / 落地机不能开。域名开了橙色云朵后，不要再用这个名字连接 Hysteria2、TUIC 或订阅。
+- Let's Encrypt / ZeroSSL 的单域名和多域名需要公网能访问本机 TCP 80（HTTP-01）。通配符改走 DNS-01，不占用 80，但 TXT 必须是灰色云朵。NAT / Alpine 不能申请任何一种。HTTP-01 续期同样需要 80 空闲。没有保存 DNS 令牌的通配符不能自动续期。
+- 订阅只走 HTTPS，不在 80 上提供内容。token 放在路径里，请把订阅地址当作密钥。Cloudflare 源站证书不会打开订阅。
+- 公开证书大约 90 天轮换一次，所以 Hysteria2 / TUIC / AnyTLS 在使用这张证书时不固定指纹。没有域名时仍用自签证书和 `pinSHA256`。源站证书大约 15 年，而且不会交给这三个协议。
+- REALITY 不使用这张证书，继续借用伪装站点。不要把 REALITY 放进 CDN。换证书种类也不会改 REALITY。
+- CDN 上的 XHTTP+TLS / WebSocket+TLS 需要自有域名，以及公开证书或 Cloudflare 源站证书，还有 Cloudflare 允许代理的回源端口。源站证书只有 Cloudflare 信任，不能给浏览器和直连客户端。NAT / Alpine / 落地机不能开。域名开了橙色云朵后，不要再用这个名字连接 Hysteria2、TUIC 或订阅。
 - XHTTP 走 CDN 时用 `packet-up`。`stream-one` 只用于直连的 XHTTP+REALITY。WebSocket 需要 CDN 打开 WebSockets，路径必须和链接里逐字相同。

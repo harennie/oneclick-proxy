@@ -11,7 +11,9 @@
 #   bash proxy.sh tune            # 网络调优（BBR / 队列算法 / 缓冲区；可单独使用，NAT/容器也可用）
 #   bash proxy.sh --land          # 落地机：只运行 Shadowsocks 2022（给中转机做出口，可设来源 IP 白名单）
 #   proxy land-add 'ss://...'     # 中转机：把出口切换到落地机
-#   bash proxy.sh --cert-domain example.com   # 可选：为自有域名申请公开证书（订阅 HTTPS + Hy2/TUIC/AnyTLS）
+#   bash proxy.sh --cert-domain example.com   # 可选：默认 Let's Encrypt 单域名 HTTP-01
+#   bash proxy.sh --cert-kind wildcard --cert-domain example.com --cf-dns-token <令牌>
+#   bash proxy.sh --cert-kind cf-origin --cf-origin-key <钥匙> --cert-domain cdn.example.com
 #   bash proxy.sh --xhttp-tls --ws-tls --cert-domain example.com
 #                                 # 可选：CDN 上的 XHTTP+TLS / WebSocket+TLS（默认不装，不替换 REALITY）
 #   bash proxy.sh --help          # 查看全部参数
@@ -115,6 +117,15 @@ readonly XRAY_CERT_DIR="/usr/local/etc/xray/certs"
 readonly XRAY_CERT_FULL="${XRAY_CERT_DIR}/fullchain.pem"
 readonly XRAY_CERT_KEY="${XRAY_CERT_DIR}/privkey.pem"
 readonly CDN_FLAG="${CERT_BASE}/cdn-xray"
+# 令牌和 EAB 只放在这些 600 文件里，不写入 state.env。
+readonly CERT_DNS_TOKEN="${CERT_BASE}/cf-dns.token"
+readonly CERT_ZEROSSL_EAB="${CERT_BASE}/zerossl.eab"
+readonly CERT_ORIGIN_KEY="${CERT_BASE}/cf-origin.key"
+readonly CERT_DNS_AUTH="${CERT_LIB}/dns-auth.sh"
+readonly CERT_DNS_CLEAN="${CERT_LIB}/dns-cleanup.sh"
+readonly CERT_TXT_DIR="/var/lib/proxy-oneclick/acme-txt"
+readonly ZEROSSL_SERVER="https://acme.zerossl.com/v2/DV90"
+readonly CF_ORIGIN_API="https://api.cloudflare.com/client/v4/certificates"
 # 公共 DNS64 服务器（nat64.net / Trex），仅在 IPv6-only 且用户同意时写入 /etc/resolv.conf
 readonly DNS64_SERVERS="2a00:1098:2b::1 2a00:1098:2c::1 2a01:4f8:c2c:123f::1"
 readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
@@ -169,6 +180,13 @@ OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0
 OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）
 OPT_CERT_EMAIL=""   # 可选，交给 Let's Encrypt；空则不登记邮箱
 OPT_SUB_PORT=""     # 订阅 HTTPS 端口，默认 8447
+OPT_CERT_KIND=""    # 空=Let's Encrypt 单域名。le|wildcard|multi|zerossl|zerossl-wildcard|zerossl-multi|cf-origin
+OPT_CERT_NAMES=""   # 多域名或源站证书的名字，逗号分隔
+OPT_CERT_LINK=""    # 通配符证书写进链接的具体主机名，默认为根域名
+OPT_CF_DNS_TOKEN="" # Cloudflare API 令牌，只用于 DNS-01。不写入 state.env
+OPT_CF_ORIGIN_KEY="" # Cloudflare Origin CA Key。出现即表示申请源站证书
+OPT_ZEROSSL_KID=""
+OPT_ZEROSSL_HMAC=""
 XRAY_LABEL=""       # 端口提示中的协议名（落地机为 Shadowsocks 2022）
 
 # 运行时变量（部分持久化到 STATE_FILE）
@@ -500,7 +518,8 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             XHTTP_TLS_ENABLED XHTTP_TLS_PORT XHTTP_TLS_PATH
             WS_ENABLED WS_PORT WS_PATH
             OUTBOUND_IP
-            CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN)
+            CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
+            CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
@@ -524,6 +543,8 @@ NAT_SRC=""          # 本次安装 NAT_MODE 的来源：cli | manual | alpine | 
 # 双栈且为空时保持原来的 AsIs / Hy2 happy eyeballs，直到交互询问或 --auto（默认 46）。
 OUTBOUND_IP=""
 CERT_ON=0 CERT_DOMAIN="" CERT_EMAIL="" SUB_PORT=8447 SUB_TOKEN=""
+# 旧状态文件没有这几项时保持 Let's Encrypt 单域名 HTTP-01，已经签好的公开证书行为不变。
+CERT_CA=letsencrypt CERT_SCOPE=single CERT_NAMES="" CERT_PUBLIC=1 CERT_CHALLENGE=http
 OUTBOUND_EFFECTIVE=""   # 本次写配置实际使用的策略（单栈会强制 4 或 6，不覆盖 OUTBOUND_IP）
 OUTBOUND_IP_DONE=0      # 本次进程只决定一次
 
@@ -2368,7 +2389,7 @@ check_port_free() { # $1 proto $2 port $3 允许的进程名(正则)
     [[ $1 == udp && $2 == "$HY2_PORT" && hysteria =~ ^($3)$ ]] && svc_active hysteria-server && return 0
     [[ $1 == udp && $2 == "$TUIC_PORT" && ${TUIC_ENABLED:-0} == 1 && sing-box =~ ^($3)$ ]] && svc_active sing-box && return 0
     [[ $1 == udp && $2 == "$XRAY_PORT" && ${LAND_MODE:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
-    [[ $1 == tcp && $2 == "$SUB_PORT" && ${CERT_ON:-0} == 1 && $3 =~ python ]] && svc_active proxy-oneclick-sub && return 0
+    [[ $1 == tcp && $2 == "$SUB_PORT" ]] && cert_is_public && [[ $3 =~ python ]] && svc_active proxy-oneclick-sub && return 0
     [[ $1 == tcp && $2 == "$XHTTP_TLS_PORT" && ${XHTTP_TLS_ENABLED:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
     [[ $1 == tcp && $2 == "$WS_PORT" && ${WS_ENABLED:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
   fi
@@ -3215,10 +3236,8 @@ render_firewall() {
   (( ${ANYTLS_ENABLED:-0} )) && fw_add_port tcp_ports "$ANYTLS_PORT"
   (( ${XHTTP_TLS_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_TLS_PORT"
   (( ${WS_ENABLED:-0} )) && fw_add_port tcp_ports "$WS_PORT"
-  if (( ${CERT_ON:-0} == 1 )); then
-    fw_add_port tcp_ports 80
-    fw_add_port tcp_ports "${SUB_PORT:-8447}"
-  fi
+  if cert_http_open; then fw_add_port tcp_ports 80; fi
+  if cert_is_public; then fw_add_port tcp_ports "${SUB_PORT:-8447}"; fi
   for p in $EXTRA_TCP; do fw_add_port tcp_ports "$p"; done
   udp_ports=""
   (( HY2_ENABLED )) && udp_ports="$HY2_PORT"
@@ -3503,7 +3522,12 @@ ask_extra_ports() {
   detect_ssh_ports
   t=$(other_listen_ports tcp); u=$(other_listen_ports udp)
   # 排除自身端口
-  t=$(for p in $t; do [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || $p == "$XHTTP_TLS_PORT" || $p == "$WS_PORT" || ( ${CERT_ON:-0} == 1 && ( $p == "$SUB_PORT" || $p == 80 ) ) ]] || echo "$p"; done | tr '\n' ' ')
+  t=$(for p in $t; do
+    if [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || $p == "$XHTTP_TLS_PORT" || $p == "$WS_PORT" ]] || cert_port_owned "$p"; then
+      continue
+    fi
+    echo "$p"
+  done | tr '\n' ' ')
   u=$(for p in $u; do [[ $p == "$HY2_PORT" || $p == "$TUIC_PORT" ]] || echo "$p"; done | tr '\n' ' ')
   t=${t% } u=${u% }
   if [[ -n $t || -n $u ]]; then
@@ -3546,8 +3570,10 @@ cloud_fw_reminder() {
   (( TUIC_ENABLED )) && printf 'UDP   %-7s  TUIC v5\n' "$TUIC_PORT"
   (( XHTTP_TLS_ENABLED )) && printf 'TCP   %-7s  XHTTP+TLS（CDN 回源，不是 REALITY）\n' "$XHTTP_TLS_PORT"
   (( WS_ENABLED )) && printf 'TCP   %-7s  WebSocket+TLS（CDN 回源，不是 REALITY）\n' "$WS_PORT"
-  if (( ${CERT_ON:-0} == 1 )); then
+  if cert_http_open; then
     printf 'TCP   %-7s  证书续期（HTTP-01，不提供订阅）\n' 80
+  fi
+  if cert_is_public; then
     printf 'TCP   %-7s  订阅 HTTPS\n' "$SUB_PORT"
   fi
   echo "位置：云控制台安全组。Oracle Cloud 镜像可能还有自带 iptables。"
@@ -3583,21 +3609,42 @@ F2B
 }
 
 # ============================================================
-#          可选：公开证书（Let's Encrypt）与订阅 HTTPS
+#          可选：证书（默认 Let's Encrypt 单域名）与订阅 HTTPS
 # ============================================================
 # 默认不申请。没有域名时 REALITY、以及 Hysteria2 / TUIC / AnyTLS 的自签证书都保持原样。
-# 申请之后：
-#   · HTTP-01 只用 TCP 80，不碰 REALITY 所在端口；
+# 不写种类时仍是 Let's Encrypt 单域名 HTTP-01。其它种类：通配符（DNS-01）、多域名、
+# ZeroSSL（同样三种公开证书）、Cloudflare 源站证书（只有 Cloudflare 信任，只给 CDN）。
+# 公开证书申请之后：
+#   · HTTP-01 只用 TCP 80，不碰 REALITY 所在端口；通配符改走 DNS-01，不占 80；
 #   · 订阅只在 HTTPS 上提供，明文 HTTP 不返回订阅内容；
 #   · Hysteria2 / TUIC / AnyTLS 出示这张证书，链接改用自有域名，不再带 insecure / pin；
 #   · REALITY 继续借用伪装站点，配置里不写入这张证书。
-#   · 可选的 CDN 线路（XHTTP+TLS / WebSocket+TLS）才使用这张证书。续期钩子只在
-#     /etc/proxy-oneclick/cdn-xray 存在时才把证书拷给 Xray 并重启 Xray。
-# NAT 模式拒绝申请：公网 80 往往映射不到这台机器。systemd 用 timer 续期，OpenRC 用 daily cron。
+#   · 可选的 CDN 线路（XHTTP+TLS / WebSocket+TLS）可以使用公开证书或源站证书。
+#     续期钩子只在 /etc/proxy-oneclick/cdn-xray 存在时才把证书拷给 Xray 并重启 Xray。
+# 源站证书不会打开订阅，也不会交给 Hysteria2 / TUIC / AnyTLS。
+# 换种类时先关掉旧证书再申请新的，不改 REALITY。
+# NAT 模式拒绝全部种类。公开证书的续期：systemd timer 或 OpenRC daily cron。
 
-cert_cli_requested() { [[ -n ${OPT_CERT_DOMAIN:-} || ${OPT_CERT:-} == 1 ]]; }
+cert_cli_requested() {
+  [[ -n ${OPT_CERT_DOMAIN:-} || ${OPT_CERT:-} == 1 || -n ${OPT_CERT_KIND:-} || -n ${OPT_CERT_NAMES:-} || -n ${OPT_CF_ORIGIN_KEY:-} || -n ${OPT_ZEROSSL_KID:-} ]]
+}
+# 公开可信：Let's Encrypt / ZeroSSL。旧状态没有 CERT_PUBLIC 时默认就是这种。
+cert_is_public() {
+  [[ ${CERT_ON:-0} == 1 && ${CERT_PUBLIC:-1} == 1 && ${CERT_CA:-letsencrypt} != cloudflare ]]
+}
+# Hysteria2 / TUIC / AnyTLS / 订阅。Cloudflare 源站证书不算。
 tls_present_real() {
+  cert_is_public && [[ -n ${CERT_DOMAIN:-} && -s ${CERT_FULLCHAIN:-} && -s ${CERT_PRIVKEY:-} ]]
+}
+# CDN 两条线路。公开证书和 Cloudflare 源站证书都可以。
+tls_for_cdn() {
   [[ ${CERT_ON:-0} == 1 && -n ${CERT_DOMAIN:-} && -s ${CERT_FULLCHAIN:-} && -s ${CERT_PRIVKEY:-} ]]
+}
+cert_http_open() { [[ ${CERT_ON:-0} == 1 && ${CERT_CHALLENGE:-http} == http ]]; }
+cert_port_owned() {
+  cert_http_open && [[ $1 == 80 ]] && return 0
+  cert_is_public && [[ $1 == "${SUB_PORT:-}" ]] && return 0
+  return 1
 }
 tls_link_host() {
   if tls_present_real; then printf '%s' "$CERT_DOMAIN"; else server_addr; fi
@@ -3748,23 +3795,81 @@ cert_grant_readers() {
   fi
 }
 
-cert_san_ok() {
-  local san esc
-  [[ -s $1 ]] || return 1
-  san=$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null || true)
+cert_regex_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//./\\.}
+  s=${s//\*/\\*}
+  s=${s//\[/\\[}
+  s=${s//\]/\\]}
+  printf '%s' "$s"
+}
+cert_name_covered() { # $1 证书文件 $2 名字。*.example.com 只覆盖一级，不覆盖根域名。
+  local file=$1 name=$2 san esc wild w p left
+  [[ -s $file ]] || return 1
+  san=$(openssl x509 -in "$file" -noout -ext subjectAltName 2>/dev/null || true)
   [[ -n $san ]] || return 1
-  esc=${CERT_DOMAIN//./\\.}
-  grep -Eq "DNS:${esc}(,|[[:space:]]|$)" <<<"$san"
+  esc=$(cert_regex_escape "$name")
+  grep -Eq "DNS:${esc}(,|[[:space:]]|$)" <<<"$san" && return 0
+  [[ $name == \*.* ]] && return 1
+  wild=$(grep -Eo 'DNS:\*\.[A-Za-z0-9.-]+' <<<"$san" || true)
+  while read -r w; do
+    [[ -n $w ]] || continue
+    w=${w#DNS:}
+    p=${w#\*.}
+    [[ $name == *".${p}" ]] || continue
+    left=${name%".$p"}
+    [[ -n $left && $left != '*' && $left != *.* ]] && return 0
+  done <<<"$wild"
+  return 1
+}
+cert_san_ok() {
+  local f=$1 n names
+  [[ -s $f ]] || return 1
+  [[ -n ${CERT_DOMAIN:-} ]] || return 1
+  cert_name_covered "$f" "$CERT_DOMAIN" || return 1
+  names=${CERT_NAMES:-$CERT_DOMAIN}
+  local -a arr=()
+  IFS=',' read -ra arr <<< "$names"
+  for n in "${arr[@]}"; do
+    [[ -n $n ]] || continue
+    cert_name_covered "$f" "$n" || return 1
+  done
+}
+cert_issuer_ok() {
+  local iss
+  iss=$(openssl x509 -in "$1" -noout -issuer 2>/dev/null || true)
+  iss=${iss,,}
+  case ${CERT_CA:-letsencrypt} in
+    letsencrypt) [[ $iss == *"let's encrypt"* || $iss == *"lets encrypt"* ]] ;;
+    zerossl) [[ $iss == *zerossl* ]] ;;
+    cloudflare) [[ $iss == *cloudflare* ]] ;;
+    *) return 1 ;;
+  esac
 }
 cert_current_ok() {
   local f live="/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem"
+  if [[ ${CERT_CA:-letsencrypt} == cloudflare ]]; then
+    [[ -s $CERT_FULLCHAIN ]] || return 1
+    cert_san_ok "$CERT_FULLCHAIN" || return 1
+    cert_issuer_ok "$CERT_FULLCHAIN" || return 1
+    openssl x509 -checkend 2592000 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1 || return 1
+    return 0
+  fi
   for f in "$CERT_FULLCHAIN" "$live"; do
     [[ -s $f ]] || continue
     cert_san_ok "$f" || continue
+    cert_issuer_ok "$f" || continue
     openssl x509 -checkend 2592000 -noout -in "$f" >/dev/null 2>&1 || continue
     return 0
   done
   return 1
+}
+cert_lineage_reusable() {
+  local live="/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem"
+  [[ -s $live ]] || return 1
+  cert_san_ok "$live" || return 1
+  cert_issuer_ok "$live" || return 1
 }
 cert_expiry_text() {
   local end
@@ -4002,8 +4107,27 @@ EOF
 write_cert_helpers() { write_sub_python; write_cert_hook; }
 
 cert_install_material() {
+  if [[ ${CERT_CA:-letsencrypt} == cloudflare ]]; then
+    [[ -s $CERT_FULLCHAIN && -s $CERT_PRIVKEY ]] || die "源站证书文件不在。"
+    cert_grant_readers
+    mkdir -p "$CERT_LIB" "$(dirname "$SUB_LOG")"
+    chmod 755 "$CERT_BASE" 2>/dev/null || true
+    chmod 750 "$CERT_DIR"
+    chown "root:${CERT_GROUP}" "$CERT_DIR"
+    selinux_fix "$CERT_BASE" "$CERT_LIB"
+    return 0
+  fi
   local live="/etc/letsencrypt/live/${CERT_NAME}"
-  [[ -s ${live}/fullchain.pem && -s ${live}/privkey.pem ]] || die "certbot 没有留下证书文件。"
+  if [[ ! -s ${live}/fullchain.pem || ! -s ${live}/privkey.pem ]]; then
+    [[ -s $CERT_FULLCHAIN && -s $CERT_PRIVKEY ]] || die "certbot 没有留下证书文件。"
+    cert_grant_readers
+    mkdir -p "$CERT_LIB" "$(dirname "$SUB_LOG")"
+    chmod 755 "$CERT_BASE" 2>/dev/null || true
+    chmod 750 "$CERT_DIR"
+    chown "root:${CERT_GROUP}" "$CERT_DIR"
+    selinux_fix "$CERT_BASE" "$CERT_LIB"
+    return 0
+  fi
   cert_grant_readers
   mkdir -p "$CERT_DIR" "$CERT_LIB" "$(dirname "$SUB_LOG")"
   cp -f "${live}/fullchain.pem" "${CERT_FULLCHAIN}.new"
@@ -4020,28 +4144,74 @@ cert_install_material() {
 }
 certbot_issue() {
   local log live="/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem"
-  local -a args=()
+  local -a args=() dargs=() arr=()
+  local n who="Let's Encrypt"
   mktmp
   log="${TMP_DIR}/certbot-issue.log"
-  if [[ -s $live ]] && ! cert_san_ok "$live"; then
-    info "已有证书不是 ${CERT_DOMAIN}，先删除再申请。"
+  if [[ -s $live ]] && ! cert_lineage_reusable; then
+    info "已有证书的名字或签发机构与这次不一致，先删除再申请。"
     certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true
   fi
   if [[ -n $CERT_EMAIL ]]; then args=(--email "$CERT_EMAIL" --no-eff-email)
   else args=(--register-unsafely-without-email); fi
-  info "向 Let's Encrypt 申请 ${CERT_DOMAIN}（HTTP-01，端口 80）。不会改动 REALITY 的 TCP ${XRAY_PORT}。"
-  if ! certbot certonly --non-interactive --agree-tos \
-      --cert-name "$CERT_NAME" \
-      --standalone --preferred-challenges http --http-01-port 80 \
-      --keep-until-expiring \
-      --deploy-hook "$CERT_HOOK" \
-      -d "$CERT_DOMAIN" \
-      "${args[@]}" >"$log" 2>&1; then
-    tail -n 30 "$log" >&2 || true
-    cert_fail_explain "$log"
-    die "申请证书失败。REALITY（TCP ${XRAY_PORT}）没有改动，也没有改用这张证书。"
+  if [[ ${CERT_CA:-letsencrypt} == zerossl ]]; then
+    who="ZeroSSL"
+    cert_load_eab || die "没有 ZeroSSL 的 EAB 凭据。"
+    args+=(--server "$ZEROSSL_SERVER" --eab-kid "$ZEROSSL_KID" --eab-hmac-key "$ZEROSSL_HMAC")
   fi
-  ok "证书已签发: ${CERT_DOMAIN}"
+  IFS=',' read -ra arr <<< "${CERT_NAMES:-$CERT_DOMAIN}"
+  for n in "${arr[@]}"; do
+    [[ -n $n ]] || continue
+    dargs+=(-d "$n")
+  done
+  # 默认路径保持原来的 Let's Encrypt 单域名 HTTP-01，参数顺序不改。
+  if [[ ${CERT_CA:-letsencrypt} == letsencrypt && ${CERT_SCOPE:-single} == single && ${CERT_CHALLENGE:-http} == http ]]; then
+    info "向 Let's Encrypt 申请 ${CERT_DOMAIN}（HTTP-01，端口 80）。不会改动 REALITY 的 TCP ${XRAY_PORT}。"
+    if ! certbot certonly --non-interactive --agree-tos \
+        --cert-name "$CERT_NAME" \
+        --standalone --preferred-challenges http --http-01-port 80 \
+        --keep-until-expiring \
+        --deploy-hook "$CERT_HOOK" \
+        -d "$CERT_DOMAIN" \
+        "${args[@]}" >"$log" 2>&1; then
+      tail -n 30 "$log" >&2 || true
+      cert_fail_explain "$log"
+      die "申请证书失败。REALITY（TCP ${XRAY_PORT}）没有改动，也没有改用这张证书。"
+    fi
+    ok "证书已签发: ${CERT_DOMAIN}"
+    return 0
+  fi
+  if [[ ${CERT_CHALLENGE:-http} == dns ]]; then
+    info "向 ${who} 申请通配符（DNS-01）：${CERT_NAMES}。不占用 80，也不改 REALITY 的 TCP ${XRAY_PORT}。"
+    if ! certbot certonly --non-interactive --agree-tos \
+        --cert-name "$CERT_NAME" \
+        --manual --preferred-challenges dns \
+        --manual-auth-hook "$CERT_DNS_AUTH" \
+        --manual-cleanup-hook "$CERT_DNS_CLEAN" \
+        --manual-public-ip-logging-ok \
+        --keep-until-expiring \
+        --deploy-hook "$CERT_HOOK" \
+        "${dargs[@]}" \
+        "${args[@]}" >"$log" 2>&1; then
+      tail -n 40 "$log" >&2 || true
+      cert_fail_explain "$log"
+      die "申请证书失败。REALITY（TCP ${XRAY_PORT}）没有改动，也没有改用这张证书。"
+    fi
+  else
+    info "向 ${who} 申请证书（HTTP-01，端口 80）：${CERT_NAMES:-$CERT_DOMAIN}。不会改动 REALITY 的 TCP ${XRAY_PORT}。"
+    if ! certbot certonly --non-interactive --agree-tos \
+        --cert-name "$CERT_NAME" \
+        --standalone --preferred-challenges http --http-01-port 80 \
+        --keep-until-expiring \
+        --deploy-hook "$CERT_HOOK" \
+        "${dargs[@]}" \
+        "${args[@]}" >"$log" 2>&1; then
+      tail -n 40 "$log" >&2 || true
+      cert_fail_explain "$log"
+      die "申请证书失败。REALITY（TCP ${XRAY_PORT}）没有改动，也没有改用这张证书。"
+    fi
+  fi
+  ok "证书已签发: ${CERT_NAMES:-$CERT_DOMAIN}"
 }
 
 cert_b64() {
@@ -4180,7 +4350,7 @@ EOF
   else
     cat >"$CERT_RENEW_UNIT" <<EOF
 [Unit]
-Description=Renew proxy-oneclick Let's Encrypt certificate
+Description=Renew proxy-oneclick certificate
 After=network-online.target
 Wants=network-online.target
 
@@ -4237,7 +4407,11 @@ cert_start_sub() {
   cert_write_sub_conf
   cert_write_bodies
   write_sub_service
-  write_renew_job
+  if cert_renew_unattended; then write_renew_job
+  else
+    cert_drop_renew_job
+    warn "没有保存 Cloudflare DNS 令牌，定时任务没法自己添加 TXT。到期前请运行 proxy cert 再添加一次，或重新申请时加上 --cf-dns-token。"
+  fi
   sd_reload
   svc_enable proxy-oneclick-sub
   svc_restart proxy-oneclick-sub || true
@@ -4250,64 +4424,936 @@ cert_start_sub() {
   cert_selfcheck
 }
 
-cert_ask_domain() {
-  [[ -n $OPT_CERT_DOMAIN ]] && CERT_DOMAIN=$OPT_CERT_DOMAIN
-  [[ -n $OPT_CERT_EMAIL ]] && CERT_EMAIL=$OPT_CERT_EMAIL
-  cert_normalize_domain
-  while :; do
-    if [[ -z $CERT_DOMAIN ]]; then
-      if (( OPT_AUTO )); then
-        if cdn_wanted; then
-          cdn_explain cert_required
-          die "请加上 --cert-domain <你的域名>。REALITY 未改动。"
-        fi
-        die "申请证书需要 --cert-domain <域名>。"
-      fi
-      ask CERT_DOMAIN "域名（已解析到本机，例如 example.com）" ""
-      cert_normalize_domain
-    fi
-    if ! cert_domain_syntax "$CERT_DOMAIN"; then
-      warn "域名无效: ${CERT_DOMAIN:-空}。需要像 example.com 这样的域名，不能是 IP。"
-      (( OPT_AUTO )) || [[ -n $OPT_CERT_DOMAIN ]] && die "域名无效，已取消申请证书。REALITY 未改动。"
-      CERT_DOMAIN=""
-      OPT_CERT_DOMAIN=""
-      continue
-    fi
-    [[ -n $PUBLIC_IP4 || -n $PUBLIC_IP6 ]] || detect_ip
-    if cert_domain_points_here "$CERT_DOMAIN"; then break; fi
-    cdn_explain dns
-    (( OPT_AUTO )) || [[ -n $OPT_CERT_DOMAIN ]] && die "域名 ${CERT_DOMAIN} 没有全部解析到本机，已取消申请证书。REALITY 未改动。"
-    confirm "重新填写域名？" y || die "已取消申请证书。REALITY 未改动。"
-    CERT_DOMAIN=""
-    OPT_CERT_DOMAIN=""
+cert_kind_id() {
+  case ${CERT_CA:-letsencrypt}:${CERT_SCOPE:-single} in
+    letsencrypt:single) printf 'le' ;;
+    letsencrypt:wildcard) printf 'wildcard' ;;
+    letsencrypt:multi) printf 'multi' ;;
+    zerossl:single) printf 'zerossl' ;;
+    zerossl:wildcard) printf 'zerossl-wildcard' ;;
+    zerossl:multi) printf 'zerossl-multi' ;;
+    cloudflare:*) printf 'cf-origin' ;;
+    *) printf 'le' ;;
+  esac
+}
+cert_kind_label_of() {
+  case $1 in
+    le) printf "Let's Encrypt 单域名" ;;
+    wildcard) printf "Let's Encrypt 通配符" ;;
+    multi) printf "Let's Encrypt 多域名" ;;
+    zerossl) printf "ZeroSSL 单域名" ;;
+    zerossl-wildcard) printf "ZeroSSL 通配符" ;;
+    zerossl-multi) printf "ZeroSSL 多域名" ;;
+    cf-origin) printf "Cloudflare 源站证书" ;;
+    *) printf '证书' ;;
+  esac
+}
+cert_kind_label() { cert_kind_label_of "$(cert_kind_id)"; }
+cert_normalize_kind() {
+  local k=${1,,}
+  k=${k// /}
+  case $k in
+    le|letsencrypt|single|http|http-01|http01) printf 'le' ;;
+    wildcard|wild|dns|dns-01|dns01) printf 'wildcard' ;;
+    multi|san|names) printf 'multi' ;;
+    zerossl|zero|zerossl-single|zerossl-http) printf 'zerossl' ;;
+    zerossl-wildcard|zerossl-wild|zerossl-dns) printf 'zerossl-wildcard' ;;
+    zerossl-multi|zerossl-san) printf 'zerossl-multi' ;;
+    cf-origin|cf|cloudflare|origin|origin-ca|cf-origin-ca) printf 'cf-origin' ;;
+    *) return 1 ;;
+  esac
+}
+cert_kind_apply() {
+  case $1 in
+    le) CERT_CA=letsencrypt; CERT_SCOPE=single; CERT_PUBLIC=1; CERT_CHALLENGE=http ;;
+    wildcard) CERT_CA=letsencrypt; CERT_SCOPE=wildcard; CERT_PUBLIC=1; CERT_CHALLENGE=dns ;;
+    multi) CERT_CA=letsencrypt; CERT_SCOPE=multi; CERT_PUBLIC=1; CERT_CHALLENGE=http ;;
+    zerossl) CERT_CA=zerossl; CERT_SCOPE=single; CERT_PUBLIC=1; CERT_CHALLENGE=http ;;
+    zerossl-wildcard) CERT_CA=zerossl; CERT_SCOPE=wildcard; CERT_PUBLIC=1; CERT_CHALLENGE=dns ;;
+    zerossl-multi) CERT_CA=zerossl; CERT_SCOPE=multi; CERT_PUBLIC=1; CERT_CHALLENGE=http ;;
+    cf-origin)
+      CERT_CA=cloudflare; CERT_PUBLIC=0; CERT_CHALLENGE=none
+      if [[ ${PLAN_NAMES:-} == *'*'* ]]; then CERT_SCOPE=wildcard
+      elif [[ ${PLAN_NAMES:-} == *,* ]]; then CERT_SCOPE=multi
+      else CERT_SCOPE=single; fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+cert_renew_unattended() {
+  [[ ${CERT_CA:-letsencrypt} == cloudflare ]] && return 1
+  [[ ${CERT_CHALLENGE:-http} == http ]] && return 0
+  [[ ${CERT_CHALLENGE:-} == dns && -s ${CERT_DNS_TOKEN:-} ]]
+}
+cert_drop_renew_job() {
+  if [[ ${INIT_SYS:-} == systemd ]] && have systemctl; then
+    systemctl disable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || true
+  fi
+  rm -f "$CERT_TIMER_UNIT" "$CERT_RENEW_UNIT" "$CERT_CRON"
+  sd_reload
+}
+cert_name_syntax() {
+  local d=${1,,}
+  d=${d%.}
+  if [[ $d == \*.* ]]; then cert_domain_syntax "${d#\*.}"; return; fi
+  cert_domain_syntax "$d"
+}
+cert_norm_names() {
+  local raw=$1 n out=""
+  local -a arr=()
+  raw=${raw// /}
+  raw=${raw,,}
+  raw=${raw//，/,}
+  IFS=',' read -ra arr <<< "$raw"
+  for n in "${arr[@]}"; do
+    n=${n%.}
+    [[ -n $n ]] || continue
+    cert_name_syntax "$n" || return 1
+    [[ ",${out}," == *",${n},"* ]] && continue
+    out+="${out:+,}${n}"
   done
-  if [[ -n $CERT_EMAIL ]] && ! cert_email_syntax "$CERT_EMAIL"; then
-    die "邮箱格式无效: ${CERT_EMAIL}"
+  [[ -n $out ]] || return 1
+  printf '%s' "$out"
+}
+cert_ensure_apex_for_wild() {
+  local names=$1 n parent out
+  local -a arr=()
+  out=$names
+  IFS=',' read -ra arr <<< "$names"
+  for n in "${arr[@]}"; do
+    [[ $n == \*.* ]] || continue
+    parent=${n#\*.}
+    [[ ",${out}," == *",${parent},"* ]] && continue
+    out="${out},${parent}"
+  done
+  printf '%s' "$out"
+}
+cert_link_covered_by_names() {
+  local link=$1 names=$2 n parent left
+  local -a arr=()
+  [[ -n $link && $link != \*.* ]] || return 1
+  IFS=',' read -ra arr <<< "$names"
+  for n in "${arr[@]}"; do
+    [[ $n == "$link" ]] && return 0
+    if [[ $n == \*.* ]]; then
+      parent=${n#\*.}
+      [[ $link == *".${parent}" ]] || continue
+      left=${link%".${parent}"}
+      [[ -n $left && $left != '*' && $left != *.* ]] && return 0
+    fi
+  done
+  return 1
+}
+cert_names_json() {
+  local n out=""
+  local -a arr=()
+  IFS=',' read -ra arr <<< "${CERT_NAMES:-}"
+  for n in "${arr[@]}"; do
+    [[ -n $n ]] || continue
+    out+="${out:+,}\"${n}\""
+  done
+  printf '[%s]' "$out"
+}
+cert_write_secret() {
+  local path=$1 body=$2 old
+  mkdir -p "$(dirname "$path")"
+  chmod 755 "$CERT_BASE" 2>/dev/null || true
+  old=$(umask)
+  umask 077
+  printf '%s\n' "$body" >"${path}.new"
+  umask "$old"
+  chmod 600 "${path}.new"
+  mv -f "${path}.new" "$path"
+}
+cert_load_eab() {
+  [[ -s $CERT_ZEROSSL_EAB ]] || return 1
+  ZEROSSL_KID=$(sed -n 's/^kid=//p' "$CERT_ZEROSSL_EAB" | head -n1)
+  ZEROSSL_HMAC=$(sed -n 's/^hmac=//p' "$CERT_ZEROSSL_EAB" | head -n1)
+  [[ -n $ZEROSSL_KID && -n $ZEROSSL_HMAC ]]
+}
+cert_explain() {
+  case $1 in
+    dns_not_here)
+      cat >&2 <<'EOF'
+域名没有全部指向这台机器，HTTP-01 不会成功。
+Let's Encrypt / ZeroSSL 会从公网访问本机的 80 端口。A 和 AAAA 里只要有一条不是本机，验证就会失败。
+若开着橙色云朵，访问会先到 Cloudflare，而不是这台机器。申请和续期时请改成灰色云朵（仅 DNS）。
+等解析生效后再试。不要把 REALITY 用来伪装的网站填到这里。REALITY 本身不用改。
+EOF
+      ;;
+    txt_timeout|txt_missing)
+      cat >&2 <<'EOF'
+DNS-01 没有完成。通配符不能用 HTTP-01，只能靠 TXT 证明你能改这个域名的 DNS。
+请检查 _acme-challenge 这条 TXT：
+1. 类型是 TXT，云朵必须是灰色。橙色云朵会让 1.1.1.1 和 8.8.8.8 看不到它。
+2. 在 Cloudflare 里名称只填 _acme-challenge，不要写成 _acme-challenge.example.com.example.com。
+3. 内容不要自己再加一层引号。
+4. 通配符会同时要 *.域名 和根域名，这是两条内容不同的 TXT，都要留下，不要互相覆盖。
+5. 刚改完可能要等一两分钟。没有 API 令牌时，到期前要再添加一次；想自动续期就重新申请并加上 --cf-dns-token。
+REALITY 没有改动。
+EOF
+      ;;
+    dns_token)
+      cat >&2 <<'EOF'
+Cloudflare 没有接受这个 DNS 令牌。
+通配符要用的是 API 令牌，不是源站证书的 Origin CA Key。两把钥匙不能混用。
+创建令牌时权限选：Zone → DNS → 编辑，以及 Zone → Zone → 读取。区域选你的域名，或所有区域。
+令牌复制错一位、过期、或只给了读取权限，都会在这里失败。到 Cloudflare 控制台重新建一把，用 --cf-dns-token 传入。
+脚本不会把令牌写进 state.env。REALITY 没有改动。
+EOF
+      ;;
+    dns_zone)
+      cat >&2 <<'EOF'
+这个令牌能登录 Cloudflare，但找不到域名所在的区域。
+请先把域名添加到这个 Cloudflare 账号，并确认令牌的区域范围包含它。
+域名还在别的注册商、或令牌属于另一个账号时，TXT 加不上去。REALITY 没有改动。
+EOF
+      ;;
+    eab)
+      cat >&2 <<'EOF'
+ZeroSSL 没有接受 EAB 凭据。
+打开 https://app.zerossl.com/developer ，生成一对 EAB KID 和 HMAC Key。必须是同一对，不能把两个填反，也不能少一位。
+用 --zerossl-kid 和 --zerossl-hmac 一起传入。HMAC 里的 + / = 要原样保留。
+这和 Let's Encrypt 不一样：ZeroSSL 的 ACME 注册必须有这对钥匙。凭据放在 /etc/proxy-oneclick/zerossl.eab（权限 600），不写入 state.env。
+REALITY 没有改动。
+EOF
+      ;;
+    rate_zero)
+      cat >&2 <<'EOF'
+ZeroSSL 拒绝签发：这个域名最近申请次数太多。
+等限制过去，或换一个还没申请过的名字。这不是 REALITY 的问题，REALITY 不使用这张证书。
+EOF
+      ;;
+    multi_fail)
+      cat >&2 <<'EOF'
+多域名证书没有签发。名单里只要有一个名字失败，整张证书都不会下来。
+请逐个检查：每个名字的 A/AAAA 都指向本机，并且是灰色云朵。橙色云朵期间，验证请求打到 Cloudflare，80 端口对不上。
+不能在这张 HTTP-01 证书里写 *.example.com。通配符请改用 wildcard 或 zerossl-wildcard。
+REALITY 没有改动。
+EOF
+      ;;
+    origin_auth)
+      cat >&2 <<'EOF'
+Cloudflare 没有接受这把源站证书钥匙。
+要用的是 Origin CA Key：打开 https://dash.cloudflare.com/profile/api-tokens ，拉到页面最下面，复制 Origin CA Key。
+这不是普通 API 令牌，也不是用来添加 TXT 的 DNS 令牌。把 DNS 令牌填到 --cf-origin-key 会在这里失败。
+用 --cf-origin-key 传入。钥匙只保存在 /etc/proxy-oneclick/cf-origin.key（权限 600）。REALITY 没有改动。
+EOF
+      ;;
+    origin_host)
+      cat >&2 <<'EOF'
+Cloudflare 没有给这些主机名签发源站证书。
+每个名字都必须属于这个 Origin CA Key 所在账号里的某个区域，例如 example.com 或 *.example.com。
+域名还没加到 Cloudflare、写错了别的账号的域名、或钥匙属于另一个账号，都会失败。
+源站证书只有 Cloudflare 信任。不要拿它给 Hysteria2、TUIC、AnyTLS 或订阅。REALITY 没有改动。
+EOF
+      ;;
+    *)
+      cdn_explain cert_fail
+      ;;
+  esac
+}
+cert_print_tutorial() {
+  echo
+  ui_bar '═' 62
+  ui_center "证书：$(cert_kind_label)" 62
+  ui_bar '─' 62
+  case $(cert_kind_id) in
+    le)
+      cat <<EOF
+这张是 Let's Encrypt 单域名证书，也是脚本的默认种类。只包含 ${CERT_DOMAIN}。
+适合：订阅 HTTPS，以及 Hysteria2、TUIC、AnyTLS。客户端按正常证书校验，链接改用这个域名，不再使用 insecure 或 pin。
+不适合：不能签发 *.${CERT_DOMAIN}。HTTP-01 证明不了通配符。要通配符请改用 wildcard。
+
+申请前：
+1. ${CERT_DOMAIN} 的全部 A/AAAA 指向本机。
+2. 关掉橙色云朵，改成灰色（仅 DNS）。橙云时验证会打到 Cloudflare，本机 80 收不到。
+3. 云安全组放行 TCP 80。80 只在申请和续期时短暂占用，不提供订阅，也不跑代理。
+4. 不要占用 REALITY 的端口。REALITY 继续借用伪装站点 ${SNI:-（安装时选的站点）}，配置里不写这张证书。
+
+签好之后：Hysteria2 / TUIC / AnyTLS 出示这张证书。REALITY、XHTTP+REALITY、Trojan 不变。
+若另外打开了 CDN 上的 XHTTP+TLS 或 WebSocket+TLS，那两条也用这张证书。
+这个名字一旦开了橙色云朵，Hysteria2、TUIC、AnyTLS 和订阅就不能再靠它连接（Cloudflare 不转发 UDP，也不转发订阅端口）。那几条请改用服务器 IP，或另做一个灰色云朵的名字。脚本不会因此改掉 REALITY。
+续期由系统定时任务完成，大约 90 天一轮，到期前约 30 天自动续。续期同样需要 80 能从公网访问。
+继续即表示同意 Let's Encrypt 服务条款：https://letsencrypt.org/repository/
+EOF
+      ;;
+    zerossl)
+      cat <<EOF
+这张是 ZeroSSL 单域名证书，公开信任，作用和 Let's Encrypt 单域名一样，只是换了一家 CA。只包含 ${CERT_DOMAIN}。
+适合：订阅 HTTPS，以及 Hysteria2、TUIC、AnyTLS。不适合：不能签发通配符。
+
+和 Let's Encrypt 的差别：必须有一对 EAB 凭据。打开 https://app.zerossl.com/developer 生成 EAB KID 和 HMAC Key，用 --zerossl-kid 和 --zerossl-hmac 传入。KID 和 HMAC 必须是同一对。
+域名、灰色云朵、TCP 80 的要求和 Let's Encrypt 单域名相同。橙云期间不要申请。
+签好之后协议怎么变，也和 Let's Encrypt 单域名相同。REALITY 不变。
+建议加上 --cert-email。不填则不登记邮箱；若 ZeroSSL 拒绝注册，补上邮箱再试。
+EOF
+      ;;
+    wildcard|zerossl-wildcard)
+      cat <<EOF
+这张是通配符证书，名字是 ${CERT_NAMES}。
+星号只覆盖一级子域名，不覆盖 a.b.根域名。根域名会单独写上，所以根域名本身也能用。
+链接里的主机名是 ${CERT_DOMAIN}。
+
+为什么用 DNS-01：HTTP-01 不能证明你拥有星号开头的名字。不占用 80 端口。
+不适合拿来代替 REALITY。REALITY 仍然借用伪装站点，不读这张证书。
+
+DNS 要做的事：
+1. 域名放在 Cloudflare。
+2. 添加 TXT，名称是 _acme-challenge，云朵必须是灰色。橙色云朵会让公共 DNS 看不到 TXT。
+3. 通配符和根域名是两条内容不同的 TXT，都要留下，不要互相覆盖。名称不要写成带两层域名的样子。
+4. 有 API 令牌时，脚本自己添加。令牌权限：Zone → DNS → 编辑，以及 Zone → Zone → 读取。这不是 Origin CA Key。用 --cf-dns-token 传入。令牌只放在权限 600 的文件里，不进 state.env，但会出现在进程列表里。
+5. 没有令牌时，脚本把要添加的内容打在屏幕上，并等待 1.1.1.1 和 8.8.8.8 能查到。这种方式不能自动续期。
+
+签好之后：这是公开证书。Hysteria2 / TUIC / AnyTLS 改用它，订阅走 HTTPS。REALITY 不变。
+若 ${CERT_DOMAIN} 要开橙色云朵给 CDN，直连的 Hysteria2、TUIC、AnyTLS 和订阅不要再用这个名字，请改用服务器 IP，或用 --cert-link 指定一个仍是灰色云朵、且被这张通配符覆盖的子域名。
+EOF
+      if [[ $(cert_kind_id) == zerossl-wildcard ]]; then
+        echo "签发机构是 ZeroSSL，还需要 https://app.zerossl.com/developer 的 EAB KID 和 HMAC。公开信任，客户端不用改校验方式。"
+      else
+        echo "签发机构是 Let's Encrypt。继续即表示同意其服务条款：https://letsencrypt.org/repository/"
+      fi
+      ;;
+    multi|zerossl-multi)
+      cat <<EOF
+这张证书上有多个名字：${CERT_NAMES}。链接和订阅使用 ${CERT_DOMAIN}。
+适合：几个主机名共用一张公开证书，给订阅 HTTPS 以及 Hysteria2、TUIC、AnyTLS。
+不适合：不能写 *.域名。通配符请改用 wildcard。REALITY 不用这张证书。
+
+每个名字都要满足：
+1. A/AAAA 全部指向本机。有一个不对，整张证书都失败。
+2. 申请时是灰色云朵。橙色云朵会把验证请求带到 Cloudflare。
+3. 云安全组放行 TCP 80。不改 REALITY 的端口。
+
+签好之后协议变化与单域名公开证书相同。续期同样走 HTTP-01。
+EOF
+      if [[ $(cert_kind_id) == zerossl-multi ]]; then
+        echo "签发机构是 ZeroSSL，需要成对的 EAB KID 和 HMAC（https://app.zerossl.com/developer）。"
+      else
+        echo "签发机构是 Let's Encrypt。继续即表示同意其服务条款：https://letsencrypt.org/repository/"
+      fi
+      ;;
+    cf-origin)
+      cat <<EOF
+这是 Cloudflare 源站证书，名字是 ${CERT_NAMES}。CDN 链接使用 ${CERT_DOMAIN}。
+只有 Cloudflare 信任它。浏览器直接打开会报不安全。Hysteria2、TUIC、AnyTLS 的客户端会拒绝。订阅 HTTPS 也不能用它。
+只适合两条 CDN 线路：XHTTP+TLS 和 WebSocket+TLS，并且域名开着橙色云朵，加密模式选「完全（严格）」。
+不要用于 Hysteria2、TUIC、AnyTLS、订阅，也不要用于 REALITY。脚本不会把这张证书装进那三个协议，也不会打开订阅。它们继续用自签证书或服务器 IP。
+
+申请步骤：
+1. 域名已经在这个 Cloudflare 账号里。
+2. 打开 https://dash.cloudflare.com/profile/api-tokens ，拉到最下面，复制 Origin CA Key。
+3. 这不是普通 API 令牌，也不是添加 TXT 用的 DNS 令牌。用 --cf-origin-key 传入。
+4. 不需要开放 80，也不走 certbot。有效期大约 15 年，不会自动续期。要换种类，先关掉这张再申请另一种。
+5. 主机名必须属于你的区域。写了 *.根域名 时，脚本会把根域名一并放进证书。*.根域名 不覆盖二级名字，例如 a.b.根域名。
+
+签好之后：REALITY 的端口、密钥和伪装站点都不变。
+若 CDN 线路已经打开，会改用这张证书。还没打开的话，到协议开关里打开 XHTTP+TLS 或 WebSocket+TLS。不要把 REALITY 放进橙色云朵后面。
+EOF
+      ;;
+  esac
+  ui_bar '═' 62
+  echo
+}
+cert_need_domain_die() {
+  case ${PLAN_KIND:-le} in
+    wildcard|zerossl-wildcard)
+      die "通配符证书需要根域名。例如：--cert-kind ${PLAN_KIND} --cert-domain example.com（会申请 *.example.com 和 example.com）。HTTP-01 做不到通配符。REALITY 未改动。" ;;
+    multi|zerossl-multi)
+      die "多域名证书需要 --cert-names a.example.com,b.example.com。每个名字都要解析到本机。REALITY 未改动。" ;;
+    cf-origin)
+      die "Cloudflare 源站证书需要 --cert-domain 或 --cert-names，以及 --cf-origin-key。例如 --cert-kind cf-origin --cf-origin-key <钥匙> --cert-domain cdn.example.com。REALITY 未改动。" ;;
+    *)
+      die "申请证书需要 --cert-domain <域名>。REALITY 未改动。" ;;
+  esac
+}
+cert_require_eab() {
+  local kid="" hmac=""
+  if [[ -n ${OPT_ZEROSSL_KID:-} || -n ${OPT_ZEROSSL_HMAC:-} ]]; then
+    if [[ -z ${OPT_ZEROSSL_KID:-} || -z ${OPT_ZEROSSL_HMAC:-} ]]; then
+      cert_explain eab
+      die "ZeroSSL 的 EAB 要成对提供。REALITY 未改动。"
+    fi
+    cert_write_secret "$CERT_ZEROSSL_EAB" "kid=${OPT_ZEROSSL_KID}"$'\n'"hmac=${OPT_ZEROSSL_HMAC}"
+    return 0
+  fi
+  cert_load_eab && return 0
+  if (( OPT_AUTO )); then
+    cert_explain eab
+    die "自动申请 ZeroSSL 需要 --zerossl-kid 和 --zerossl-hmac。REALITY 未改动。"
+  fi
+  cert_explain eab
+  ask kid "ZeroSSL EAB KID" ""
+  ask hmac "ZeroSSL EAB HMAC Key" ""
+  if [[ -z $kid || -z $hmac ]]; then die "没有 EAB 凭据，已取消。REALITY 未改动。"; fi
+  cert_write_secret "$CERT_ZEROSSL_EAB" "kid=${kid}"$'\n'"hmac=${hmac}"
+}
+cert_require_dns_token() {
+  local tok=""
+  if [[ -n ${OPT_CF_DNS_TOKEN:-} ]]; then
+    cert_write_secret "$CERT_DNS_TOKEN" "$OPT_CF_DNS_TOKEN"
+    return 0
+  fi
+  if [[ -s $CERT_DNS_TOKEN ]]; then return 0; fi
+  if (( OPT_AUTO )); then
+    cert_explain dns_token
+    die "自动申请通配符需要 --cf-dns-token。没有令牌时无法自己添加 TXT。REALITY 未改动。"
+  fi
+  if confirm "是否已有 Cloudflare API 令牌，让脚本自动添加 TXT？选否会把记录内容打在屏幕上，等你手工添加。" y; then
+    ask tok "Cloudflare API 令牌（Zone.DNS 编辑 + Zone 读取，不是 Origin CA Key）" ""
+    if [[ -z $tok ]]; then die "没有令牌，已取消。REALITY 未改动。"; fi
+    cert_write_secret "$CERT_DNS_TOKEN" "$tok"
+  else
+    info "改为手工 TXT。记录必须是灰色云朵。这次不保存令牌，以后不能自动续期。"
   fi
 }
-cert_issue_flow() {
-  step "申请公开证书"
-  cert_ask_domain
-  choose_sub_port
-  [[ -n $SUB_TOKEN ]] || SUB_TOKEN=$(rand_hex 16)
-  install_certbot_pkg
-  write_cert_helpers
-  cert_allow_80_now
-  if cert_current_ok; then
-    info "证书仍有效（${CERT_DOMAIN}，到期 $(cert_expiry_text)），跳过重新申请。"
-  else
-    if port_in_use tcp 80; then
-      cdn_explain port80 "$(port_owner tcp 80)"
-      die "80 端口被占用，证书没有申请。REALITY 的端口没有改。"
+cert_require_origin_key() {
+  local k=""
+  if [[ -n ${OPT_CF_ORIGIN_KEY:-} ]]; then
+    cert_write_secret "$CERT_ORIGIN_KEY" "$OPT_CF_ORIGIN_KEY"
+    return 0
+  fi
+  if [[ -s $CERT_ORIGIN_KEY ]]; then return 0; fi
+  if (( OPT_AUTO )); then
+    cert_explain origin_auth
+    die "自动申请源站证书需要 --cf-origin-key。这是 Origin CA Key，不是 DNS 令牌。REALITY 未改动。"
+  fi
+  cert_explain origin_auth
+  ask k "Cloudflare Origin CA Key" ""
+  if [[ -z $k ]]; then die "没有 Origin CA Key，已取消。REALITY 未改动。"; fi
+  cert_write_secret "$CERT_ORIGIN_KEY" "$k"
+}
+cert_plan_single() {
+  local d=${OPT_CERT_DOMAIN:-} def=""
+  if [[ -z $d && -n ${OPT_CERT_NAMES:-} && ${OPT_CERT_NAMES} != *,* && ${OPT_CERT_NAMES} != \*.* ]]; then d=$OPT_CERT_NAMES; fi
+  if [[ -z $d && -n ${CERT_DOMAIN:-} ]]; then def=$CERT_DOMAIN; fi
+  while :; do
+    if [[ -z $d ]]; then
+      (( OPT_AUTO )) && cert_need_domain_die
+      ask d "域名（已解析到本机，例如 example.com）" "$def"
+      d=${d,,}; d=${d%.}; d=${d// /}
     fi
-    certbot_issue
+    if ! cert_domain_syntax "$d"; then
+      warn "域名无效: ${d:-空}。需要像 example.com 这样的域名，不能是 IP。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_DOMAIN:-} ]]; } && die "域名无效，已取消申请证书。REALITY 未改动。"
+      d=""; OPT_CERT_DOMAIN=""; continue
+    fi
+    [[ -n ${PUBLIC_IP4:-} || -n ${PUBLIC_IP6:-} ]] || detect_ip
+    if cert_domain_points_here "$d"; then break; fi
+    cert_explain dns_not_here
+    { (( OPT_AUTO )) || [[ -n ${OPT_CERT_DOMAIN:-} ]]; } && die "域名 ${d} 没有全部解析到本机，已取消申请证书。REALITY 未改动。"
+    confirm "重新填写域名？" y || die "已取消申请证书。REALITY 未改动。"
+    d=""; OPT_CERT_DOMAIN=""
+  done
+  PLAN_DOMAIN=$d
+  PLAN_NAMES=$d
+}
+cert_plan_wildcard() {
+  local apex=${OPT_CERT_DOMAIN:-} link=${OPT_CERT_LINK:-} def=""
+  if [[ -z $apex && -n ${CERT_DOMAIN:-} && ${CERT_DOMAIN} != \*.* ]]; then def=$CERT_DOMAIN; fi
+  while :; do
+    if [[ -z $apex ]]; then
+      (( OPT_AUTO )) && cert_need_domain_die
+      ask apex "根域名（例如 example.com，将申请 *.example.com 和 example.com）" "$def"
+      apex=${apex,,}; apex=${apex%.}; apex=${apex// /}
+      apex=${apex#\*.}
+    fi
+    if ! cert_domain_syntax "$apex"; then
+      warn "根域名无效: ${apex:-空}。请写 example.com，不要写成 *.example.com。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_DOMAIN:-} ]]; } && die "根域名无效。REALITY 未改动。"
+      apex=""; OPT_CERT_DOMAIN=""; continue
+    fi
+    break
+  done
+  PLAN_NAMES="*.${apex},${apex}"
+  if [[ -z $link ]]; then link=$apex; else link=${link,,}; link=${link%.}; fi
+  if ! cert_link_covered_by_names "$link" "$PLAN_NAMES"; then
+    die "链接用的名字 ${link} 不在这张通配符证书里。*.${apex} 只覆盖一级子域名。根域名已经包含在内。请改 --cert-link，或留空用 ${apex}。REALITY 未改动。"
+  fi
+  PLAN_DOMAIN=$link
+  info "通配符证书包含 ${PLAN_NAMES}。客户端链接使用 ${PLAN_DOMAIN}。DNS-01 不要求 A 记录已经指向本机，也不占用 80。"
+}
+cert_plan_multi() {
+  local raw=${OPT_CERT_NAMES:-} names="" n link="" failed=0
+  local -a arr=()
+  while :; do
+    if [[ -z $raw ]]; then
+      (( OPT_AUTO )) && cert_need_domain_die
+      ask raw "多个域名，逗号分隔（每个都必须解析到本机）" "${CERT_NAMES:-}"
+    fi
+    if ! names=$(cert_norm_names "$raw"); then
+      warn "域名列表无效。例如 a.example.com,b.example.com。不能写 IP，也不能写 *.example.com。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_NAMES:-} ]]; } && die "多域名列表无效。REALITY 未改动。"
+      raw=""; OPT_CERT_NAMES=""; continue
+    fi
+    if [[ $names == *'*'* ]]; then
+      die "多域名的 HTTP-01 不能包含通配符。请改用 --cert-kind wildcard。REALITY 未改动。"
+    fi
+    if [[ $names != *,* ]]; then
+      warn "多域名至少要两个名字。只有一个时用单域名即可。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_NAMES:-} ]]; } && die "多域名至少两个名字。REALITY 未改动。"
+      raw=""; OPT_CERT_NAMES=""; continue
+    fi
+    break
+  done
+  [[ -n ${PUBLIC_IP4:-} || -n ${PUBLIC_IP6:-} ]] || detect_ip
+  IFS=',' read -ra arr <<< "$names"
+  for n in "${arr[@]}"; do
+    cert_domain_points_here "$n" || failed=1
+  done
+  if (( failed )); then
+    cert_explain dns_not_here
+    die "上面有域名没有全部解析到本机，多域名证书没有申请。REALITY 未改动。"
+  fi
+  link=${OPT_CERT_LINK:-}
+  [[ -n $link ]] || link=${OPT_CERT_DOMAIN:-}
+  [[ -n $link ]] || link=${names%%,*}
+  link=${link,,}; link=${link%.}
+  if [[ ",${names}," != *",${link},"* ]]; then
+    die "链接主机名 ${link} 不在名单里。它必须是证书上的其中一个名字。REALITY 未改动。"
+  fi
+  PLAN_NAMES=$names
+  PLAN_DOMAIN=$link
+}
+cert_plan_origin() {
+  local raw=${OPT_CERT_NAMES:-} names="" link="" n
+  local -a arr=()
+  if [[ -z $raw && -n ${OPT_CERT_DOMAIN:-} ]]; then raw=$OPT_CERT_DOMAIN; fi
+  while :; do
+    if [[ -z $raw ]]; then
+      (( OPT_AUTO )) && cert_need_domain_die
+      ask raw "源站证书上的名字（cdn.example.com，或 *.example.com,example.com）" "${CERT_NAMES:-${CERT_DOMAIN:-}}"
+    fi
+    if ! names=$(cert_norm_names "$raw"); then
+      warn "名字无效。可以写 cdn.example.com，或 *.example.com。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_NAMES:-} || -n ${OPT_CERT_DOMAIN:-} ]]; } && die "源站证书的域名无效。REALITY 未改动。"
+      raw=""; continue
+    fi
+    break
+  done
+  names=$(cert_ensure_apex_for_wild "$names")
+  link=${OPT_CERT_LINK:-}
+  if [[ -z $link && -n ${OPT_CERT_DOMAIN:-} && ${OPT_CERT_DOMAIN} != \*.* ]]; then link=$OPT_CERT_DOMAIN; fi
+  if [[ -z $link ]]; then
+    IFS=',' read -ra arr <<< "$names"
+    for n in "${arr[@]}"; do
+      [[ $n == \*.* ]] && continue
+      link=$n
+      break
+    done
+  fi
+  link=${link,,}; link=${link%.}
+  if [[ -z $link || $link == \*.* ]]; then
+    die "源站证书需要一个具体主机名给 CDN 链接使用。加上 --cert-link cdn.example.com，或把根域名也写上。REALITY 未改动。"
+  fi
+  if ! cert_link_covered_by_names "$link" "$names"; then
+    die "链接主机名 ${link} 不在源站证书的名字里。REALITY 未改动。"
+  fi
+  PLAN_NAMES=$names
+  PLAN_DOMAIN=$link
+  info "源站证书只给 CDN。Hysteria2 / TUIC / AnyTLS / 订阅不会使用它。不检查这个名字是否解析到本机（橙色云朵时解析到的是 Cloudflare）。"
+}
+cert_plan_existing() {
+  # 重装或再次进入申请、但没有指定新种类时，沿用已经保存的种类和名字。
+  local kind n failed=0
+  local -a arr=()
+  kind=$(cert_kind_id)
+  PLAN_KIND=$kind
+  PLAN_DOMAIN=$CERT_DOMAIN
+  if [[ -n ${CERT_NAMES:-} ]]; then PLAN_NAMES=$CERT_NAMES
+  elif [[ ${CERT_SCOPE:-single} == wildcard ]]; then PLAN_NAMES="*.${CERT_DOMAIN},${CERT_DOMAIN}"
+  else PLAN_NAMES=$CERT_DOMAIN; fi
+  if cert_current_ok; then return 0; fi
+  case $kind in
+    le|zerossl|multi|zerossl-multi)
+      [[ -n ${PUBLIC_IP4:-} || -n ${PUBLIC_IP6:-} ]] || detect_ip
+      IFS=',' read -ra arr <<< "$PLAN_NAMES"
+      for n in "${arr[@]}"; do cert_domain_points_here "$n" || failed=1; done
+      if (( failed )); then
+        cert_explain dns_not_here
+        die "原来的证书需要重新申请，但有域名没有全部解析到本机。REALITY 未改动。"
+      fi
+      ;;
+  esac
+  case $kind in
+    zerossl|zerossl-wildcard|zerossl-multi) cert_require_eab ;;
+  esac
+  case $kind in
+    wildcard|zerossl-wildcard) cert_require_dns_token ;;
+  esac
+  if [[ $kind == cf-origin ]]; then cert_require_origin_key; fi
+}
+cert_plan_request() {
+  local kind=""
+  PLAN_KIND="" PLAN_DOMAIN="" PLAN_NAMES=""
+  if [[ -n ${OPT_CF_ORIGIN_KEY:-} && -z ${OPT_CERT_KIND:-} ]]; then OPT_CERT_KIND=cf-origin; fi
+  if [[ -n ${OPT_ZEROSSL_KID:-}${OPT_ZEROSSL_HMAC:-} && -z ${OPT_CERT_KIND:-} ]]; then OPT_CERT_KIND=zerossl; fi
+  if [[ -z ${OPT_CERT_KIND:-} && -z ${OPT_CERT_DOMAIN:-} && -z ${OPT_CERT_NAMES:-} && -z ${OPT_CERT_LINK:-} ]] \
+     && (( ${CERT_ON:-0} == 1 )) && [[ -n ${CERT_DOMAIN:-} ]]; then
+    cert_plan_existing
+    return 0
+  fi
+  if [[ -n ${OPT_CERT_KIND:-} ]]; then
+    kind=$(cert_normalize_kind "$OPT_CERT_KIND") || die "不认识的证书种类: ${OPT_CERT_KIND}。可选 le、wildcard、multi、zerossl、zerossl-wildcard、zerossl-multi、cf-origin。"
+  elif [[ ${OPT_CERT_NAMES:-} == *,* ]]; then kind=multi
+  else kind=le; fi
+  PLAN_KIND=$kind
+  if [[ -n ${OPT_CERT_EMAIL:-} ]]; then CERT_EMAIL=$OPT_CERT_EMAIL; fi
+  if [[ -n ${CERT_EMAIL:-} ]] && ! cert_email_syntax "$CERT_EMAIL"; then
+    die "邮箱格式无效: ${CERT_EMAIL}"
+  fi
+  case $kind in
+    le|zerossl) cert_plan_single ;;
+    wildcard|zerossl-wildcard) cert_plan_wildcard ;;
+    multi|zerossl-multi) cert_plan_multi ;;
+    cf-origin) cert_plan_origin ;;
+  esac
+  case $kind in
+    zerossl|zerossl-wildcard|zerossl-multi) cert_require_eab ;;
+  esac
+  case $kind in
+    wildcard|zerossl-wildcard) cert_require_dns_token ;;
+  esac
+  if [[ $kind == cf-origin ]]; then cert_require_origin_key; fi
+}
+cert_switch_needed() {
+  (( ${CERT_ON:-0} == 1 )) || return 1
+  [[ -s $CERT_FULLCHAIN || -d /etc/letsencrypt/live/${CERT_NAME} ]] || return 1
+  [[ $(cert_kind_id) != "$PLAN_KIND" ]]
+}
+cert_retire_for_switch() {
+  info "正在关闭当前证书，随后申请另一种。REALITY 的端口、密钥和伪装站点都不变。"
+  svc_disable_stop proxy-oneclick-sub || true
+  cert_drop_renew_job
+  if have certbot; then certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true; fi
+  rm -f "$CERT_FULLCHAIN" "$CERT_PRIVKEY" "$SUB_CONF" "$SUB_BODY" "$SUB_CLASH" "$XRAY_CERT_FULL" "$XRAY_CERT_KEY"
+  CERT_ON=0
+  if (( HY2_ENABLED )) && [[ -x $HY_BIN ]]; then
+    gen_hy2_cert
+    write_hy2_config
+    restart_hy2
+  fi
+  if sb_needed && [[ -x $SB_BIN ]]; then
+    write_singbox_config
+    restart_singbox
+  fi
+  if cdn_wanted && [[ -x $XRAY_BIN ]] && xray_inbound_needed; then
+    write_xray_config
+    restart_xray
+  fi
+  if (( ! NAT_MODE && ${FW_ENABLED:-0} == 1 )); then apply_firewall; fi
+  save_state
+  ok "旧证书已关闭。CDN 线路的开关还留着，但在新证书签下来之前不会监听。REALITY 仍在原来的端口上。"
+}
+cert_ensure_dig() {
+  have dig && return 0
+  if [[ ${PKG:-} == apk ]]; then pkg_try bind-tools
+  elif [[ ${PKG:-} == apt ]]; then
+    pkg_try dnsutils
+    have dig || pkg_try bind9-dnsutils
+  else
+    pkg_try bind-utils
+  fi
+  have dig || die "需要 dig 来确认 TXT。Debian/Ubuntu 安装 dnsutils 或 bind9-dnsutils，RHEL 安装 bind-utils，Alpine 安装 bind-tools。装好后重试。REALITY 未改动。"
+}
+write_dns_hooks() {
+  mkdir -p "$CERT_LIB" "$CERT_TXT_DIR"
+  chmod 700 "$CERT_TXT_DIR" 2>/dev/null || true
+  cat >"$CERT_DNS_AUTH" <<'EOF'
+#!/bin/sh
+# 由 proxy-oneclick 生成。certbot DNS-01 时调用。不打印令牌。
+set -u
+token_file="__TOKEN__"
+txt_dir="__TXTDIR__"
+dom="${CERTBOT_DOMAIN:-}"
+val="${CERTBOT_VALIDATION:-}"
+say() { printf '%s\n' "$1" >&2; }
+if [ -z "$dom" ] || [ -z "$val" ]; then
+  say "acme-dns-auth-failed 缺少域名或校验值。"
+  exit 1
+fi
+name="_acme-challenge.${dom}"
+mkdir -p "$txt_dir"
+chmod 700 "$txt_dir" 2>/dev/null || true
+poll_txt() {
+  if ! command -v dig >/dev/null 2>&1; then
+    say "acme-txt-timeout 本机没有 dig，无法向 1.1.1.1 和 8.8.8.8 确认 TXT。请安装 dnsutils、bind9-dnsutils 或 bind-utils 后重试。"
+    exit 1
+  fi
+  i=0
+  while [ "$i" -lt 30 ]; do
+    got=$( { dig +short TXT "$name" @1.1.1.1; dig +short TXT "$name" @8.8.8.8; } 2>/dev/null || true)
+    if printf '%s\n' "$got" | grep -F -q -- "$val"; then sleep 15; return 0; fi
+    i=$((i + 1))
+    sleep 10
+  done
+  say "acme-txt-timeout"
+  say "公共 DNS 大约五分钟内没有看到 ${name} 的 TXT。请确认为灰色云朵，名称只填 _acme-challenge，内容不要额外加引号。通配符的两条 TXT 都要留下。"
+  say "$val"
+  return 1
+}
+if [ -s "$token_file" ]; then
+  command -v curl >/dev/null 2>&1 || { say "acme-dns-auth-failed 没有 curl。"; exit 1; }
+  command -v jq >/dev/null 2>&1 || { say "acme-dns-auth-failed 没有 jq。"; exit 1; }
+  token=$(cat "$token_file")
+  token=$(printf '%s' "$token" | tr -d '\r\n ')
+  host=$dom
+  zone=""
+  while :; do
+    resp=$(curl -sS -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" "https://api.cloudflare.com/client/v4/zones?name=${host}" || true)
+    ok=$(printf '%s' "$resp" | jq -r '.success // false' 2>/dev/null || echo false)
+    if [ "$ok" != "true" ]; then
+      say "acme-dns-auth-failed"
+      say "Cloudflare 拒绝了这个 API 令牌。请使用 Zone.DNS 编辑和 Zone 读取权限的令牌，不要使用 Origin CA Key。"
+      printf '%s' "$resp" | jq -r '.errors[]? | "\(.code) \(.message)"' >&2 || true
+      exit 1
+    fi
+    zone=$(printf '%s' "$resp" | jq -r '.result[0].id // empty')
+    if [ -n "$zone" ]; then break; fi
+    case "$host" in
+      *.*) host=${host#*.} ;;
+      *) break ;;
+    esac
+  done
+  if [ -z "$zone" ]; then
+    say "acme-dns-zone-missing"
+    say "找不到 ${dom} 所在的 Cloudflare 区域。请先把域名加到这个账号，并让令牌能看这个区域。"
+    exit 1
+  fi
+  body=$(jq -n --arg name "$name" --arg content "$val" '{type:"TXT",name:$name,content:$content,ttl:60}')
+  resp=$(curl -sS -X POST -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" --data "$body" "https://api.cloudflare.com/client/v4/zones/${zone}/dns_records" || true)
+  id=$(printf '%s' "$resp" | jq -r '.result.id // empty')
+  if [ -z "$id" ]; then
+    say "acme-dns-auth-failed"
+    say "TXT 没有添加成功。若是认证错误，就是令牌不对，或误用了 Origin CA Key。"
+    printf '%s' "$resp" | jq -r '.errors[]? | "\(.code) \(.message)"' >&2 || true
+    exit 1
+  fi
+  hash=$(printf '%s' "$val" | sha256sum | awk '{print $1}')
+  printf '%s\n' "$id" > "${txt_dir}/${hash}"
+  printf '%s\n' "$zone" > "${txt_dir}/${hash}.zone"
+  chmod 600 "${txt_dir}/${hash}" "${txt_dir}/${hash}.zone" 2>/dev/null || true
+  say "已添加 TXT：${name} 。等待公共 DNS。通配符的另一条会再添加一次，不要删掉这一条。"
+  poll_txt
+else
+  say "请手工添加 DNS TXT（灰色云朵，仅 DNS）："
+  say "  名称: _acme-challenge"
+  say "  完整名字: ${name}"
+  say "  内容: ${val}"
+  say "通配符会有两条不同内容，都要保留。添加后保持这个窗口，脚本会自己复查。"
+  poll_txt
+fi
+EOF
+  cat >"$CERT_DNS_CLEAN" <<'EOF'
+#!/bin/sh
+set -u
+token_file="__TOKEN__"
+txt_dir="__TXTDIR__"
+val="${CERTBOT_VALIDATION:-}"
+[ -n "$val" ] || exit 0
+hash=$(printf '%s' "$val" | sha256sum | awk '{print $1}')
+id=""
+zone=""
+[ -f "${txt_dir}/${hash}" ] && id=$(cat "${txt_dir}/${hash}")
+[ -f "${txt_dir}/${hash}.zone" ] && zone=$(cat "${txt_dir}/${hash}.zone")
+if [ -n "$id" ] && [ -n "$zone" ] && [ -s "$token_file" ] && command -v curl >/dev/null 2>&1; then
+  token=$(cat "$token_file")
+  token=$(printf '%s' "$token" | tr -d '\r\n ')
+  curl -sS -X DELETE -H "Authorization: Bearer ${token}" "https://api.cloudflare.com/client/v4/zones/${zone}/dns_records/${id}" >/dev/null 2>&1 || true
+fi
+rm -f "${txt_dir}/${hash}" "${txt_dir}/${hash}.zone"
+exit 0
+EOF
+  sed -i "s|__TOKEN__|${CERT_DNS_TOKEN}|g; s|__TXTDIR__|${CERT_TXT_DIR}|g" "$CERT_DNS_AUTH" "$CERT_DNS_CLEAN"
+  chmod 755 "$CERT_DNS_AUTH" "$CERT_DNS_CLEAN"
+}
+cert_origin_root_pem() {
+  cat <<'PEM'
+-----BEGIN CERTIFICATE-----
+MIICiTCCAi6gAwIBAgIUXZP3MWb8MKwBE1Qbawsp1sfA/Y4wCgYIKoZIzj0EAwIw
+gY8xCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1T
+YW4gRnJhbmNpc2NvMRkwFwYDVQQKExBDbG91ZEZsYXJlLCBJbmMuMTgwNgYDVQQL
+Ey9DbG91ZEZsYXJlIE9yaWdpbiBTU0wgRUNDIENlcnRpZmljYXRlIEF1dGhvcml0
+eTAeFw0xOTA4MjMyMTA4MDBaFw0yOTA4MTUxNzAwMDBaMIGPMQswCQYDVQQGEwJV
+UzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZyYW5jaXNjbzEZ
+MBcGA1UEChMQQ2xvdWRGbGFyZSwgSW5jLjE4MDYGA1UECxMvQ2xvdWRGbGFyZSBP
+cmlnaW4gU1NMIEVDQyBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAASR+sGALuaGshnUbcxKry+0LEXZ4NY6JUAtSeA6g87K3jaA
+xpIg9G50PokpfWkhbarLfpcZu0UAoYy2su0EhN7wo2YwZDAOBgNVHQ8BAf8EBAMC
+AQYwEgYDVR0TAQH/BAgwBgEB/wIBAjAdBgNVHQ4EFgQUhTBdOypw1O3VkmcH/es5
+tBoOOKcwHwYDVR0jBBgwFoAUhTBdOypw1O3VkmcH/es5tBoOOKcwCgYIKoZIzj0E
+AwIDSQAwRgIhAKilfntP2ILGZjwajktkBtXE1pB4Y/fjAfLkIRUzrI15AiEA5UCL
+XYZZ9m2c3fKwIenMMojL1eqydsgqj/wK4p5kagQ=
+-----END CERTIFICATE-----
+PEM
+}
+cert_issue_origin() {
+  local key csr body resp ok cert san n okey elow
+  local -a arr=()
+  mktmp
+  key="${TMP_DIR}/origin.key"
+  csr="${TMP_DIR}/origin.csr"
+  san=""
+  IFS=',' read -ra arr <<< "$CERT_NAMES"
+  for n in "${arr[@]}"; do
+    [[ -n $n ]] || continue
+    san+="${san:+,}DNS:${n}"
+  done
+  if ! openssl ecparam -name prime256v1 -genkey -noout -out "$key" 2>"${TMP_DIR}/origin.err"; then
+    die "没能在本机生成源站证书的私钥。REALITY 未改动。"
+  fi
+  if ! openssl req -new -key "$key" -subj "/CN=${CERT_DOMAIN}" -addext "subjectAltName=${san}" -out "$csr" 2>>"${TMP_DIR}/origin.err"; then
+    die "没能生成证书请求。REALITY 未改动。"
+  fi
+  have curl || die "需要 curl 才能向 Cloudflare 申请源站证书。REALITY 未改动。"
+  have jq || die "需要 jq 才能读取 Cloudflare 的返回。REALITY 未改动。"
+  okey=$(<"$CERT_ORIGIN_KEY")
+  okey=${okey//$'\r'/}
+  okey=${okey//$'\n'/}
+  okey=${okey// /}
+  body=$(jq -n --rawfile csr "$csr" --argjson hosts "$(cert_names_json)" \
+    '{hostnames:$hosts, requested_validity:5475, request_type:"origin-ecc", csr:$csr}')
+  resp=$(curl -sS -X POST "$CF_ORIGIN_API" \
+    -H "Content-Type: application/json" \
+    -H "X-Auth-User-Service-Key: ${okey}" \
+    --data "$body" 2>"${TMP_DIR}/origin.err" || true)
+  printf '%s\n' "$resp" >"${TMP_DIR}/origin.json"
+  ok=$(jq -r '.success // false' <<<"$resp" 2>/dev/null || echo false)
+  if [[ $ok != true ]]; then
+    jq -r '.errors[]? | "\(.code) \(.message)"' <<<"$resp" >&2 || true
+    elow=$(tr '[:upper:]' '[:lower:]' <<<"$resp" 2>/dev/null || true)
+    if [[ $elow == *authentication* || $elow == *'10000'* || $elow == *unauthorized* || $elow == *'invalid request headers'* || $elow == *'9109'* || -z $resp ]]; then
+      printf '\ncf-origin-auth\n' >>"${TMP_DIR}/origin.json"
+      cert_explain origin_auth
+    else
+      printf '\ncf-origin-host\n' >>"${TMP_DIR}/origin.json"
+      cert_explain origin_host
+    fi
+    die "Cloudflare 没有签发源站证书。REALITY 未改动。"
+  fi
+  cert=$(jq -r '.result.certificate // empty' <<<"$resp")
+  if [[ $cert != *'BEGIN CERTIFICATE'* ]]; then
+    cert_explain origin_host
+    die "Cloudflare 的返回里没有证书。REALITY 未改动。"
+  fi
+  cert_grant_readers
+  mkdir -p "$CERT_DIR"
+  {
+    printf '%s\n' "$cert"
+    cert_origin_root_pem
+  } >"${CERT_FULLCHAIN}.new"
+  cp -f "$key" "${CERT_PRIVKEY}.new"
+  chown "root:${CERT_GROUP}" "${CERT_FULLCHAIN}.new" "${CERT_PRIVKEY}.new"
+  chmod 644 "${CERT_FULLCHAIN}.new"
+  chmod 640 "${CERT_PRIVKEY}.new"
+  mv -f "${CERT_FULLCHAIN}.new" "$CERT_FULLCHAIN"
+  mv -f "${CERT_PRIVKEY}.new" "$CERT_PRIVKEY"
+  chmod 755 "$CERT_BASE" 2>/dev/null || true
+  chmod 750 "$CERT_DIR"
+  chown "root:${CERT_GROUP}" "$CERT_DIR"
+  if ! cert_san_ok "$CERT_FULLCHAIN"; then
+    cert_explain origin_host
+    die "签下来的源站证书里没有 ${CERT_DOMAIN}。REALITY 未改动。"
+  fi
+  ok "Cloudflare 源站证书已保存。只有 Cloudflare 信任它。"
+}
+cert_issue_flow() {
+  step "申请证书"
+  local old_label switching=0
+  local keep_ca keep_scope keep_pub keep_ch keep_names keep_dom
+  old_label=$(cert_kind_label)
+  cert_plan_request
+  cert_switch_needed && switching=1
+  cert_kind_apply "$PLAN_KIND"
+  CERT_NAMES=$PLAN_NAMES
+  CERT_DOMAIN=$PLAN_DOMAIN
+  cert_normalize_domain
+  keep_ca=$CERT_CA
+  keep_scope=$CERT_SCOPE
+  keep_pub=$CERT_PUBLIC
+  keep_ch=$CERT_CHALLENGE
+  keep_names=$CERT_NAMES
+  keep_dom=$CERT_DOMAIN
+  if (( ! switching )) && cert_current_ok; then
+    info "证书仍有效（${CERT_DOMAIN}，到期 $(cert_expiry_text)），跳过重新申请。"
+    if [[ $CERT_CA != cloudflare && -n ${OPT_SUB_PORT:-} ]]; then choose_sub_port; fi
+  else
+    cert_print_tutorial
+    if (( ! OPT_AUTO )); then
+      if (( switching )); then
+        confirm "将关闭现在的${old_label}，再申请$(cert_kind_label)。Hysteria2 / TUIC / AnyTLS 会先改回自签。已经打开的 CDN 线路会先停掉监听，新证书签好后再挂上，开关本身保留。请先按上面的说明准备好。REALITY 不变。输入 y 继续。" n \
+          || die "已取消。原来的证书还在。REALITY 未改动。"
+      else
+        confirm "请先按上面的说明准备好，再继续申请。选 n 取消。REALITY 不变。" y \
+          || die "已取消。REALITY 未改动。"
+      fi
+    elif (( switching )); then
+      info "证书种类从 ${old_label} 换成 $(cert_kind_label)。先关闭旧证书再申请。REALITY 不变。"
+    fi
+    if (( switching )); then cert_retire_for_switch; fi
+    CERT_CA=$keep_ca
+    CERT_SCOPE=$keep_scope
+    CERT_PUBLIC=$keep_pub
+    CERT_CHALLENGE=$keep_ch
+    CERT_NAMES=$keep_names
+    CERT_DOMAIN=$keep_dom
+    if [[ $CERT_CA != cloudflare ]]; then
+      choose_sub_port
+      [[ -n $SUB_TOKEN ]] || SUB_TOKEN=$(rand_hex 16)
+    fi
+    if [[ $CERT_CA == cloudflare ]]; then
+      cert_issue_origin
+    else
+      install_certbot_pkg
+      write_cert_helpers
+      if [[ $CERT_CHALLENGE == http ]]; then
+        cert_allow_80_now
+        if port_in_use tcp 80; then
+          cdn_explain port80 "$(port_owner tcp 80)"
+          die "80 端口被占用，证书没有申请。REALITY 的端口没有改。"
+        fi
+      else
+        cert_ensure_dig
+        write_dns_hooks
+      fi
+      certbot_issue
+    fi
   fi
   cert_install_material
   CERT_ON=1
-  cert_write_sub_conf
-  cert_write_bodies
+  if [[ $CERT_CA == cloudflare ]]; then
+    svc_disable_stop proxy-oneclick-sub || true
+    cert_drop_renew_job
+    if ! cdn_wanted; then
+      info "源站证书还不会被任何协议使用。请到协议开关打开 XHTTP+TLS 或 WebSocket+TLS。不要把它用于 Hysteria2、TUIC、AnyTLS 或订阅。"
+    fi
+  else
+    cert_write_sub_conf
+    cert_write_bodies
+  fi
   save_state
+  ok "证书已就绪：$(cert_kind_label) ${CERT_DOMAIN}"
 }
+cert_refresh_cdn() {
+  cdn_wanted || return 0
+  tls_for_cdn || return 0
+  cdn_install_xray_certs || warn "证书已就绪，但没能交给 Xray。REALITY 没有改用这张证书。"
+  cdn_sync_flag
+  if [[ -d $CERT_LIB || -f $CERT_HOOK ]]; then write_cert_hook; fi
+  if [[ -x $XRAY_BIN ]] && xray_inbound_needed; then
+    write_xray_config
+    restart_xray
+  fi
+}
+cert_after_issue() {
+  cert_rewire_protocols
+  if (( FW_ENABLED )); then apply_firewall; fi
+  cert_start_sub
+  cert_refresh_cdn
+  save_state
+  if (( INSTALLED )); then save_info || true; show_info; fi
+}
+
 cert_rewire_protocols() {
   # 只改能出示这张证书的协议。不调用 write_xray_config，REALITY 继续借用伪装站点。
   if (( HY2_ENABLED )) && [[ -x $HY_BIN ]]; then
@@ -4328,6 +5374,11 @@ cert_turn_off() {
   fi
   rm -f "$CDN_FLAG" "$XRAY_CERT_FULL" "$XRAY_CERT_KEY"
   CERT_ON=0
+  CERT_CA=letsencrypt
+  CERT_SCOPE=single
+  CERT_NAMES=""
+  CERT_PUBLIC=1
+  CERT_CHALLENGE=http
   svc_disable_stop proxy-oneclick-sub || true
   if [[ ${INIT_SYS:-} == systemd ]] && have systemctl; then
     systemctl disable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || true
@@ -4369,10 +5420,16 @@ cert_remove_files() {
   sd_reload
   if have certbot; then certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true; fi
   rm -f "$CDN_FLAG" "$XRAY_CERT_FULL" "$XRAY_CERT_KEY"
-  rm -rf "$CERT_DIR" "$CERT_LIB" /var/log/proxy-oneclick
+  rm -f "$CERT_DNS_TOKEN" "$CERT_ZEROSSL_EAB" "$CERT_ORIGIN_KEY"
+  rm -rf "$CERT_DIR" "$CERT_LIB" "$CERT_TXT_DIR" /var/log/proxy-oneclick
   if id "$SUB_USER" >/dev/null 2>&1; then userdel "$SUB_USER" >/dev/null 2>&1 || deluser "$SUB_USER" >/dev/null 2>&1 || true; fi
   if getent group "$CERT_GROUP" >/dev/null 2>&1; then groupdel "$CERT_GROUP" >/dev/null 2>&1 || delgroup "$CERT_GROUP" >/dev/null 2>&1 || true; fi
   CERT_ON=0
+  CERT_CA=letsencrypt
+  CERT_SCOPE=single
+  CERT_NAMES=""
+  CERT_PUBLIC=1
+  CERT_CHALLENGE=http
   (( had )) && ok "证书与订阅 HTTPS 已移除。"
   return 0
 }
@@ -4388,16 +5445,18 @@ setup_cert() {
   fi
   if cdn_wanted && [[ $OPT_CERT == 0 ]]; then
     cdn_explain cert_required
-    die "CDN 线路需要公开证书，不能和 --no-cert 一起使用。REALITY 未改动。"
+    die "CDN 线路需要证书，不能和 --no-cert 一起使用。公开证书或 Cloudflare 源站证书都可以。REALITY 未改动。"
   fi
   if [[ $OPT_CERT == 0 ]]; then
     if (( CERT_ON == 1 )); then cert_turn_off; fi
     return 0
   fi
   local want=0
-  if [[ -n $OPT_CERT_DOMAIN || $OPT_CERT == 1 ]]; then want=1
+  if [[ -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; then want=1
   elif cdn_wanted; then
-    info "CDN 上的 XHTTP / WebSocket 需要公开证书。REALITY 仍然借用伪装站点。"
+    if (( CERT_ON != 1 )) || [[ -z $CERT_DOMAIN ]]; then
+      info "CDN 上的 XHTTP / WebSocket 需要证书。默认是 Let's Encrypt 单域名；只给 CDN 用时可以选 Cloudflare 源站证书。REALITY 仍然借用伪装站点。"
+    fi
     want=1
   elif (( CERT_ON == 1 )) && [[ -n $CERT_DOMAIN ]]; then want=1
   elif (( OPT_AUTO )); then return 0
@@ -4409,46 +5468,88 @@ setup_cert() {
   cert_issue_flow
 }
 
+cert_menu_pick_kind() {
+  echo
+  echo "默认是 Let's Encrypt 单域名。其它种类是可选项，签好之前 REALITY 不变。"
+  ui_columns "oneclick proxy" "返回" \
+    "Let's Encrypt 单域名（默认，HTTP-01）" \
+    "Let's Encrypt 通配符（DNS-01）" \
+    "Let's Encrypt 多域名（HTTP-01）" \
+    "ZeroSSL 单域名（HTTP-01）" \
+    "ZeroSSL 通配符（DNS-01）" \
+    "ZeroSSL 多域名（HTTP-01）" \
+    "Cloudflare 源站证书（只给 CDN）"
+  local c
+  ask c "请选择" "0"
+  case $c in
+    1) OPT_CERT_KIND=le ;;
+    2) OPT_CERT_KIND=wildcard ;;
+    3) OPT_CERT_KIND=multi ;;
+    4) OPT_CERT_KIND=zerossl ;;
+    5) OPT_CERT_KIND=zerossl-wildcard ;;
+    6) OPT_CERT_KIND=zerossl-multi ;;
+    7) OPT_CERT_KIND=cf-origin ;;
+    *) return 1 ;;
+  esac
+}
 cert_menu_issue() {
-  local d=${CERT_DOMAIN-}
-  ask d "域名（已解析到本机）" "$d"
-  OPT_CERT_DOMAIN=$d
-  cert_issue_flow
+  cert_menu_pick_kind || return 0
   OPT_CERT_DOMAIN=""
-  cert_rewire_protocols
-  if (( FW_ENABLED )); then apply_firewall; fi
-  cert_start_sub
-  save_state
-  show_info
+  OPT_CERT_NAMES=""
+  OPT_CERT_LINK=""
+  cert_issue_flow
+  OPT_CERT_KIND=""
+  cert_after_issue
 }
 cert_menu_renew() {
-  tls_present_real || { warn "尚未申请证书。"; return 0; }
-  local owner=""
-  if port_in_use tcp 80; then
-    owner=$(port_owner tcp 80)
-    cdn_explain port80 "${owner:-未知}"
+  tls_for_cdn || { warn "尚未申请证书。"; return 0; }
+  if [[ ${CERT_CA:-letsencrypt} == cloudflare ]]; then
+    cat <<EOF
+这是 Cloudflare 源站证书，不是 Let's Encrypt，不会自动续期。
+有效期大约 15 年（到 $(cert_expiry_text)）。只有 Cloudflare 信任它。
+要换成别的种类，请重新选择种类：脚本会先关掉这一张，再签新的。REALITY 不动。
+不要把这张证书用于 Hysteria2、TUIC、AnyTLS 或订阅。
+EOF
     return 0
   fi
-  cert_allow_80_now
+  if [[ ${CERT_CHALLENGE:-http} == dns ]]; then
+    cert_ensure_dig
+    write_dns_hooks
+    if [[ ! -s $CERT_DNS_TOKEN ]]; then
+      cat <<'EOF'
+上次没有保存 Cloudflare DNS 令牌。
+续期还是要在 _acme-challenge 上添加 TXT，而且必须是灰色云朵。
+脚本会打印要添加的内容，并等待公共 DNS 能查到。这次不需要开放 80 端口。
+如果希望以后自动续期，请重新申请并加上 --cf-dns-token。
+EOF
+    else
+      info "将用已保存的 Cloudflare DNS 令牌续期，不占用 80 端口。"
+    fi
+  else
+    local owner=""
+    if port_in_use tcp 80; then
+      owner=$(port_owner tcp 80)
+      cdn_explain port80 "${owner:-未知}"
+      return 0
+    fi
+    cert_allow_80_now
+  fi
   local renew_args=(renew --cert-name "$CERT_NAME")
   if openssl x509 -checkend 2592000 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
     info "证书尚未进入续期窗口（到期前 30 天才续）。当前到期 $(cert_expiry_text)。"
-    confirm "仍然向 Let's Encrypt 强制续期？" n || return 0
+    confirm "仍然向 $(cert_kind_label) 强制续期？" n || return 0
     renew_args+=(--force-renewal)
   fi
   if certbot "${renew_args[@]}"; then
     cert_install_material
     cert_rewire_protocols
-    if cdn_wanted; then
-      cdn_install_xray_certs || warn "证书已续期，但没能交给 Xray。REALITY 没有改用这张证书。"
-      cdn_sync_flag
-      write_cert_hook
-      if [[ -x $XRAY_BIN ]] && xray_inbound_needed; then restart_xray; fi
-    fi
+    cert_refresh_cdn
     cert_start_sub
     ok "续期检查完成。到期 $(cert_expiry_text)。"
   else
-    cdn_explain cert_fail
+    if [[ ${CERT_CHALLENGE:-http} == dns ]]; then cert_explain txt_missing
+    elif [[ ${CERT_SCOPE:-} == multi ]]; then cert_explain multi_fail
+    else cdn_explain cert_fail; fi
     warn "续期失败。REALITY 未改动。"
   fi
 }
@@ -4456,30 +5557,40 @@ menu_cert() {
   need_node
   [[ -n $OS_ID ]] || detect_os
   if (( NAT_MODE )); then
-    die "NAT 模式不能申请证书：HTTP-01 需要公网 80 能访问到本机，NAT 小鸡通常没有这条映射。不申请时 REALITY 和自签证书保持原样。"
+    die "NAT 模式不能申请证书，也不能使用 Cloudflare 源站证书：公网访问不到这台机器，CDN 也无法回源。不申请时 REALITY 和自签证书保持原样。"
   fi
   while :; do
     echo
-    if tls_present_real; then
-      printf '证书  %s\n' "$CERT_DOMAIN"
+    if tls_for_cdn; then
+      printf '证书  %s\n' "$(cert_kind_label)"
+      printf '名字  %s\n' "${CERT_NAMES:-$CERT_DOMAIN}"
+      printf '链接  %s\n' "$CERT_DOMAIN"
       printf '到期  %s\n' "$(cert_expiry_text)"
-      printf '订阅  HTTPS %s:%s（完整链接在查看里，明文 HTTP 不提供）\n' "$CERT_DOMAIN" "$SUB_PORT"
+      if cert_is_public; then
+        printf '订阅  HTTPS %s:%s（完整链接在查看里，明文 HTTP 不提供）\n' "$CERT_DOMAIN" "$SUB_PORT"
+      else
+        echo "订阅  未开启。这张只有 Cloudflare 信任，不能给浏览器、Hysteria2、TUIC、AnyTLS。"
+      fi
     else
       echo "当前未申请证书。不申请时 REALITY 与自签的 Hysteria2 / TUIC / AnyTLS 保持原样。"
     fi
     ui_columns "oneclick proxy" "返回" \
-      "申请 / 更换域名" \
+      "选择证书种类并申请" \
       "立即续期" \
-      "查看订阅链接" \
-      "关闭证书（改回自签）"
+      "查看链接" \
+      "关闭证书"
     local c
     ask c "请选择" "0"
     case $c in
       1) cert_menu_issue ;;
       2) cert_menu_renew ;;
-      3) if tls_present_real; then show_info; else warn "尚未申请证书。"; fi ;;
-      4) if ! tls_present_real; then info "当前没有证书。"; continue; fi
-         confirm "关闭证书后，Hysteria2 / TUIC / AnyTLS 改回自签，订阅 HTTPS 停止。开着的 CDN 线路（XHTTP+TLS / WebSocket+TLS）也会关掉，不能改用自签。REALITY 不变。确认？" n || continue
+      3) if tls_for_cdn; then show_info; else warn "尚未申请证书。"; fi ;;
+      4) if ! tls_for_cdn; then info "当前没有证书。"; continue; fi
+         if cert_is_public; then
+           confirm "关闭证书后，Hysteria2 / TUIC / AnyTLS 改回自签，订阅 HTTPS 停止。开着的 CDN 线路也会关掉。REALITY 不变。确认？" n || continue
+         else
+           confirm "关闭 Cloudflare 源站证书后，CDN 上的 XHTTP+TLS / WebSocket+TLS 会停。Hysteria2 / TUIC / AnyTLS 本来就是自签，订阅本来就没开。REALITY 不变。确认？" n || continue
+         fi
          cert_turn_off ;;
       *) return 0 ;;
     esac
@@ -4497,18 +5608,14 @@ do_cert() {
   fi
   need_node
   if (( NAT_MODE )); then
-    die "NAT 模式不能申请证书：HTTP-01 需要公网 80 能访问到本机，NAT 小鸡通常没有这条映射。不申请时 REALITY 和自签证书保持原样。"
+    die "NAT 模式不能申请证书，也不能使用 Cloudflare 源站证书：公网访问不到这台机器，CDN 也无法回源。不申请时 REALITY 和自签证书保持原样。"
   fi
-  if [[ -n $OPT_CERT_DOMAIN || $OPT_CERT == 1 ]]; then
+  if cert_cli_requested; then
     cert_issue_flow
-    cert_rewire_protocols
-    if (( FW_ENABLED )); then apply_firewall; fi
-    cert_start_sub
-    save_state
-    show_info
+    cert_after_issue
     return 0
   fi
-  if [[ ! -t 0 && ! -r /dev/tty ]]; then die "非交互环境请使用 --cert-domain。"; fi
+  if [[ ! -t 0 && ! -r /dev/tty ]]; then die "非交互环境请使用 --cert-domain 或 --cert-kind。"; fi
   menu_cert
 }
 
@@ -4558,7 +5665,7 @@ EOF
     port80)
       cat >&2 <<EOF
 80 端口被占用（${who}），证书申请停住了。
-申请证书时，Let's Encrypt 要暂时独占 80 做验证，验证完就放开。80 上不提供订阅，也不跑代理。
+申请或续期 HTTP-01（Let's Encrypt 或 ZeroSSL 的单域名、多域名）时，要暂时独占 80 做验证，验证完就放开。通配符走 DNS-01，不占用 80。80 上不提供订阅，也不跑代理。
 常见占用是 Nginx、Caddy、Apache 或另一个网站。先执行 ss -Htlnp 'sport = :80' 看是谁，停掉它再申请。
 REALITY 的端口没有改。不要把 REALITY 挪到 80，也不要把 REALITY 放进 CDN。
 EOF
@@ -4594,9 +5701,9 @@ EOF
       ;;
     cert_required)
       cat >&2 <<'EOF'
-这条线路需要你自己的域名，以及已经签好的公开证书。
-它走的是普通 TLS，不是 REALITY。CDN 用「完全（严格）」回源时，源站必须出示浏览器信任的证书。自签证书会被当成证书不匹配。
-请先让域名解析到本机，再申请证书（--cert-domain，或菜单「申请证书」）。REALITY、XHTTP+REALITY、Hysteria2 不会被关掉，REALITY 也不会改用这张证书。
+这条线路需要你自己的域名，以及一张证书。
+它走的是普通 TLS，不是 REALITY。默认用公开证书（Let's Encrypt 单域名）。只给这两条 CDN 线路、并且域名开着橙色云朵时，也可以改用 Cloudflare 源站证书。源站证书只有 Cloudflare 信任，不能给 Hysteria2、TUIC、AnyTLS 或订阅。
+自签证书会被当成证书不匹配。请先申请证书（--cert-domain，或菜单「申请证书」）。REALITY、XHTTP+REALITY、Hysteria2 不会被关掉，REALITY 也不会改用这张证书。
 EOF
       ;;
     cert_fail)
@@ -4654,7 +5761,7 @@ EOF
     526)
       cat >&2 <<'EOF'
 回源证书和域名对不上。Cloudflare 上这通常显示为 526，或提示 origin certificate 无效。
-加密模式请用「完全（严格）」。源站必须出示刚申请的那张公开证书，名字就是这个域名。
+加密模式请用「完全（严格）」。源站必须出示这张证书，名字就是这个域名。公开证书和 Cloudflare 源站证书都可以过「完全（严格）」。源站证书不能拿去给浏览器、Hysteria2、TUIC、AnyTLS 或订阅。
 自签证书、证书写成别的域名、或把 REALITY 的伪装站证书拿来回源，都会失败。
 不要改成「灵活」。灵活会让 Cloudflare 用明文连源站，这条 TLS 线路对不上。
 EOF
@@ -4695,20 +5802,35 @@ EOF
   esac
 }
 
-cert_fail_explain() { # $1 certbot 日志
+cert_fail_explain() { # $1 日志
   local log=$1 low
   low=$(tr '[:upper:]' '[:lower:]' <"$log" 2>/dev/null || true)
-  if [[ $low == *'address already in use'* || $low == *'eaddrinuse'* ]]; then
-    cdn_explain port80 "$(port_owner tcp 80)"
-  elif [[ $low == *'too many certificates'* || $low == *'rate limit'* || $low == *'ratelimited'* ]]; then
-    cdn_explain cert_rate
-  elif [[ $low == *'nxdomain'* || $low == *'dns problem'* || $low == *'no valid a'* || $low == *'servfail'* ]]; then
-    cdn_explain dns
-  elif [[ $low == *'timeout'* || $low == *'timed out'* || $low == *'connection refused'* || $low == *'firewall'* || $low == *'unauthorized'* ]]; then
-    cdn_explain cert_unreachable
-  else
-    cdn_explain cert_fail
+  if [[ $low == *'acme-txt-timeout'* ]]; then cert_explain txt_timeout; return 0; fi
+  if [[ $low == *'acme-dns-auth-failed'* || $low == *'invalid api token'* || $low == *'authentication error'* ]]; then
+    cert_explain dns_token; return 0
   fi
+  if [[ $low == *'acme-dns-zone-missing'* ]]; then cert_explain dns_zone; return 0; fi
+  if [[ $low == *'cf-origin-auth'* ]]; then cert_explain origin_auth; return 0; fi
+  if [[ $low == *'cf-origin-host'* ]]; then cert_explain origin_host; return 0; fi
+  if [[ $low == *'address already in use'* || $low == *'eaddrinuse'* ]]; then
+    cdn_explain port80 "$(port_owner tcp 80)"; return 0
+  fi
+  if [[ $low == *'too many certificates'* || $low == *'rate limit'* || $low == *'ratelimited'* ]]; then
+    if [[ ${CERT_CA:-letsencrypt} == zerossl ]]; then cert_explain rate_zero; else cdn_explain cert_rate; fi
+    return 0
+  fi
+  if [[ ${CERT_CA:-} == zerossl && ( $low == *'external account'* || $low == *'eab credential'* || $low == *'invalid eab'* ) ]]; then
+    cert_explain eab; return 0
+  fi
+  if [[ ${CERT_CHALLENGE:-} == dns ]]; then cert_explain txt_missing; return 0; fi
+  if [[ ${CERT_SCOPE:-} == multi ]]; then cert_explain multi_fail; return 0; fi
+  if [[ $low == *'nxdomain'* || $low == *'dns problem'* || $low == *'no valid a'* || $low == *'servfail'* ]]; then
+    cert_explain dns_not_here; return 0
+  fi
+  if [[ $low == *'timeout'* || $low == *'timed out'* || $low == *'connection refused'* || $low == *'firewall'* || $low == *'unauthorized'* ]]; then
+    cdn_explain cert_unreachable; return 0
+  fi
+  cdn_explain cert_fail
 }
 
 cdn_ensure_paths() {
@@ -4732,7 +5854,7 @@ cdn_port_ok() { # $1 端口 $2 正在设置的变量名（跳过自己）。不�
   if [[ $self != WS_PORT ]] && (( ${WS_ENABLED:-0} == 1 )) && [[ -n $WS_PORT && $p == "$WS_PORT" ]]; then
     cdn_explain port_taken "WebSocket + TLS" "$p"; return 1
   fi
-  if (( ${CERT_ON:-0} == 1 )) && [[ $p == "$SUB_PORT" ]]; then cdn_explain port_taken "订阅 HTTPS" "$p"; return 1; fi
+  if cert_is_public && [[ $p == "$SUB_PORT" ]]; then cdn_explain port_taken "订阅 HTTPS" "$p"; return 1; fi
   if ! cdn_cf_port "$p"; then cdn_explain port_cf "$p"; return 1; fi
   return 0
 }
@@ -4744,7 +5866,7 @@ cdn_mark_siblings() { # $1 正在改的变量名，避免把自己标成占用
   (( ${ANYTLS_ENABLED:-0} == 1 )) && [[ $skip != ANYTLS_PORT ]] && local_mark_used tcp "$ANYTLS_PORT"
   (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && [[ $skip != XHTTP_TLS_PORT ]] && local_mark_used tcp "$XHTTP_TLS_PORT"
   (( ${WS_ENABLED:-0} == 1 )) && [[ $skip != WS_PORT ]] && local_mark_used tcp "$WS_PORT"
-  (( ${CERT_ON:-0} == 1 )) && [[ -n $SUB_PORT ]] && local_mark_used tcp "$SUB_PORT"
+  cert_is_public && [[ -n $SUB_PORT ]] && local_mark_used tcp "$SUB_PORT"
   local_mark_used tcp 80
 }
 cdn_choose_port() { # $1 变量名 $2 命令行端口 $3 名称 $4 默认端口
@@ -4790,7 +5912,7 @@ cdn_choose_port() { # $1 变量名 $2 命令行端口 $3 名称 $4 默认端口
 }
 
 cdn_install_xray_certs() {
-  tls_present_real || { cdn_explain cert_required; return 1; }
+  tls_for_cdn || { cdn_explain cert_required; return 1; }
   local grp
   grp=$(id -gn nobody 2>/dev/null || echo nogroup)
   mkdir -p "$XRAY_CERT_DIR"
@@ -4807,7 +5929,7 @@ cdn_install_xray_certs() {
   selinux_fix "$XRAY_CERT_DIR"
 }
 cdn_sync_flag() {
-  if cdn_wanted && tls_present_real; then
+  if cdn_wanted && tls_for_cdn; then
     mkdir -p "$(dirname "$CDN_FLAG")"
     printf '1\n' >"$CDN_FLAG"
     chmod 644 "$CDN_FLAG"
@@ -4852,8 +5974,8 @@ cdn_ws_inbound_json() {
 cdn_attach_inbounds() { # $1 配置文件 $2 无 flow 的客户端 JSON
   local f=$1 clients=$2 ib
   [[ -n $clients ]] || clients='[]'
-  if cdn_wanted && ! tls_present_real; then
-    info "CDN 线路要等公开证书就绪后再写入。这一步先保持 REALITY 原样，不会把证书写进 REALITY。"
+  if cdn_wanted && ! tls_for_cdn; then
+    info "CDN 线路要等证书就绪后再写入。这一步先保持 REALITY 原样，不会把证书写进 REALITY。"
     return 0
   fi
   if (( ${XHTTP_TLS_ENABLED:-0} == 1 )); then
@@ -4882,7 +6004,7 @@ cdn_ws_link() { # $1 uuid $2 名称
 }
 cdn_render_links() {
   local u r
-  if (( XHTTP_TLS_ENABLED )) && tls_present_real; then
+  if (( XHTTP_TLS_ENABLED )) && tls_for_cdn; then
     printf '%s\n' "$(cdn_xhttp_link "$UUID" "${NODE_NAME}-XHTTP-TLS")"
     if [[ -s $USERS_FILE ]]; then
       while IFS=$'\t' read -r u r; do
@@ -4891,7 +6013,7 @@ cdn_render_links() {
       done <"$USERS_FILE"
     fi
   fi
-  if (( WS_ENABLED )) && tls_present_real; then
+  if (( WS_ENABLED )) && tls_for_cdn; then
     printf '%s\n' "$(cdn_ws_link "$UUID" "${NODE_NAME}-WS-TLS")"
     if [[ -s $USERS_FILE ]]; then
       while IFS=$'\t' read -r u r; do
@@ -4902,7 +6024,7 @@ cdn_render_links() {
   fi
 }
 cdn_mihomo() {
-  tls_present_real || return 0
+  tls_for_cdn || return 0
   if (( XHTTP_TLS_ENABLED )); then
     cat <<Y
   - name: "${NODE_NAME}-XHTTP-TLS"
@@ -4942,7 +6064,7 @@ Y
 }
 cdn_print_links() { # $1=1 着色
   local paint=${1:-0} u r qr
-  if (( XHTTP_TLS_ENABLED )) && tls_present_real; then
+  if (( XHTTP_TLS_ENABLED )) && tls_for_cdn; then
     node_link_head "$paint" "VLESS + XHTTP + TLS（CDN）" "${NODE_NAME}-XHTTP-TLS" "$CERT_DOMAIN" "${XHTTP_TLS_PORT}  TCP"
     node_link_note "$paint" "不是 REALITY。path ${XHTTP_TLS_PATH}，mode=packet-up。不要套到 REALITY 上。"
     qr=$(cdn_xhttp_link "$UUID" "${NODE_NAME}-XHTTP-TLS")
@@ -4960,7 +6082,7 @@ cdn_print_links() { # $1=1 着色
       done <"$USERS_FILE"
     fi
   fi
-  if (( WS_ENABLED )) && tls_present_real; then
+  if (( WS_ENABLED )) && tls_for_cdn; then
     node_link_head "$paint" "VLESS + WebSocket + TLS（CDN）" "${NODE_NAME}-WS-TLS" "$CERT_DOMAIN" "${WS_PORT}  TCP"
     node_link_note "$paint" "不是 REALITY。path ${WS_PATH}。Cloudflare 要打开 WebSockets。"
     qr=$(cdn_ws_link "$UUID" "${NODE_NAME}-WS-TLS")
@@ -4991,6 +6113,12 @@ cdn_print_tutorial() { # 可选 $1 = xhttp|ws，空则打印已开启的
       ;;
   esac
   (( show_x || show_w )) || return 0
+  local cert_line
+  if [[ ${CERT_CA:-letsencrypt} == cloudflare ]]; then
+    cert_line="证书：Cloudflare 源站证书。只有 Cloudflare 信任它。浏览器、Hysteria2、TUIC、AnyTLS 和订阅都会拒绝。回源加密用「完全（严格）」，不要用「灵活」。"
+  else
+    cert_line="证书：已经签好的公开证书。回源加密用「完全（严格）」，不要用「灵活」，也不要改成自签。"
+  fi
   echo
   ui_bar '═' 62
   ui_center "CDN 线路怎么接" 62
@@ -5001,7 +6129,7 @@ cdn_print_tutorial() { # 可选 $1 = xhttp|ws，空则打印已开启的
 不要把 REALITY 的链接改成这个域名，也不要给 REALITY 开橙色云朵。
 
 域名：${CERT_DOMAIN}
-证书：已经签好的公开证书。回源加密用「完全（严格）」，不要用「灵活」，也不要改成自签。
+${cert_line}
 
 DNS（Cloudflare 或同类的 HTTPS 反向代理）：
 1. 添加 A 记录。域名是 example.com 时名称填 @；域名是 cdn.example.com 时名称填 cdn。不要把整段 ${CERT_DOMAIN} 再接到自己后面。内容填本机公网 IPv4。代理状态打开（橙色云朵）。
@@ -5123,7 +6251,7 @@ cdn_probe_public() { # $1 端口 $2 路径 $3 ws|get
 }
 cdn_check_xhttp() {
   local wrong="/not-the-xhttp-path" right bad
-  tls_present_real || { cdn_explain cert_required; return 1; }
+  tls_for_cdn || { cdn_explain cert_required; return 1; }
   if ! port_in_use tcp "$XHTTP_TLS_PORT"; then cdn_explain origin_down "$XHTTP_TLS_PORT"; return 1; fi
   if ! cdn_origin_cert_ok "$XHTTP_TLS_PORT"; then cdn_explain 526; return 1; fi
   have curl || { warn "没有 curl，跳过路径探测。"; cdn_probe_public "$XHTTP_TLS_PORT" "$XHTTP_TLS_PATH" get; return 0; }
@@ -5150,7 +6278,7 @@ cdn_check_xhttp() {
 cdn_check_ws() {
   local wrong tag
   wrong="/not-${WS_PATH#/}"
-  tls_present_real || { cdn_explain cert_required; return 1; }
+  tls_for_cdn || { cdn_explain cert_required; return 1; }
   if ! port_in_use tcp "$WS_PORT"; then cdn_explain origin_down "$WS_PORT"; return 1; fi
   if ! cdn_origin_cert_ok "$WS_PORT"; then cdn_explain 526; return 1; fi
   have curl || { warn "没有 curl，跳过 WebSocket 探测。"; return 0; }
@@ -5187,16 +6315,16 @@ cdn_run_checks() { # 可选 $1 = xhttp|ws
 }
 
 cdn_ensure_cert() {
-  tls_present_real && return 0
+  tls_for_cdn && return 0
   cdn_explain cert_required
   if [[ $OPT_CERT == 0 ]]; then
-    die "CDN 线路需要公开证书，不能和 --no-cert 一起使用。REALITY 未改动。"
+    die "CDN 线路需要证书，不能和 --no-cert 一起使用。公开证书或 Cloudflare 源站证书都可以。REALITY 未改动。"
   fi
-  if (( OPT_AUTO )) && [[ -z $OPT_CERT_DOMAIN ]]; then
-    die "请加上 --cert-domain <你的域名>。REALITY 未改动。"
+  if (( OPT_AUTO )) && [[ -z $OPT_CERT_DOMAIN && -z $OPT_CERT_NAMES && -z $OPT_CERT_KIND && -z $OPT_CF_ORIGIN_KEY ]]; then
+    die "请加上 --cert-domain <你的域名>。只给 CDN 用源站证书时再加上 --cert-kind cf-origin --cf-origin-key。REALITY 未改动。"
   fi
-  if (( ! OPT_AUTO )); then
-    confirm "现在申请公开证书？域名需要已经解析到本机。" y || return 1
+  if (( ! OPT_AUTO )) && [[ -z ${OPT_CERT_KIND:-} || ${OPT_CERT_KIND} == le ]]; then
+    confirm "现在申请 Let's Encrypt 单域名证书？域名需要已经解析到本机。只想给 CDN 用源站证书时，请改走 proxy cert。" y || return 1
     info "继续申请即表示同意 Let’s Encrypt 服务条款（https://letsencrypt.org/repository/）。"
   fi
   cert_issue_flow
@@ -5204,7 +6332,7 @@ cdn_ensure_cert() {
   if (( FW_ENABLED )); then apply_firewall; fi
   cert_start_sub
   save_state
-  tls_present_real
+  tls_for_cdn
 }
 cdn_prepare_enable() { # $1 xhttp|ws。失败返回 1，调用方保持关闭
   local kind=$1
@@ -5229,9 +6357,9 @@ cdn_after_cert() {
     cdn_explain nat
     die "NAT 模式下没有写入 CDN 线路。"
   fi
-  if ! tls_present_real; then
+  if ! tls_for_cdn; then
     cdn_explain cert_required
-    die "没有公开证书，CDN 线路没有开启。REALITY 未改动。"
+    die "没有可用证书，CDN 线路没有开启。公开证书或 Cloudflare 源站证书都可以。REALITY 未改动。"
   fi
   cdn_ensure_paths
   cdn_install_xray_certs
@@ -5698,10 +6826,8 @@ proto_fw_extra() {
   (( XHTTP_TLS_ENABLED )) && s+="；TCP ${XHTTP_TLS_PORT}（XHTTP+TLS，CDN）"
   (( WS_ENABLED )) && s+="；TCP ${WS_PORT}（WebSocket+TLS，CDN）"
   (( TUIC_ENABLED )) && s+="；UDP ${TUIC_PORT}（TUIC）"
-  if (( ${CERT_ON:-0} == 1 )); then
-    s+="；TCP 80（证书续期）"
-    s+="；TCP ${SUB_PORT}（订阅 HTTPS）"
-  fi
+  if cert_http_open; then s+="；TCP 80（证书续期）"; fi
+  if cert_is_public; then s+="；TCP ${SUB_PORT}（订阅 HTTPS）"; fi
   printf '%s' "$s"
 }
 ensure_proto_secrets() {
@@ -6656,7 +7782,7 @@ do_install() {
     die "请去掉 --xhttp-tls / --ws-tls。不带这两个参数时，安装方式和现在相同。"
   fi
   if (( NAT_MODE )) && cert_cli_requested; then
-    die "NAT 模式不能申请证书：Let's Encrypt 的 HTTP-01 需要公网 80 端口能访问到本机，NAT 小鸡通常没有这条映射。请去掉 --cert-domain。不带该参数时，安装方式与现在相同。"
+    die "NAT 模式不能申请证书（含通配符、ZeroSSL 和 Cloudflare 源站证书）：公网访问不到这台机器，CDN 也无法回源。请去掉证书参数。不带这些参数时，安装方式与现在相同。"
   fi
   take_lock
     if (( was_land )); then
@@ -7707,12 +8833,12 @@ menu_users() {
           node_link_uri "$(vless_xhttp_link "$nu" "${NODE_NAME}-XHTTP-${remark}" 0)"
           echo; print_qr "$(vless_xhttp_link "$nu" "${NODE_NAME}-XHTTP-${remark}" 0)"
         fi
-        if (( XHTTP_TLS_ENABLED )) && tls_present_real; then
+        if (( XHTTP_TLS_ENABLED )) && tls_for_cdn; then
           node_link_head 1 "额外用户 ${remark} · XHTTP+TLS" "${NODE_NAME}-XHTTP-TLS-${remark}" "$CERT_DOMAIN" "${XHTTP_TLS_PORT}  TCP"
           node_link_uri "$(cdn_xhttp_link "$nu" "${NODE_NAME}-XHTTP-TLS-${remark}")"
           echo; print_qr "$(cdn_xhttp_link "$nu" "${NODE_NAME}-XHTTP-TLS-${remark}")"
         fi
-        if (( WS_ENABLED )) && tls_present_real; then
+        if (( WS_ENABLED )) && tls_for_cdn; then
           node_link_head 1 "额外用户 ${remark} · WebSocket+TLS" "${NODE_NAME}-WS-TLS-${remark}" "$CERT_DOMAIN" "${WS_PORT}  TCP"
           node_link_uri "$(cdn_ws_link "$nu" "${NODE_NAME}-WS-TLS-${remark}")"
           echo; print_qr "$(cdn_ws_link "$nu" "${NODE_NAME}-WS-TLS-${remark}")"
@@ -7737,10 +8863,10 @@ menu_users() {
         if (( XHTTP_ENABLED )); then
           echo; vless_xhttp_link "$u" "${NODE_NAME}-XHTTP-${r}" 0; echo
         fi
-        if (( XHTTP_TLS_ENABLED )) && tls_present_real; then
+        if (( XHTTP_TLS_ENABLED )) && tls_for_cdn; then
           echo; cdn_xhttp_link "$u" "${NODE_NAME}-XHTTP-TLS-${r}"; echo
         fi
-        if (( WS_ENABLED )) && tls_present_real; then
+        if (( WS_ENABLED )) && tls_for_cdn; then
           echo; cdn_ws_link "$u" "${NODE_NAME}-WS-TLS-${r}"; echo
         fi ;;
       *) return 0 ;;
@@ -7797,7 +8923,7 @@ menu_status() {
   local s svcs="xray hysteria-server sing-box proxy-oneclick-fw fail2ban"
   if (( NAT_MODE )); then svcs="xray hysteria-server sing-box"; [[ -n $HOP_RANGE ]] && svcs+=" proxy-oneclick-hop"; fi
   if (( LAND_MODE )); then svcs="xray"; [[ -f $LAND_FW_UNIT || -f $LAND_FW_RC ]] && svcs+=" proxy-oneclick-land-fw"; fi
-  (( ${CERT_ON:-0} == 1 )) && svcs+=" proxy-oneclick-sub"
+  cert_is_public && svcs+=" proxy-oneclick-sub"
   for s in $svcs; do
     local st; st=$(svc_state "$s")
     [[ -z $st ]] && st="unknown"
@@ -7835,8 +8961,10 @@ menu_status() {
   else printf '  网络调优:       未应用（proxy tune）\n'; fi
   printf '  时间同步:       %s\n' "$(time_sync_status)"
   if (( ${CERT_ON:-0} == 1 )) || svc_exists proxy-oneclick-sub; then
-    printf '  证书:           %s  到期 %s\n' "${CERT_DOMAIN:-未设置}" "$(cert_expiry_text)"
-    if svc_active proxy-oneclick-sub; then printf '  订阅 HTTPS:     运行中（TCP %s，明文 HTTP 不提供）\n' "$SUB_PORT"
+    printf '  证书:           %s  %s  到期 %s\n' "$(cert_kind_label)" "${CERT_DOMAIN:-未设置}" "$(cert_expiry_text)"
+    if [[ ${CERT_CA:-letsencrypt} == cloudflare || ${CERT_PUBLIC:-1} != 1 ]]; then
+      printf '  订阅 HTTPS:     未开启。源站证书只有 Cloudflare 信任，不能给浏览器和直连客户端。\n'
+    elif svc_active proxy-oneclick-sub; then printf '  订阅 HTTPS:     运行中（TCP %s，明文 HTTP 不提供）\n' "$SUB_PORT"
     else printf '  订阅 HTTPS:     未运行（TCP %s）\n' "$SUB_PORT"; fi
   fi
   echo; _cyan "  监听端口："
@@ -8310,11 +9438,24 @@ usage() {
   --ws-port <端口>    回源端口（默认 2087）
   --hop <a-b|none>    Hysteria2 端口跳跃范围（默认 20000-50000，none 关闭）
   --name <名称>       节点名称（默认 国家-城市）
-  --cert-domain <域名>  可选：为已解析到本机的自有域名申请 Let's Encrypt 证书
-                      订阅只走 HTTPS；Hysteria2 / TUIC / AnyTLS 改用该证书和域名
-                      REALITY 仍借用伪装站点，不使用这张证书。NAT 模式不可用
-  --cert-email <邮箱> 可选，登记给 Let's Encrypt；不填则不登记邮箱
+  --cert-domain <域名>  可选：为自有域名申请证书。不写 --cert-kind 时是
+                      Let's Encrypt 单域名 HTTP-01（默认）。订阅只走 HTTPS；
+                      Hysteria2 / TUIC / AnyTLS 改用该证书和域名。
+                      REALITY 仍借用伪装站点。NAT 模式不可用
+  --cert-kind <种类>  le（默认）| wildcard | multi | zerossl | zerossl-wildcard
+                      | zerossl-multi | cf-origin
+                      通配符走 DNS-01。cf-origin 是 Cloudflare 源站证书，
+                      只有 Cloudflare 信任，只能给两条 CDN 线路
+  --cert-names <列表> 多域名或源站证书的名字，逗号分隔
+  --cert-link <主机名> 通配符证书写进链接的具体名字，默认是根域名
+  --cert-email <邮箱> 可选，登记给证书机构；不填则不登记邮箱
+  --cf-dns-token <令牌>  Cloudflare API 令牌，只用于通配符的 DNS-01
+                      权限要有 Zone.DNS 编辑和 Zone 读取。不是 Origin CA Key
+  --cf-origin-key <钥匙> Cloudflare Origin CA Key。写了就申请源站证书
+  --zerossl-kid <id>  ZeroSSL 的 EAB KID，须和 --zerossl-hmac 成对
+  --zerossl-hmac <key> ZeroSSL 的 EAB HMAC
   --sub-port <端口>   订阅 HTTPS 端口（默认 8447，不能是 80，也不能占用 REALITY）
+                      源站证书不会打开订阅
   --no-cert           关闭已申请的证书，Hysteria2 / TUIC / AnyTLS 改回自签
                       开着的 CDN 线路一并关掉（不能改用自签）
   --no-firewall       不配置 nftables 防火墙
@@ -8373,7 +9514,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
 管理命令:
   proxy               打开交互菜单
   proxy info          查看链接 / 二维码 / mihomo 配置
-  proxy cert          申请 / 续期 / 关闭公开证书（订阅 HTTPS）
+  proxy cert          选择证书种类 / 续期 / 关闭（默认 Let's Encrypt 单域名）
   proxy cdn           查看 CDN 线路教程并复查（XHTTP+TLS / WebSocket+TLS）
   proxy proto         单独打开或关闭协议（不删除已有密钥）
   proxy sni           重新优选 / 更换 SNI
@@ -8453,6 +9594,50 @@ parse_args() {
       --cert-email=*)
         cert_email_syntax "${1#*=}" || die "--cert-email 格式无效: ${1#*=}"
         OPT_CERT_EMAIL=${1#*=} ;;
+      --cert-kind)
+        [[ -n ${2-} ]] || die "--cert-kind 需要种类：le、wildcard、multi、zerossl、zerossl-wildcard、zerossl-multi、cf-origin"
+        OPT_CERT_KIND=$(cert_normalize_kind "$2") || die "--cert-kind 无法识别: $2"
+        OPT_CERT=1; shift ;;
+      --cert-kind=*)
+        OPT_CERT_KIND=$(cert_normalize_kind "${1#*=}") || die "--cert-kind 无法识别: ${1#*=}"
+        OPT_CERT=1 ;;
+      --cert-names)
+        [[ -n ${2-} ]] || die "--cert-names 需要用逗号分隔的域名"
+        OPT_CERT_NAMES=$(cert_norm_names "$2") || die "--cert-names 里有无效域名: $2"
+        OPT_CERT=1; shift ;;
+      --cert-names=*)
+        OPT_CERT_NAMES=$(cert_norm_names "${1#*=}") || die "--cert-names 里有无效域名: ${1#*=}"
+        OPT_CERT=1 ;;
+      --cert-link)
+        [[ -n ${2-} ]] || die "--cert-link 需要主机名"
+        OPT_CERT_LINK=${2,,}; OPT_CERT_LINK=${OPT_CERT_LINK%.}
+        cert_domain_syntax "$OPT_CERT_LINK" || die "--cert-link 不是可用的主机名: $2"
+        shift ;;
+      --cert-link=*)
+        OPT_CERT_LINK=${1#*=}; OPT_CERT_LINK=${OPT_CERT_LINK,,}; OPT_CERT_LINK=${OPT_CERT_LINK%.}
+        cert_domain_syntax "$OPT_CERT_LINK" || die "--cert-link 不是可用的主机名: ${OPT_CERT_LINK}" ;;
+      --cf-dns-token)
+        [[ -n ${2-} ]] || die "--cf-dns-token 需要 Cloudflare API 令牌"
+        OPT_CF_DNS_TOKEN=$2; shift ;;
+      --cf-dns-token=*) OPT_CF_DNS_TOKEN=${1#*=}; [[ -n $OPT_CF_DNS_TOKEN ]] || die "--cf-dns-token 需要 Cloudflare API 令牌" ;;
+      --cf-origin-key)
+        [[ -n ${2-} ]] || die "--cf-origin-key 需要 Origin CA Key"
+        OPT_CF_ORIGIN_KEY=$2
+        [[ -n $OPT_CERT_KIND ]] || OPT_CERT_KIND=cf-origin
+        OPT_CERT=1; shift ;;
+      --cf-origin-key=*)
+        OPT_CF_ORIGIN_KEY=${1#*=}
+        [[ -n $OPT_CF_ORIGIN_KEY ]] || die "--cf-origin-key 需要 Origin CA Key"
+        [[ -n $OPT_CERT_KIND ]] || OPT_CERT_KIND=cf-origin
+        OPT_CERT=1 ;;
+      --zerossl-kid)
+        [[ -n ${2-} ]] || die "--zerossl-kid 需要 EAB KID"
+        OPT_ZEROSSL_KID=$2; OPT_CERT=1; shift ;;
+      --zerossl-kid=*) OPT_ZEROSSL_KID=${1#*=}; [[ -n $OPT_ZEROSSL_KID ]] || die "--zerossl-kid 需要 EAB KID"; OPT_CERT=1 ;;
+      --zerossl-hmac)
+        [[ -n ${2-} ]] || die "--zerossl-hmac 需要 EAB HMAC"
+        OPT_ZEROSSL_HMAC=$2; OPT_CERT=1; shift ;;
+      --zerossl-hmac=*) OPT_ZEROSSL_HMAC=${1#*=}; [[ -n $OPT_ZEROSSL_HMAC ]] || die "--zerossl-hmac 需要 EAB HMAC"; OPT_CERT=1 ;;
       --sub-port)
         is_port "${2-}" || die "--sub-port 参数无效"
         [[ $2 == 80 ]] && die "--sub-port 不能是 80（80 只用于证书申请的 HTTP-01）"
@@ -8535,7 +9720,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_CERT_DOMAIN || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert
