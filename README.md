@@ -101,7 +101,7 @@ NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239
 
 CDN 线路示例：`bash proxy.sh --auto --cert-domain example.com --xhttp-tls --ws-tls`（两条都可选，也可以只开一条。见「经过 CDN 的两条线路」）
 
-管理子命令：`proxy info | proto | sni | regen | port | user | update | status | speed | firewall | nat | cert | cdn | tune | land | land-add | land-test | land-off | land-on | land-del | allow | uninstall`（加 `--auto` 可在脚本/自动化里免确认，例如 `proxy uninstall --auto`）。
+管理子命令：`proxy info | proto | sni | regen | port | user | update | status | speed | firewall | nat | cert | cdn | tune | route | land | land-add | land-test | land-off | land-on | land-del | allow | uninstall`（加 `--auto` 可在脚本/自动化里免确认，例如 `proxy uninstall --auto`）。`proxy route` 只做线路检测，不改配置。
 
 装完之后改协议（不删除已有 UUID、Reality 密钥、XHTTP 路径和各协议密码）：
 
@@ -146,7 +146,8 @@ proxy proto
 - **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。Cloudflare 源站证书不会交给它们。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
 - **CDN 上的两条线路（默认关闭）**：VLESS + XHTTP + TLS（TCP 2083，`mode=packet-up`）和 VLESS + WebSocket + TLS（TCP 2087）。用公开证书，或只用这两条时改用 Cloudflare 源站证书。都不是 REALITY。打开时脚本会打印 DNS、橙色云朵、回源端口、加密模式和客户端链接该怎么填。详见「经过 CDN 的两条线路」。
 - **输出**：每个已开启协议单独一块：名称、地址、端口各一行，链接本身最后单独一行。vless://（含 / 不含 pqv）、xhttp 的 vless://（`mode=stream-one`，无 flow）、hysteria2://（未申请证书时带 `mport`、`sni`、`insecure=1`、`pinSHA256`；申请之后地址和 SNI 为自有域名，不再带 insecure / pin）、可选的 trojan:// / tuic:// / anytls://。打开 CDN 线路后另有两条 vless://（`security=tls`，没有 flow / pbk / sid / pqv / insecure）。终端二维码，mihomo（Clash.Meta）YAML 片段。申请公开证书后另有仅 HTTPS 的订阅地址。源站证书没有订阅。
-- **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」，第 17 项是「申请证书」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
+- **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」，第 17 项是「申请证书」，第 18 项是「线路检测」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
+- **线路检测**：`proxy route` 从本机向外看路由。回国只测回程（VPS → 电信 / 联通 / 移动），国际拆成「国际线路」（上游、Tier1、交换中心）和「国际互联」（到常用目标的路径和时延）两项，三份分数不合成一个总分。IPv4 和 IPv6 各一份报告。不改代理配置，不重启，也不测流媒体。去程要在自己的电脑上跑，报告末尾给出现成命令。详见「线路检测」。
 - **落地机 / 落地转发**：`--land` 把本机装成只跑 Shadowsocks 2022 的出口（落地机）；已安装的节点用 `proxy land-add 'ss://...'` 把出口切到落地机（中转），见下文。
 - **健壮性**：`set -o errexit -o pipefail -o errtrace` + 错误陷阱提示出错行；可重复运行（保留已有密钥，只更新组件与配置）；安装前检查端口占用；没有 IPv6 也能正常工作（链接使用 IPv4）；通过 shellcheck 检查。
 
@@ -656,6 +657,26 @@ NAT 小鸡不需要放行这些端口：只要在服务商面板里建好对应�
 
 ---
 
+## 线路检测
+
+`proxy route`（菜单第 18 项，落地机菜单第 12 项）只看路由。不改 Xray、Hysteria2、sing-box 和防火墙，不重启，也不测流媒体解锁。没装节点、NAT 模式、落地机都可以跑。需要本机有 `curl`；路径探测用已安装的 `traceroute`、`mtr` 或 `nexttrace`（调用 nexttrace 时带 `--traceroute`，不和 `--mtr` 混用）。没有这些命令时，对应的探测会写成无法打分，而不是编一个分数。
+
+报告按 IPv4、IPv6 各一份，里面是中文说明，不是一行口号。每一份都有：
+
+- **本机接入**：公网地址、源 ASN、Cloudflare `cdn-cgi/trace` 看到的位置和 colo。这个位置用来估算理论往返下限（球面距离的公里数除以 100）。
+- **回国回程**：电信、联通、移动分开。只测从 VPS 发向运营商地址的回程，不把结果说成从家里到 VPS 的去程。电信按 CN2 GIA（AS4809 且 59.43，不夹 AS4134 / 202.97）高于 CTG→CN2（AS23764 再到 4809），再高于 CN2 GT，再高于 CTG→163 和普通 163。联通按 9929 高于 10099，再高于 4837。移动按 CMIN2（AS58807）高于 CMI（AS58453），再高于普通 CMNET。每家先算线路档次、延迟、丢包，再三家平均。某一家测试地址都不回应时记 0，并且算进平均。
+- **国际线路**：这台机器和谁互联。上游取 RIPEstat looking-glass 里、紧挨在本 ASN 前面的 ASN。IP 反查走 bgp.tools（或 Team Cymru）的 whois 43 端口，不抓网页。left 邻居超过 12 个时不当成上游。交换中心用 PeeringDB 的不重复 `ix_id`。权重是上游 30、Tier1 40、IX 30。三项有一项接口失败就写「国际线路无法打分」，不把失败当成 0 分的很差。
+- **国际互联**：到亚太、北美、欧洲目标的 traceroute / mtr。路径分成直连/对等、Tier1 中转、Tier2/3、多跳、绕路、不可达，再和理论下限比。本机在亚太时权重是亚太 50、北美 25、欧洲 25；在北美是 20 / 50 / 30；在欧洲是 20 / 30 / 50。绕美、绕欧会写出大约多出来的毫秒。上游名单里有、但这条路径没经过的运营商会单独点出来：有 Cogent、NTT 不等于去欧洲时真的走了它们。
+- **总评**：回国回程、国际线路、国际互联三个分数并排。90–100 顶级，80–89 优秀，65–79 良好，45–64 一般，低于 45 很差。没有第四个合成总分。
+
+档次是 100 分制。回国每一家是线路最多 60、延迟最多 25、丢包最多 15，例如 `移动回程 88/100（线路 CMIN2 60、延迟 20、丢包 8）`。
+
+去程不会在 VPS 上测。报告最后给出可以复制的命令，在你自己的电脑上跑：Linux / macOS 是 `traceroute -n -w 1 -q 1 <地址>` 和 `nexttrace --traceroute <地址>`，Windows 是 `tracert -d <地址>`。
+
+局限也写在报告里：只覆盖回程和从本机向外的国际路径；晚高峰和白天可能差很多；traceroute 中间的星号不等于丢包；Telegram 等任播落点不一定是标出来的城市。IPv6 上如果同时看到 Hurricane Electric（AS6939）和 Cogent（AS174），会说明这两家长期不交换 IPv6 路由。
+
+---
+
 ## 常用维护
 
 **菜单**
@@ -685,17 +706,19 @@ Hysteria2 ▶ …              sing-box  ▶ 未安装
  6. 用户管理（添加 / 删除）           15. 切换 NAT 模式（当前: 自动/开/关）
  7. 更新 Xray / Hysteria2 / 脚本      16. 协议开关
  8. 运行状态 / 日志                   17. 申请证书
- 9. 网络测速 / 延迟提示
+ 9. 网络测速 / 延迟提示               18. 线路检测（回程 / 国际线路 / 国际互联）
 ────────────────────────────────
   0. 退出
 ════════════════════════════════
 ```
 
-NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 11 项（没有客户端直连协议），框标题同样是 `oneclick proxy`。
+NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 12 项（没有客户端直连协议，第 12 项仍是线路检测），框标题同样是 `oneclick proxy`。
 
 **协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS，以及 CDN 上的 XHTTP+TLS（第 7 项）、WebSocket+TLS（第 8 项）。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径、CDN 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥和 CDN 路径，但不会把已关闭的协议重新打开。已申请公开证书时，重新生成密钥不会把 Hysteria2 / TUIC / AnyTLS 换回自签证书。打开 CDN 线路时会打印教程并做一次检查。想再看教程：`proxy cdn`。
 
 **申请证书**（第 17 项，或 `proxy cert`）：选择种类并申请、续期、查看链接，或关闭证书。默认仍是 Let's Encrypt 单域名。见「申请证书」。
+
+**线路检测**（第 18 项，落地机菜单第 12 项，或 `proxy route`）：见「线路检测」。只探测，不改已经装好的协议。
 
 **切换 NAT 模式**（第 15 项，落地机菜单为第 11 项）：`自动`（默认：Alpine 强制 NAT、LXC/OpenVZ 容器安装时询问、已安装的沿用原模式）/ `开`（强制 NAT 映射端口流程，等同 `--nat`）/ `关`（强制普通模式，等同 `--no-nat`；Alpine 不可用）。在第 1 或 13 项安装前选择即可；设置保存在 `state.env`（`NAT_PREF`），之后的修改端口等操作都按它执行。已安装时切换到不同模式会提示立即重新安装（保留密钥 / UUID）；命令行 `--nat` / `--no-nat` 优先并同步该设置。
 
@@ -743,6 +766,16 @@ proxy firewall
 ```bash
 proxy speed
 ```
+
+**线路检测**（回程、国际线路、国际互联，三项分开；不改配置）
+
+```bash
+proxy route
+proxy route ipv4
+proxy route ipv6
+```
+
+见「线路检测」。
 
 **网络调优**：状态 / 预设 / 恢复（见「网络调优」）
 
@@ -848,3 +881,4 @@ proxy uninstall --auto
 - REALITY 不使用这张证书，继续借用伪装站点。不要把 REALITY 放进 CDN。换证书种类也不会改 REALITY。
 - CDN 上的 XHTTP+TLS / WebSocket+TLS 需要自有域名，以及公开证书或 Cloudflare 源站证书，还有 Cloudflare 允许代理的回源端口。源站证书只有 Cloudflare 信任，不能给浏览器和直连客户端。NAT / Alpine / 落地机不能开。域名开了橙色云朵后，不要再用这个名字连接 Hysteria2、TUIC 或订阅。
 - XHTTP 走 CDN 时用 `packet-up`。`stream-one` 只用于直连的 XHTTP+REALITY。WebSocket 需要 CDN 打开 WebSockets，路径必须和链接里逐字相同。
+- `proxy route` 只测从 VPS 出发的回程和向外的国际路径。它不能代替在自己电脑上做的去程，也不能把国际线路和国际互联合成一个分数。测试地址会失效，任播目标的时延下限只是参照。

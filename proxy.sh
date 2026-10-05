@@ -16,6 +16,7 @@
 #   bash proxy.sh --cert-kind cf-origin --cf-origin-key <钥匙> --cert-domain cdn.example.com
 #   bash proxy.sh --xhttp-tls --ws-tls --cert-domain example.com
 #                                 # 可选：CDN 上的 XHTTP+TLS / WebSocket+TLS（默认不装，不替换 REALITY）
+#   bash proxy.sh route           # 线路检测：回程 / 国际线路 / 国际互联（不改配置）
 #   bash proxy.sh --help          # 查看全部参数
 # 安装完成后可直接使用命令: proxy
 #
@@ -9151,7 +9152,7 @@ menu_speed() {
 
   提示：
    · 在本地电脑上测试到 VPS 的延迟：tcping $(server_addr) $(pub_xray_port)（ICMP ping 可能被运营商限速，仅供参考）
-   · 查看回程路由：在 VPS 上运行 nexttrace（https://github.com/nxtrace/NTrace-core）
+   · 回程 / 国际线路 / 国际互联：proxy route（只检测，不改配置、不重启）
    · 晚高峰丢包严重时优先使用 Hysteria2；TCP 稳定时 REALITY 延迟更低
    · SNI 目标延迟过高（> 100ms）时，可在菜单中「更换 SNI」重新优选
 TIP
@@ -9230,6 +9231,1416 @@ do_uninstall() {
     sed -i "s/^INSTALLED=.*/INSTALLED='0'/" "$STATE_FILE" 2>/dev/null || true; fi
   rm -f "$BIN_PATH"
   ok "卸载完成。别忘了在云服务商控制台关闭不再需要的端口。"
+}
+
+# ============================================================
+# 线路检测（proxy route）
+# 只读：不改代理配置，不重启服务，不测流媒体。
+# 三项分开计分，禁止合成一个总分：回国回程 | 国际线路 | 国际互联。
+# 回国只测 VPS → 大陆的回程。去程命令打印给用户在自己电脑上跑。
+# 国际线路 = 上游 / Tier1 / IX。国际互联 = 到目标的路径和时延。
+# 权重（写进报告）：上游 30、Tier1 40、IX 30。
+# IPv4 与 IPv6 各出一份完整报告。
+# ============================================================
+
+declare -gA ROUTE_ASN_CACHE=()
+ROUTE_LAT="" ROUTE_LON="" ROUTE_CONT=""
+ROUTE_ORIGIN="" ROUTE_HOLDER="" ROUTE_PREFIX=""
+ROUTE_UPSTREAMS="" ROUTE_UP_OK=0 ROUTE_IX=-1 ROUTE_IX_OK=0 ROUTE_FAC=-1
+ROUTE_NEIGH_N=-1 ROUTE_PDB_NAME=""
+ROUTE_HOP_IPS="" ROUTE_PATH_ASNS="" ROUTE_STAR_HOPS=0 ROUTE_HOP_N=0
+ROUTE_RTT=-1 ROUTE_REACHED=0 ROUTE_LOSS=-1 ROUTE_MTR=0
+ROUTE_CHINA_SCORE="" ROUTE_LINE_SCORE="" ROUTE_INTL_SCORE=""
+OPT_ROUTE_FAM=""
+
+route_grade_name() {
+  local s=$1
+  [[ $s =~ ^[0-9]+$ ]] || { printf '无法评分'; return 0; }
+  if (( s >= 90 )); then printf '顶级'
+  elif (( s >= 80 )); then printf '优秀'
+  elif (( s >= 65 )); then printf '良好'
+  elif (( s >= 45 )); then printf '一般'
+  else printf '很差'; fi
+}
+route_grade_text() { # 名称 分数或 na
+  local label=$1 score=$2
+  if [[ $score == na || ! $score =~ ^[0-9]+$ ]]; then printf '%s无法打分' "$label"
+  else printf '%s %s/100（%s）' "$label" "$score" "$(route_grade_name "$score")"; fi
+}
+route_summary_text() { # 回程 线路 互联。只打这三行，没有第四个合成总分
+  printf '%s\n' "这三项分开计，不合成一个总分。国际线路好，只说明上游和交换中心这些条件摆在那里；不代表去常用服务的路径也好。回程好，也不代表国际好，反过来一样。"
+  printf '%s\n' "$(route_grade_text "回国回程" "$1")"
+  printf '%s\n' "$(route_grade_text "国际线路" "$2")"
+  printf '%s\n' "$(route_grade_text "国际互联" "$3")"
+}
+route_avg() {
+  local s=0 n=0 x
+  for x in "$@"; do
+    [[ $x =~ ^[0-9]+$ ]] || continue
+    s=$((s + x)); n=$((n + 1))
+  done
+  if (( n == 0 )); then printf 'na'; else printf '%s' $(( (s + n / 2) / n )); fi
+}
+route_is_tier1() {
+  case $1 in
+    174|701|1239|1299|2914|3257|3320|3356|3491|5511|6453|6461|6762|7018) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_asn_name() {
+  case $1 in
+    174) printf 'Cogent' ;;
+    701) printf 'Verizon' ;;
+    1239) printf 'Sprint' ;;
+    1299) printf 'Arelion' ;;
+    2914) printf 'NTT' ;;
+    3257) printf 'GTT' ;;
+    3320) printf 'DTAG' ;;
+    3356) printf 'Lumen' ;;
+    3491) printf 'PCCW' ;;
+    5511) printf 'Orange' ;;
+    6453) printf 'Tata' ;;
+    6461) printf 'Zayo' ;;
+    6762) printf 'TI Sparkle' ;;
+    7018) printf 'AT&T' ;;
+    6939) printf 'Hurricane Electric' ;;
+    9002) printf 'RETN' ;;
+    4809) printf 'CN2' ;;
+    4134) printf '电信163' ;;
+    23764) printf 'CTG' ;;
+    9929) printf 'CUII' ;;
+    10099) printf 'CUG' ;;
+    4837) printf '联通4837' ;;
+    58807) printf 'CMIN2' ;;
+    58453) printf 'CMI' ;;
+    9808) printf '移动CMNET' ;;
+    *) printf '' ;;
+  esac
+}
+route_fmt_asns() {
+  local x nm out=""
+  for x in "$@"; do
+    x=${x#AS}; x=${x#as}; x=${x#As}
+    [[ $x =~ ^[0-9]+$ ]] || continue
+    nm=$(route_asn_name "$x")
+    if [[ -n $nm ]]; then out+="${nm}（AS${x}）、"; else out+="AS${x}、"; fi
+  done
+  printf '%s' "${out%、}"
+}
+route_count_tier1() {
+  local n=0 x
+  for x in "$@"; do route_is_tier1 "$x" && n=$((n + 1)); done
+  printf '%s' "$n"
+}
+route_count_words() {
+  local n=0 x
+  for x in "$@"; do [[ -n $x ]] && n=$((n + 1)); done
+  printf '%s' "$n"
+}
+route_uniq_words() {
+  local x
+  printf '%s\n' "$@" | awk 'NF && !seen[$0]++ {printf "%s ", $0}'
+}
+route_has() {
+  local n=$1 x
+  shift
+  for x in "$@"; do [[ $x == "$n" ]] && return 0; done
+  return 1
+}
+route_order_before() { # A 出现在某个 B 之前
+  local a=$1 b=$2 seen=0 x
+  shift 2
+  for x in "$@"; do
+    [[ $x == "$a" ]] && seen=1
+    [[ $x == "$b" && $seen == 1 ]] && return 0
+  done
+  return 1
+}
+route_is_ct_provincial() {
+  case $1 in
+    4811|4812|4813|4816|4847|58466) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_is_cu_ordinary() {
+  case $1 in
+    4837|4808|17816|17621|17622|17623) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_is_cm_ordinary() {
+  case $1 in
+    9808|56040|56041|56042|56044|56046|56047|56048) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_any_fn() { # 函数名 后续参数
+  local fn=$1 x
+  shift
+  for x in "$@"; do "$fn" "$x" && return 0; done
+  return 1
+}
+route_china_classify_telecom() {
+  local seen_5943=$1 seen_20297=$2
+  shift 2
+  local -a asns=("$@")
+  local has4134=0 has4809=0
+  if route_has 4134 "${asns[@]}"; then has4134=1; fi
+  if route_has 4809 "${asns[@]}"; then has4809=1; fi
+  if (( has4809 && seen_5943 && !seen_20297 && !has4134 )); then printf 'gia'; return 0; fi
+  if route_order_before 23764 4809 "${asns[@]}"; then printf 'ctg_cn2'; return 0; fi
+  if (( has4809 && (has4134 || seen_20297) )); then printf 'cn2_gt'; return 0; fi
+  if (( has4809 )); then printf 'cn2_unknown'; return 0; fi
+  if route_order_before 23764 4134 "${asns[@]}" || { route_has 23764 "${asns[@]}" && (( has4134 )); }; then
+    printf 'ctg_163'; return 0
+  fi
+  if (( has4134 || seen_20297 )); then printf '163'; return 0; fi
+  if route_any_fn route_is_ct_provincial "${asns[@]}"; then printf '163'; return 0; fi
+  printf 'unknown'
+}
+route_china_classify_unicom() {
+  local -a asns=("$@")
+  if route_has 9929 "${asns[@]}"; then printf 'cuii'; return 0; fi
+  if route_has 10099 "${asns[@]}"; then printf 'cug'; return 0; fi
+  if route_any_fn route_is_cu_ordinary "${asns[@]}"; then printf '4837'; return 0; fi
+  printf 'unknown'
+}
+route_china_classify_mobile() {
+  local -a asns=("$@")
+  if route_has 58807 "${asns[@]}"; then printf 'cmin2'; return 0; fi
+  if route_has 58453 "${asns[@]}"; then printf 'cmi'; return 0; fi
+  if route_any_fn route_is_cm_ordinary "${asns[@]}"; then printf 'cmnet'; return 0; fi
+  printf 'unknown'
+}
+route_china_classify() { # 运营商 以及 ASN / IP 混排
+  local carrier=${1,,}
+  shift
+  local -a asns=()
+  local t seen_5943=0 seen_20297=0
+  for t in "$@"; do
+    t=${t%,}; t=${t#AS}; t=${t#as}; t=${t#As}
+    if [[ $t == *:* ]]; then continue
+    elif [[ $t =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      [[ $t == 59.43.* ]] && seen_5943=1
+      [[ $t == 202.97.* ]] && seen_20297=1
+    elif [[ $t == 59.43 ]]; then seen_5943=1
+    elif [[ $t == 202.97 ]]; then seen_20297=1
+    elif [[ $t =~ ^[0-9]+$ ]]; then asns+=("$t"); fi
+  done
+  case $carrier in
+    telecom|ct|电信) route_china_classify_telecom "$seen_5943" "$seen_20297" "${asns[@]}" ;;
+    unicom|cu|联通) route_china_classify_unicom "${asns[@]}" ;;
+    mobile|cm|移动) route_china_classify_mobile "${asns[@]}" ;;
+    *) printf 'unknown' ;;
+  esac
+}
+route_china_line_points() {
+  case $1 in
+    gia|cuii|cmin2) printf '60' ;;
+    ctg_cn2) printf '50' ;;
+    cn2_unknown) printf '45' ;;
+    cug) printf '42' ;;
+    cmi) printf '40' ;;
+    cn2_gt) printf '38' ;;
+    ctg_163) printf '22' ;;
+    4837) printf '18' ;;
+    cmnet) printf '15' ;;
+    163) printf '12' ;;
+    *) printf '0' ;;
+  esac
+}
+route_china_class_label() {
+  case $1 in
+    gia) printf 'CN2 GIA' ;;
+    ctg_cn2) printf 'CTG→CN2' ;;
+    cn2_gt) printf 'CN2 GT' ;;
+    cn2_unknown) printf 'CN2' ;;
+    ctg_163) printf 'CTG→163' ;;
+    163) printf '163' ;;
+    cuii) printf '9929/CUII' ;;
+    cug) printf '10099/CUG' ;;
+    4837) printf '4837' ;;
+    cmin2) printf 'CMIN2' ;;
+    cmi) printf 'CMI' ;;
+    cmnet) printf '普通CMNET' ;;
+    *) printf '未能识别' ;;
+  esac
+}
+route_latency_points() { # 往返毫秒 理论下限；下限空或 0 时用绝对档。未知往返记 0 分
+  local rtt=$1 floor=${2:-}
+  [[ $rtt =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  if [[ $floor =~ ^[0-9]+$ ]] && (( floor > 0 )); then
+    local ratio=$((rtt * 100 / floor))
+    if (( ratio <= 130 )); then printf '25'
+    elif (( ratio <= 180 )); then printf '20'
+    elif (( ratio <= 250 )); then printf '14'
+    elif (( ratio <= 400 )); then printf '8'
+    else printf '2'; fi
+  else
+    if (( rtt <= 50 )); then printf '25'
+    elif (( rtt <= 90 )); then printf '20'
+    elif (( rtt <= 150 )); then printf '14'
+    elif (( rtt <= 250 )); then printf '8'
+    else printf '3'; fi
+  fi
+}
+route_loss_points() { # 丢包百分比整数；空或负表示未知，返回 -1
+  local p=$1
+  [[ $p =~ ^[0-9]+$ ]] || { printf -- '-1'; return 0; }
+  if (( p <= 0 )); then printf '15'
+  elif (( p <= 2 )); then printf '12'
+  elif (( p <= 5 )); then printf '8'
+  elif (( p <= 15 )); then printf '4'
+  else printf '0'; fi
+}
+route_china_carrier_score() { # 线路分 延迟分 丢包分（丢包 -1 表示未知，不加）
+  local line=$1 lat=$2 loss=$3 s=0
+  [[ $line =~ ^[0-9]+$ ]] && s=$line
+  [[ $lat =~ ^[0-9]+$ ]] && s=$((s + lat))
+  if [[ $loss =~ ^[0-9]+$ ]]; then s=$((s + loss)); fi
+  (( s > 100 )) && s=100
+  printf '%s' "$s"
+}
+route_china_item_text() { # 运营商中文 线路名 总分 线路分 延迟分 丢包分
+  local name=$1 label=$2 score=$3 line=$4 lat=$5 loss=$6
+  local lat_s loss_s
+  if [[ $lat =~ ^[0-9]+$ ]]; then lat_s=$lat; else lat_s=未知; fi
+  if [[ $loss =~ ^[0-9]+$ ]]; then loss_s=$loss; else loss_s=未知; fi
+  printf '%s回程 %s/100（线路 %s %s、延迟 %s、丢包 %s）' "$name" "$score" "$label" "$line" "$lat_s" "$loss_s"
+}
+route_line_part_up() {
+  local n=$1
+  if (( n <= 0 )); then printf '0'
+  elif (( n == 1 )); then printf '10'
+  elif (( n == 2 )); then printf '18'
+  elif (( n == 3 )); then printf '24'
+  else printf '30'; fi
+}
+route_line_part_t1() {
+  local n=$1
+  if (( n <= 0 )); then printf '0'
+  elif (( n == 1 )); then printf '18'
+  elif (( n == 2 )); then printf '28'
+  elif (( n == 3 )); then printf '35'
+  else printf '40'; fi
+}
+route_line_part_ix() {
+  local n=$1
+  if (( n <= 0 )); then printf '0'
+  elif (( n == 1 )); then printf '8'
+  elif (( n <= 3 )); then printf '16'
+  elif (( n <= 7 )); then printf '24'
+  else printf '30'; fi
+}
+route_line_score() { # 上游家数 Tier1家数 IX个数；任一为 -1 则 na，不把查询失败当成 0 分
+  local u=$1 t=$2 i=$3
+  if [[ $u == -1 || $t == -1 || $i == -1 ]]; then printf 'na'; return 0; fi
+  [[ $u =~ ^[0-9]+$ && $t =~ ^[0-9]+$ && $i =~ ^[0-9]+$ ]] || { printf 'na'; return 0; }
+  local a b c
+  a=$(route_line_part_up "$u"); b=$(route_line_part_t1 "$t"); c=$(route_line_part_ix "$i")
+  printf '%s' $((a + b + c))
+}
+route_na_centric() { case $1 in 174|3356|6939|701|7018|6461|1239) return 0 ;; *) return 1 ;; esac; }
+route_eu_centric() { case $1 in 3320|5511|1299|6762) return 0 ;; *) return 1 ;; esac; }
+route_detour_kind() { # 本机洲 目标洲 ASN... 往返 下限 → us / eu / 空
+  local vps=$1 dest=$2 asn_csv=$3 rtt=$4 floor=$5
+  [[ $rtt =~ ^[0-9]+$ && $floor =~ ^[0-9]+$ ]] || return 0
+  (( floor > 0 && rtt > floor * 2 )) || return 0
+  local x na=0 eu=0
+  local -a asn_words=()
+  read -r -a asn_words <<<"$asn_csv"
+  for x in "${asn_words[@]}"; do
+    x=${x#AS}; x=${x#as}
+    if route_na_centric "$x"; then na=1; fi
+    if route_eu_centric "$x"; then eu=1; fi
+  done
+  if [[ $vps == "$dest" ]]; then
+    if [[ $vps == apac && $na == 1 ]]; then printf 'us'; return 0; fi
+    if [[ $vps == apac && $eu == 1 ]]; then printf 'eu'; return 0; fi
+    if [[ $vps == na && $eu == 1 ]]; then printf 'eu'; return 0; fi
+    if [[ $vps == eu && $na == 1 ]]; then printf 'us'; return 0; fi
+    return 0
+  fi
+  if [[ $vps == apac && $dest == eu && $na == 1 ]]; then printf 'us'; return 0; fi
+  if [[ $vps == apac && $dest == na && $eu == 1 ]]; then printf 'eu'; return 0; fi
+  if [[ $vps == eu && $dest == apac && $na == 1 ]]; then printf 'us'; return 0; fi
+  if [[ $vps == na && $dest == apac && $eu == 1 ]]; then printf 'eu'; return 0; fi
+  return 0
+}
+route_detour_extra() {
+  local rtt=$1 floor=$2
+  [[ $rtt =~ ^[0-9]+$ && $floor =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  if (( rtt > floor )); then printf '%s' $((rtt - floor)); else printf '0'; fi
+}
+route_path_class_points() {
+  case $1 in
+    direct) printf '60' ;;
+    t1) printf '48' ;;
+    t23) printf '36' ;;
+    multi) printf '22' ;;
+    detour) printf '12' ;;
+    *) printf '0' ;;
+  esac
+}
+route_path_class_label() {
+  case $1 in
+    direct) printf '直连/对等' ;;
+    t1) printf 'Tier1 中转' ;;
+    t23) printf 'Tier2/3' ;;
+    multi) printf '多跳' ;;
+    detour) printf '绕路' ;;
+    unreach) printf '不可达' ;;
+    *) printf '不可达' ;;
+  esac
+}
+route_intl_lat_points() { # 往返 下限，满分 40
+  local rtt=$1 floor=${2:-}
+  [[ $rtt =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  if [[ $floor =~ ^[0-9]+$ ]] && (( floor > 0 )); then
+    local ratio=$((rtt * 100 / floor))
+    if (( ratio <= 125 )); then printf '40'
+    elif (( ratio <= 160 )); then printf '32'
+    elif (( ratio <= 220 )); then printf '22'
+    elif (( ratio <= 350 )); then printf '12'
+    else printf '4'; fi
+  else
+    if (( rtt <= 40 )); then printf '40'
+    elif (( rtt <= 80 )); then printf '32'
+    elif (( rtt <= 150 )); then printf '22'
+    elif (( rtt <= 250 )); then printf '12'
+    else printf '4'; fi
+  fi
+}
+route_path_class() { # 本机洲 目标洲 ASN串 往返 下限
+  local vps=$1 dest=$2 asn_csv=$3 rtt=$4 floor=$5
+  local -a arr=() asn_words=()
+  local x n=0 has_t1=0
+  read -r -a asn_words <<<"$asn_csv"
+  for x in "${asn_words[@]}"; do
+    x=${x#AS}; x=${x#as}
+    [[ $x =~ ^[0-9]+$ ]] || continue
+    arr+=("$x"); n=$((n + 1))
+    if route_is_tier1 "$x"; then has_t1=1; fi
+  done
+  if (( n == 0 )); then printf 'unreach'; return 0; fi
+  local det
+  det=$(route_detour_kind "$vps" "$dest" "${arr[*]}" "$rtt" "$floor")
+  if [[ -n $det ]]; then printf 'detour'; return 0; fi
+  if (( n <= 2 )); then printf 'direct'; return 0; fi
+  if (( has_t1 && n <= 4 )); then printf 't1'; return 0; fi
+  if (( n >= 6 )); then printf 'multi'; return 0; fi
+  printf 't23'
+}
+route_intl_target_score() { # 路径档 延迟分
+  local p lat=$2 s
+  p=$(route_path_class_points "$1")
+  [[ $lat =~ ^[0-9]+$ ]] || lat=0
+  s=$((p + lat))
+  (( s > 100 )) && s=100
+  printf '%s' "$s"
+}
+route_cc_continent() {
+  case ${1^^} in
+    CN|HK|MO|TW|JP|KR|SG|MY|TH|VN|ID|PH|AU|NZ|IN|BD|LK|KH|LA|MM|BN|PK|NP|MN) printf 'apac' ;;
+    US|CA|MX) printf 'na' ;;
+    GB|UK|DE|FR|NL|IT|ES|SE|NO|FI|DK|PL|IE|PT|AT|CH|BE|CZ|HU|RO|GR|BG|HR|SK|SI|LT|LV|EE|LU|IS|UA) printf 'eu' ;;
+    *) printf 'other' ;;
+  esac
+}
+route_continent_weights() { # 输出「亚太 北美 欧洲」
+  case $1 in
+    apac) printf '50 25 25' ;;
+    na) printf '20 50 30' ;;
+    eu) printf '20 30 50' ;;
+    *) printf '34 33 33' ;;
+  esac
+}
+route_cont_zh() {
+  case $1 in
+    apac) printf '亚太' ;;
+    na) printf '北美' ;;
+    eu) printf '欧洲' ;;
+    *) printf '其他' ;;
+  esac
+}
+route_intl_combine() { # 分1 权1 分2 权2 分3 权3；非数字的分数丢掉并重分配权重
+  local s1=$1 w1=$2 s2=$3 w2=$4 s3=$5 w3=$6
+  local num=0 den=0
+  if [[ $s1 =~ ^[0-9]+$ && $w1 =~ ^[0-9]+$ ]]; then num=$((num + s1 * w1)); den=$((den + w1)); fi
+  if [[ $s2 =~ ^[0-9]+$ && $w2 =~ ^[0-9]+$ ]]; then num=$((num + s2 * w2)); den=$((den + w2)); fi
+  if [[ $s3 =~ ^[0-9]+$ && $w3 =~ ^[0-9]+$ ]]; then num=$((num + s3 * w3)); den=$((den + w3)); fi
+  if (( den == 0 )); then printf 'na'; else printf '%s' $(( (num + den / 2) / den )); fi
+}
+route_colo_latlon() {
+  case ${1^^} in
+    HKG) printf '22.31 114.17' ;;
+    NRT|HND|TYO) printf '35.68 139.76' ;;
+    KIX) printf '34.43 135.23' ;;
+    SIN) printf '1.35 103.99' ;;
+    LAX) printf '33.94 -118.41' ;;
+    SJC|SFO) printf '37.40 -122.08' ;;
+    SEA) printf '47.45 -122.31' ;;
+    IAD) printf '38.95 -77.46' ;;
+    EWR|JFK) printf '40.64 -73.78' ;;
+    ORD) printf '41.98 -87.90' ;;
+    DFW) printf '32.90 -97.04' ;;
+    MIA) printf '25.80 -80.29' ;;
+    ATL) printf '33.64 -84.43' ;;
+    DEN) printf '39.86 -104.67' ;;
+    FRA) printf '50.04 8.56' ;;
+    AMS) printf '52.31 4.76' ;;
+    LHR) printf '51.47 -0.46' ;;
+    CDG) printf '49.01 2.55' ;;
+    MAD) printf '40.47 -3.56' ;;
+    ARN) printf '59.65 17.93' ;;
+    WAW) printf '52.17 20.97' ;;
+    SYD) printf '-33.95 151.18' ;;
+    MEL) printf '-37.67 144.84' ;;
+    ICN) printf '37.46 126.44' ;;
+    TPE) printf '25.08 121.23' ;;
+    KUL) printf '2.75 101.71' ;;
+    BKK) printf '13.69 100.75' ;;
+    DEL) printf '28.56 77.10' ;;
+    BOM) printf '19.09 72.87' ;;
+    *) printf '' ;;
+  esac
+}
+route_cc_latlon() {
+  case ${1^^} in
+    HK) printf '22.30 114.17' ;;
+    MO) printf '22.20 113.55' ;;
+    TW) printf '25.03 121.57' ;;
+    JP) printf '35.68 139.76' ;;
+    KR) printf '37.57 126.98' ;;
+    SG) printf '1.35 103.82' ;;
+    AU) printf '-33.87 151.21' ;;
+    NZ) printf '-36.85 174.76' ;;
+    DE) printf '50.11 8.68' ;;
+    NL) printf '52.37 4.90' ;;
+    GB|UK) printf '51.51 -0.13' ;;
+    FR) printf '48.86 2.35' ;;
+    US) printf '39.00 -98.00' ;;
+    CA) printf '43.65 -79.38' ;;
+    CN) printf '39.90 116.41' ;;
+    *) printf '' ;;
+  esac
+}
+route_distance_km() { # lat1 lon1 lat2 lon2
+  awk -v lat1="$1" -v lon1="$2" -v lat2="$3" -v lon2="$4" 'BEGIN {
+    if (lat1+0==0 && lon1+0==0 && lat2+0==0 && lon2+0==0) { print 0; exit }
+    pi=atan2(0, -1)
+    r1=lat1*pi/180; r2=lat2*pi/180
+    dlat=(lat2-lat1)*pi/180; dlon=(lon2-lon1)*pi/180
+    a=sin(dlat/2)^2 + cos(r1)*cos(r2)*sin(dlon/2)^2
+    if (a<0) a=0
+    if (a>1) a=1
+    c=2*atan2(sqrt(a), sqrt(1-a))
+    printf "%d", 6371*c+0.5
+  }'
+}
+route_rtt_floor_ms() {
+  local km=$1 ms
+  [[ $km =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  ms=$(( (km + 50) / 100 ))
+  if (( ms < 1 && km > 0 )); then ms=1; fi
+  printf '%s' "$ms"
+}
+route_pick_upstreams() { # looking-glass 列表、邻居列表、邻居个数。超过 12 个 left 邻居不用
+  local lg=$1 neigh=$2 n=$3 x
+  local -a picked=() lg_words=() nb_words=()
+  read -r -a lg_words <<<"$lg"
+  for x in "${lg_words[@]}"; do [[ $x =~ ^[0-9]+$ ]] && picked+=("$x"); done
+  if [[ $n =~ ^[0-9]+$ ]] && (( n <= 12 )); then
+    read -r -a nb_words <<<"$neigh"
+    for x in "${nb_words[@]}"; do [[ $x =~ ^[0-9]+$ ]] && picked+=("$x"); done
+  fi
+  if ((${#picked[@]})); then route_uniq_words "${picked[@]}"; fi
+  return 0
+}
+route_unused_upstreams() { # 上游列表 路径 ASN。只点名 Tier1、HE、RETN 里没出现在路径上的
+  local ups=$1 path=$2 x out=""
+  local -a up_words=()
+  read -r -a up_words <<<"$ups"
+  for x in "${up_words[@]}"; do
+    x=${x#AS}; x=${x#as}
+    route_is_tier1 "$x" || [[ $x == 6939 || $x == 9002 ]] || continue
+    [[ " $path " == *" $x "* ]] && continue
+    out+="$x "
+  done
+  printf '%s' "$out"
+}
+route_unused_note() {
+  local ups=$1 path=$2 u names="" used="" x nm
+  u=$(route_unused_upstreams "$ups" "$path")
+  [[ -n ${u// } ]] || return 0
+  for x in $u; do
+    nm=$(route_asn_name "$x")
+    names+="${nm:-AS$x}（AS${x}）、"
+  done
+  names=${names%、}
+  for x in $path; do
+    x=${x#AS}; x=${x#as}
+    nm=$(route_asn_name "$x")
+    [[ -n $nm ]] && used+="${nm}（AS${x}）、"
+  done
+  used=${used%、}
+  if [[ -n $used ]]; then
+    printf '对等或上游里有 %s，但这条路径上没有看到它们，实际经过的是 %s。名单里有这家运营商，不能当成这条路真的用了它。\n' "$names" "$used"
+  else
+    printf '对等或上游里有 %s，但这条路径上没有看到它们。有这些上游只说明具备互联条件，不代表去这个目标时走了过去。\n' "$names"
+  fi
+}
+route_he_cogent_note() { # 地址族 上游列表
+  local fam=$1 ups=$2
+  [[ $fam == 6 ]] || return 0
+  [[ " $ups " == *" 6939 "* && " $ups " == *" 174 "* ]] || return 0
+  printf '%s\n' "IPv6 上同时看到了 Hurricane Electric（AS6939）和 Cogent（AS174）。这两家长期不互相交换 IPv6 路由，只在其中一边的目标，另一边往往要绕很远，甚至根本到不了。某一侧不可达时先考虑这个原因，不要当成整条 IPv6 都坏了。"
+}
+route_lg_upstreams_from_json() { # 源 ASN；JSON 从标准输入来
+  local origin=$1
+  jq -r --arg origin "$origin" '
+    [ .data.rrcs[]?.peers[]?
+      | (.as_path | tostring | gsub("[^0-9 ]+"; "") | split(" ") | map(select(length > 0))) as $p
+      | select(($p | length) >= 2)
+      | $p[-2]
+      | select(. != $origin and . != "")
+    ] | unique | .[]
+  '
+}
+route_neigh_left_from_json() {
+  jq -r '[.data.neighbours[]? | select(.type=="left") | (.asn | tostring)] | unique | .[]'
+}
+route_pdb_ix_count_from_json() {
+  jq '[.data[]?.ix_id] | unique | length'
+}
+route_whois_parse() {
+  awk -F'|' 'NF >= 2 {
+    gsub(/^[ \t]+|[ \t]+$/, "", $1)
+    gsub(/^[ \t]+|[ \t]+$/, "", $2)
+    if ($1 ~ /^[0-9]+$/ && $2 != "" && $1 !~ /^AS/) print $2, $1
+  }'
+}
+route_is_ip() {
+  local s=${1,,}
+  [[ $s =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0
+  [[ $s == *:* && $s =~ ^[0-9a-f:]+$ ]] && return 0
+  return 1
+}
+route_ip_private() {
+  local ip=$1 o
+  [[ $ip == 10.* || $ip == 192.168.* || $ip == 127.* || $ip == 169.254.* || $ip == 0.* ]] && return 0
+  if [[ $ip =~ ^172\.([0-9]+)\. ]]; then
+    o=${BASH_REMATCH[1]}
+    (( o >= 16 && o <= 31 )) && return 0
+  fi
+  if [[ $ip =~ ^100\.([0-9]+)\. ]]; then
+    o=${BASH_REMATCH[1]}
+    (( o >= 64 && o <= 127 )) && return 0
+  fi
+  [[ ${ip,,} == fe80:* || ${ip,,} == fc* || ${ip,,} == fd* || ${ip,,} == ::1 ]] && return 0
+  return 1
+}
+route_parse_trace_line() {
+  local line=$1 target=$2
+  [[ $line == traceroute* || $line == Tracing* || $line == tracing* ]] && return 0
+  [[ $line == *'hops max'* || $line == *'hop max'* ]] && return 0
+  local -a tok=()
+  local i t ip="" rtt="" stars=0 prev
+  read -r -a tok <<<"$line" || true
+  for (( i = 0; i < ${#tok[@]}; i++ )); do
+    t=${tok[i]}
+    t=${t#(}; t=${t%)}; t=${t%,}
+    if route_is_ip "$t"; then ip=$t
+    elif [[ $t == '*' ]]; then stars=$((stars + 1))
+    elif [[ $t == ms || $t == msec ]]; then
+      prev=${tok[i-1]:-}
+      prev=${prev%ms}
+      if [[ $prev =~ ^[0-9]+(\.[0-9]+)?$ && -z $rtt ]]; then rtt=${prev%%.*}; fi
+    fi
+  done
+  if [[ -z $ip && $stars -gt 0 ]]; then
+    ROUTE_STAR_HOPS=$((ROUTE_STAR_HOPS + 1))
+    ROUTE_HOP_N=$((ROUTE_HOP_N + 1))
+    return 0
+  fi
+  [[ -n $ip ]] || return 0
+  ROUTE_HOP_N=$((ROUTE_HOP_N + 1))
+  ROUTE_HOP_IPS+="$ip "
+  if [[ ${ip,,} == "$target" && -n $rtt ]]; then
+    ROUTE_REACHED=1
+    ROUTE_RTT=$rtt
+  elif [[ ${ip,,} == "$target" ]]; then
+    ROUTE_REACHED=1
+  fi
+}
+route_parse_mtr_line() {
+  local line=$1 target=$2
+  local ip="" loss="" avg=""
+  if [[ $line =~ ([0-9A-Fa-f:.]+|\?+)[[:space:]]+([0-9.]+)%?[[:space:]]+[0-9]+[[:space:]]+[0-9.]+[[:space:]]+([0-9.]+) ]]; then
+    ip=${BASH_REMATCH[1]}
+    loss=${BASH_REMATCH[2]%%.*}
+    avg=${BASH_REMATCH[3]%%.*}
+  else
+    return 0
+  fi
+  if [[ $ip == \?* ]]; then
+    ROUTE_STAR_HOPS=$((ROUTE_STAR_HOPS + 1))
+    ROUTE_HOP_N=$((ROUTE_HOP_N + 1))
+    return 0
+  fi
+  route_is_ip "$ip" || return 0
+  ROUTE_HOP_N=$((ROUTE_HOP_N + 1))
+  ROUTE_HOP_IPS+="$ip "
+  if [[ ${ip,,} == "$target" ]]; then
+    ROUTE_REACHED=1
+    [[ $avg =~ ^[0-9]+$ ]] && ROUTE_RTT=$avg
+    [[ $loss =~ ^[0-9]+$ ]] && ROUTE_LOSS=$loss
+  fi
+}
+route_parse_trace_text() { # 文本 目标地址
+  local text=$1 target=${2,,}
+  ROUTE_HOP_IPS="" ROUTE_STAR_HOPS=0 ROUTE_HOP_N=0
+  ROUTE_RTT=-1 ROUTE_REACHED=0 ROUTE_LOSS=-1 ROUTE_MTR=0
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=$(printf '%s' "$line" | sed -E $'s/\x1B\\[[0-9;?]*[ -/]*[@-~]//g')
+    if [[ $line == *'|'*'--'* ]]; then
+      ROUTE_MTR=1
+      route_parse_mtr_line "$line" "$target"
+    else
+      route_parse_trace_line "$line" "$target"
+    fi
+  done <<<"$text"
+  if (( ROUTE_MTR )); then
+    (( ROUTE_REACHED )) || ROUTE_LOSS=-1
+  else
+    if (( ROUTE_REACHED )); then ROUTE_LOSS=0; else ROUTE_LOSS=-1; fi
+  fi
+}
+route_china_targets() { # 地址族 运营商
+  case "$1:$2" in
+    4:telecom)
+      printf '%s\n' \
+        "202.96.134.133 31.23 121.47 上海电信" \
+        "61.139.2.69 30.67 104.06 成都电信" \
+        "222.246.129.80 28.23 112.94 湖南电信" ;;
+    4:unicom)
+      printf '%s\n' \
+        "202.106.196.115 39.90 116.41 北京联通" \
+        "221.4.66.66 23.13 113.26 广东联通" \
+        "58.20.127.238 28.23 112.94 湖南联通" ;;
+    4:mobile)
+      printf '%s\n' \
+        "211.136.17.107 39.90 116.41 北京移动" \
+        "211.138.91.1 34.27 117.18 移动骨干" \
+        "117.135.169.1 34.75 113.65 河南移动" ;;
+    6:telecom) printf '%s\n' "240e:f7:4f:1::1 23.13 113.26 电信IPv6" ;;
+    6:unicom) printf '%s\n' "2408:8000::1 39.90 116.41 联通IPv6" ;;
+    6:mobile) printf '%s\n' "2409:8c00:1::1 39.90 116.41 移动IPv6" ;;
+  esac
+}
+route_intl_targets() { # 地址族 洲
+  case "$1:$2" in
+    4:apac)
+      printf '%s\n' \
+        "91.108.56.100 1.35 103.82 新加坡Telegram" \
+        "203.178.148.1 35.69 139.69 东京WIDE" \
+        "203.198.23.10 22.28 114.16 香港HGC" ;;
+    4:na)
+      printf '%s\n' \
+        "149.154.175.50 25.77 -80.19 迈阿密Telegram" \
+        "72.52.104.74 37.55 -121.98 弗里蒙特HE" ;;
+    4:eu)
+      printf '%s\n' \
+        "149.154.167.51 52.37 4.90 阿姆斯特丹Telegram" \
+        "193.0.6.139 52.37 4.89 阿姆斯特丹RIPE" ;;
+    6:apac)
+      printf '%s\n' \
+        "2001:b28:f23f:f005::a 1.35 103.82 新加坡Telegram" \
+        "2001:200::1 35.69 139.69 东京WIDE" ;;
+    6:na)
+      printf '%s\n' \
+        "2001:b28:f23d:f001::a 25.77 -80.19 迈阿密Telegram" \
+        "2001:470:0:503::2 37.55 -121.98 弗里蒙特HE" ;;
+    6:eu)
+      printf '%s\n' "2001:67c:4e8:f002::a 52.37 4.90 阿姆斯特丹Telegram" ;;
+  esac
+}
+route_carrier_zh() { case $1 in telecom) printf '电信' ;; unicom) printf '联通' ;; mobile) printf '移动' ;; esac; }
+
+route_whois_tcp() { # 主机 查询正文。$1 在内层 bash 才展开，避免查询正文被外层吃掉
+  local host=$1
+  timeout 12 bash -c "exec 3<>/dev/tcp/${host}/43 || exit 1; printf '%s' \"\$1\" >&3; timeout 8 cat <&3" _ "$2"
+}
+route_ripe_asn() {
+  local j asn
+  j=$(curl -fsS --connect-timeout 6 -m 12 -A oneclick-proxy \
+    "https://stat.ripe.net/data/network-info/data.json?resource=$1") || return 1
+  asn=$(jq -r '.data.asns[0] // empty' <<<"$j") || return 1
+  [[ $asn =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$asn"
+}
+route_whois_bulk() {
+  local -a ips=()
+  local ip a raw=""
+  for ip in "$@"; do
+    route_ip_private "$ip" && continue
+    [[ -n ${ROUTE_ASN_CACHE[$ip]+x} ]] && continue
+    ips+=("$ip")
+  done
+  ((${#ips[@]} == 0)) && return 0
+  local q=$'begin\nverbose\n'
+  for ip in "${ips[@]}"; do q+="$ip"$'\n'; done
+  q+=$'end\n'
+  raw=$(route_whois_tcp bgp.tools "$q" 2>/dev/null) || raw=""
+  if [[ -z $raw ]]; then raw=$(route_whois_tcp whois.cymru.com "$q" 2>/dev/null) || raw=""; fi
+  if [[ -n $raw ]]; then
+    while read -r ip a; do
+      [[ -n $ip && $a =~ ^[0-9]+$ ]] && ROUTE_ASN_CACHE["$ip"]=$a
+    done < <(printf '%s\n' "$raw" | route_whois_parse)
+  fi
+  if have curl && have jq; then
+    for ip in "${ips[@]}"; do
+      [[ -n ${ROUTE_ASN_CACHE[$ip]+x} ]] && continue
+      a=$(route_ripe_asn "$ip" 2>/dev/null) || a=""
+      [[ $a =~ ^[0-9]+$ ]] && ROUTE_ASN_CACHE["$ip"]=$a
+    done
+  fi
+}
+route_fill_path_asns() {
+  local ip asn prev=""
+  local -a hop_words=()
+  read -r -a hop_words <<<"$ROUTE_HOP_IPS"
+  if ((${#hop_words[@]})); then route_whois_bulk "${hop_words[@]}"; fi
+  ROUTE_PATH_ASNS=""
+  ROUTE_CLASS_TOKENS=""
+  for ip in "${hop_words[@]}"; do
+    ROUTE_CLASS_TOKENS+="$ip "
+    asn=${ROUTE_ASN_CACHE[$ip]:-}
+    [[ $asn =~ ^[0-9]+$ ]] || continue
+    ROUTE_CLASS_TOKENS+="$asn "
+    [[ $asn == "$prev" ]] && continue
+    ROUTE_PATH_ASNS+="$asn "
+    prev=$asn
+  done
+}
+route_trace_bin() {
+  if have traceroute; then printf 'traceroute'
+  elif have nexttrace; then printf 'nexttrace'
+  elif have mtr; then printf 'mtr'
+  else printf 'none'; fi
+}
+route_run_capture() { # 超时秒 命令...
+  local sec=$1
+  shift
+  if have timeout; then timeout "$sec" "$@" 2>&1 || true
+  else "$@" 2>&1 || true; fi
+}
+route_nexttrace_args() { # 地址族；把参数打到标准输出，一行一个
+  local fam=$1 help
+  help=$(nexttrace --help 2>&1 || true)
+  if [[ $help == *'--traceroute'* ]]; then printf '%s\n' --traceroute; fi
+  if [[ $help == *'--tcp'* || $help == *'-T,'* || $help == *$'\n'"  -T"* || $help == *' -T '* ]]; then
+    printf '%s\n' -T -p 8080
+  fi
+  [[ $fam == 6 ]] && printf '%s\n' -6
+  if [[ $help == *' -q '* || $help == *$'\n'"  -q"* ]]; then printf '%s\n' -q 1; fi
+  printf '%s\n' -m 18
+}
+route_probe() { # 目标
+  local target=$1 fam=4 raw="" mode
+  [[ $target == *:* ]] && fam=6
+  mode=$(route_trace_bin)
+  ROUTE_HOP_IPS="" ROUTE_REACHED=0 ROUTE_RTT=-1 ROUTE_LOSS=-1
+  [[ $mode == none ]] && return 1
+  if [[ $mode == traceroute ]]; then
+    if [[ $fam == 6 ]]; then
+      raw=$(route_run_capture 22 traceroute -6 -n -w 1 -q 1 -m 18 "$target")
+    else
+      raw=$(route_run_capture 22 traceroute -T -p 8080 -n -w 1 -q 1 -m 18 "$target")
+      if [[ $raw == *'invalid option'* || $raw == *'unknown option'* || $raw == *'not recognized'* || $raw == *'unrecognized'* || -z ${raw// } ]]; then
+        raw=$(route_run_capture 22 traceroute -n -w 1 -q 1 -m 18 "$target")
+      fi
+    fi
+  elif [[ $mode == nexttrace ]]; then
+    local -a args=()
+    local line
+    while IFS= read -r line; do [[ -n $line ]] && args+=("$line"); done < <(route_nexttrace_args "$fam")
+    raw=$(route_run_capture 25 nexttrace "${args[@]}" "$target")
+    route_parse_trace_text "$raw" "$target"
+    if (( ROUTE_HOP_N == 0 && ROUTE_REACHED == 0 )); then
+      args=(--traceroute)
+      raw=$(route_run_capture 25 nexttrace "${args[@]}" "$target")
+    fi
+  else
+    local -a mt=(mtr -n -r -c 4 -w -m 18)
+    [[ $fam == 6 ]] && mt+=(-6) || mt+=(-4)
+    raw=$(route_run_capture 30 "${mt[@]}" -T -P 8080 "$target")
+    if [[ $raw == *'invalid'* || $raw == *'unknown option'* || -z ${raw// } ]]; then
+      raw=$(route_run_capture 30 "${mt[@]}" "$target")
+    fi
+  fi
+  route_parse_trace_text "$raw" "$target"
+  if have mtr && (( ROUTE_REACHED )) && (( ! ROUTE_MTR )); then
+    local -a mt2=(mtr -n -r -c 4 -w -m 18)
+    [[ $fam == 6 ]] && mt2+=(-6) || mt2+=(-4)
+    local mraw loss_before=$ROUTE_LOSS reached_before=$ROUTE_REACHED rtt_before=$ROUTE_RTT hops_before=$ROUTE_HOP_IPS
+    mraw=$(route_run_capture 28 "${mt2[@]}" "$target")
+    if [[ $mraw == *'|'*'--'* ]]; then
+      route_parse_trace_text "$mraw" "$target"
+      if (( ! ROUTE_REACHED )); then
+        ROUTE_LOSS=$loss_before ROUTE_REACHED=$reached_before ROUTE_RTT=$rtt_before ROUTE_HOP_IPS=$hops_before ROUTE_MTR=0
+        route_parse_trace_text "$raw" "$target"
+      fi
+    fi
+  fi
+  if (( ROUTE_HOP_N > 0 || ROUTE_REACHED )); then return 0; fi
+  return 1
+}
+route_url_res() { printf '%s' "${1//\//%2F}"; }
+route_curl_json() {
+  curl -fsS --connect-timeout 8 --retry 1 --retry-delay 1 -m 25 -A oneclick-proxy "$1"
+}
+route_load_origin() { # ip
+  local ip=$1 j
+  ROUTE_ORIGIN="" ROUTE_HOLDER="" ROUTE_PREFIX=""
+  if have curl && have jq; then
+    j=$(route_curl_json "https://stat.ripe.net/data/prefix-overview/data.json?resource=$(route_url_res "$ip")") || j=""
+    if [[ -n $j ]]; then
+      ROUTE_ORIGIN=$(jq -r '.data.asns[0].asn // empty' <<<"$j" 2>/dev/null || true)
+      ROUTE_HOLDER=$(jq -r '.data.asns[0].holder // empty' <<<"$j" 2>/dev/null || true)
+      ROUTE_PREFIX=$(jq -r '.data.resource // empty' <<<"$j" 2>/dev/null || true)
+    fi
+  fi
+  if [[ ! $ROUTE_ORIGIN =~ ^[0-9]+$ ]]; then
+    route_whois_bulk "$ip"
+    ROUTE_ORIGIN=${ROUTE_ASN_CACHE[$ip]:-}
+  fi
+}
+route_set_place() { # loc colo
+  local loc=$1 colo=$2 ll=""
+  ll=$(route_colo_latlon "$colo")
+  [[ -n $ll ]] || ll=$(route_cc_latlon "$loc")
+  ROUTE_LOC=$loc ROUTE_COLO=$colo
+  if [[ -n $ll ]]; then
+    read -r ROUTE_LAT ROUTE_LON <<<"$ll"
+    if [[ -n $loc ]]; then ROUTE_CONT=$(route_cc_continent "$loc")
+    else ROUTE_CONT=other; fi
+  else
+    ROUTE_LAT="" ROUTE_LON="" ROUTE_CONT=other
+  fi
+}
+route_load_place() { # 地址族
+  local fam=$1 raw="" loc="" colo=""
+  ROUTE_LOC="" ROUTE_COLO=""
+  if have curl; then
+    if [[ $fam == 6 ]]; then
+      raw=$(curl -6 -fsS --connect-timeout 5 -m 8 "https://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null) || raw=""
+    else
+      raw=$(curl -4 -fsS --connect-timeout 5 -m 8 "https://1.1.1.1/cdn-cgi/trace" 2>/dev/null) || raw=""
+    fi
+    loc=$(awk -F= '$1=="loc"{print $2; exit}' <<<"$raw")
+    colo=$(awk -F= '$1=="colo"{print $2; exit}' <<<"$raw")
+  fi
+  route_set_place "$loc" "$colo"
+}
+route_load_upstreams() { # 源 ASN 地址族
+  local asn=$1 fam=$2
+  ROUTE_UPSTREAMS="" ROUTE_UP_OK=0 ROUTE_IX=-1 ROUTE_IX_OK=0 ROUTE_FAC=-1
+  ROUTE_NEIGH_N=-1 ROUTE_PDB_NAME="" ROUTE_NEIGH_WIDE=0
+  [[ $asn =~ ^[0-9]+$ ]] || return 0
+  have curl && have jq || return 0
+  local -a prefs=()
+  local ann p raw ups lg="" nb id ixj fac sz
+  [[ -n $ROUTE_PREFIX ]] && prefs+=("$ROUTE_PREFIX")
+  ann=$(route_curl_json "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${asn}") || ann=""
+  if [[ -n $ann ]]; then
+    while read -r p; do
+      [[ -z $p ]] && continue
+      if [[ $fam == 4 && $p == *:* ]]; then continue; fi
+      if [[ $fam == 6 && $p != *:* ]]; then continue; fi
+      [[ " ${prefs[*]} " == *" $p "* ]] && continue
+      prefs+=("$p")
+      ((${#prefs[@]} >= 2)) && break
+    done < <(jq -r '.data.prefixes[]?.prefix // empty' <<<"$ann" 2>/dev/null || true)
+  fi
+  for p in "${prefs[@]}"; do
+    raw=$(route_curl_json "https://stat.ripe.net/data/looking-glass/data.json?resource=$(route_url_res "$p")") || continue
+    ups=$(printf '%s' "$raw" | route_lg_upstreams_from_json "$asn" 2>/dev/null) || ups=""
+    lg+=" $ups"
+    ROUTE_UP_OK=1
+  done
+  mktmp
+  if curl -fsS --connect-timeout 8 -m 20 -A oneclick-proxy -o "${TMP_DIR}/route-neigh.json" \
+      "https://stat.ripe.net/data/asn-neighbours/data.json?resource=AS${asn}"; then
+    sz=$(wc -c < "${TMP_DIR}/route-neigh.json" 2>/dev/null || echo 0)
+    if (( sz > 250000 )); then
+      ROUTE_NEIGH_N=999
+      ROUTE_NEIGH_WIDE=1
+    else
+      nb=$(route_neigh_left_from_json < "${TMP_DIR}/route-neigh.json" 2>/dev/null) || nb=""
+      ROUTE_NEIGH_N=$(printf '%s\n' "$nb" | awk 'NF{c++} END{print c+0}')
+    fi
+  fi
+  if (( ROUTE_UP_OK )); then
+    if (( ROUTE_NEIGH_WIDE )); then
+      ROUTE_UPSTREAMS=$(route_pick_upstreams "$lg" "" 999)
+    else
+      ROUTE_UPSTREAMS=$(route_pick_upstreams "$lg" "$nb" "$ROUTE_NEIGH_N")
+    fi
+  elif [[ ${ROUTE_NEIGH_N:-0} =~ ^[0-9]+$ ]] && (( ROUTE_NEIGH_N <= 12 && ROUTE_NEIGH_N > 0 )) && [[ -n ${nb:-} ]]; then
+    ROUTE_UPSTREAMS=$(route_pick_upstreams "" "$nb" "$ROUTE_NEIGH_N")
+    ROUTE_UP_OK=1
+  fi
+  raw=$(route_curl_json "https://www.peeringdb.com/api/net?asn=${asn}") || raw=""
+  if [[ -z $raw ]]; then ROUTE_IX=-1; return 0; fi
+  id=$(jq -r '.data[0].id // empty' <<<"$raw" 2>/dev/null || true)
+  ROUTE_PDB_NAME=$(jq -r '.data[0].name // empty' <<<"$raw" 2>/dev/null || true)
+  if [[ -z $id ]]; then ROUTE_IX=0; ROUTE_IX_OK=1; return 0; fi
+  ixj=$(route_curl_json "https://www.peeringdb.com/api/netixlan?net_id=${id}") || { ROUTE_IX=-1; return 0; }
+  ROUTE_IX=$(printf '%s' "$ixj" | route_pdb_ix_count_from_json 2>/dev/null || echo -1)
+  [[ $ROUTE_IX =~ ^[0-9]+$ ]] && ROUTE_IX_OK=1
+  fac=$(route_curl_json "https://www.peeringdb.com/api/netfac?net_id=${id}") || fac=""
+  if [[ -n $fac ]]; then ROUTE_FAC=$(jq '.data | length' <<<"$fac" 2>/dev/null || echo -1); fi
+}
+route_bj_floor() {
+  [[ -n $ROUTE_LAT && -n $ROUTE_LON ]] || { printf ''; return 0; }
+  local km
+  km=$(route_distance_km "$ROUTE_LAT" "$ROUTE_LON" 39.90 116.41)
+  route_rtt_floor_ms "$km"
+}
+route_pair_floor() { # 目标纬度 经度
+  [[ -n $ROUTE_LAT && -n $ROUTE_LON ]] || { printf ''; return 0; }
+  local km
+  km=$(route_distance_km "$ROUTE_LAT" "$ROUTE_LON" "$1" "$2")
+  route_rtt_floor_ms "$km"
+}
+
+route_section_access() {
+  local fam=$1 ip=$2
+  printf '\n%s【本机接入】%s\n' "$C_BOLD" "$C_NONE"
+  route_load_origin "$ip"
+  route_load_place "$fam"
+  local place="没有从 Cloudflare 的 cdn-cgi/trace 读到位置"
+  if [[ -n ${ROUTE_LOC:-} || -n ${ROUTE_COLO:-} ]]; then
+    place="Cloudflare 把接入位置标成 ${ROUTE_LOC:-未知}，就近机房 colo 是 ${ROUTE_COLO:-未知}"
+  fi
+  local asn_txt="没有查到源 ASN"
+  if [[ $ROUTE_ORIGIN =~ ^[0-9]+$ ]]; then
+    asn_txt="源 ASN 是 AS${ROUTE_ORIGIN}"
+    [[ -n $ROUTE_HOLDER ]] && asn_txt+="（${ROUTE_HOLDER}）"
+    [[ -n $ROUTE_PREFIX ]] && asn_txt+="，覆盖前缀 ${ROUTE_PREFIX}"
+  fi
+  printf '这台机器这次用来检测的 IPv%s 是 %s。%s。%s。位置用来估算到北京、以及到各洲测试点的理论往返下限，算法是球面距离的公里数除以 100。地理库和 colo 都会偏，下限只是参照。\n' \
+    "$fam" "$ip" "$asn_txt" "$place"
+  if (( NAT_MODE )); then
+    printf '当前是 NAT 模式。traceroute 仍然从这台机器发出，看的是它出去的路径，不是宿主机或你家里的路径。\n'
+  fi
+  printf '下面的回国测试发向三大运营商自己的地址，方向是 VPS 到大陆，也就是回程。它不能代表你家里的宽带访问这台 VPS 的去程。去程要在你自己的电脑上测，命令在这份报告的最后。\n'
+}
+route_china_explain() {
+  local carrier=$1 class=$2 label=$3 ip=$4 rtt=$5 loss=$6
+  local zh asns_txt floor
+  local -a path_words=()
+  zh=$(route_carrier_zh "$carrier")
+  read -r -a path_words <<<"$ROUTE_PATH_ASNS"
+  if ((${#path_words[@]})); then asns_txt=$(route_fmt_asns "${path_words[@]}"); else asns_txt=""; fi
+  [[ -n $asns_txt ]] || asns_txt="（没有解析出自治系统号）"
+  printf '%s：发往%s（%s）。路径上看到的自治系统依次是 %s。' "$zh" "$label" "$ip" "$asns_txt"
+  case $class in
+    gia)
+      printf '同时有 AS4809 和 59.43 段，而且没有 AS4134、也没有 202.97，按 CN2 GIA 计。这是电信回程里通常最好的一档。'
+      ;;
+    ctg_cn2)
+      printf 'AS23764（CTG）出现在 AS4809 之前，按 CTG 转入 CN2 计。这好于直接走 163，但还不是只走 59.43、不夹 163 的 CN2 GIA。'
+      ;;
+    cn2_gt)
+      printf '路径里有 AS4809，同时又有 AS4134 或 202.97，按 CN2 GT 计。CN2 和 163 混在一起，通常不如 GIA，也不如干净的 CTG→CN2。'
+      ;;
+    cn2_unknown)
+      printf '只看到 AS4809，没有 59.43，也没有 202.97 或 AS4134，分不清是 GIA 还是 GT，档次放在两者之间。'
+      ;;
+    ctg_163)
+      printf '看到 AS23764 之后进入 AS4134，没有 AS4809，按 CTG 转入 163 计。这不是 CN2。'
+      ;;
+    163)
+      if route_any_fn route_is_ct_provincial "${path_words[@]}" && ! route_has 4134 "${path_words[@]}"; then
+        printf '没有 AS4809。看到的是电信省网 ASN，不是 163 骨干 AS4134，仍按普通 163 这一档计，不升到 CN2。'
+      else
+        printf '没有 AS4809。按普通 163（AS4134 或 202.97）计。'
+      fi
+      ;;
+    cuii) printf '看到 AS9929，按联通 CUII / 9929 计。这是联通回程里通常最好的一档，高于 10099 和 4837。' ;;
+    cug) printf '看到 AS10099，没有 AS9929，按联通 CUG / 10099 计。好于普通 4837，不如 9929。' ;;
+    4837) printf '没有 AS9929 和 AS10099。按普通联通（AS4837 或省网）计。' ;;
+    cmin2) printf '看到 AS58807，按移动 CMIN2 计。这是移动回程里通常最好的一档。' ;;
+    cmi) printf '看到 AS58453，没有 AS58807，按移动 CMI 计。好于普通 CMNET，不如 CMIN2。' ;;
+    cmnet) printf '没有 AS58807 和 AS58453。按普通移动 CMNET（AS9808 或省网）计。' ;;
+    *)
+      printf '这些 ASN 对不上这家运营商的 CN2 / 163、9929 / 10099 / 4837、CMIN2 / CMI / CMNET 判断，线路档次记 0。'
+      ;;
+  esac
+  floor=$(route_bj_floor)
+  if [[ $rtt =~ ^[0-9]+$ ]]; then
+    printf '最后一跳往返约 %s ms。' "$rtt"
+    if [[ $floor =~ ^[0-9]+$ && $floor != 0 ]]; then
+      printf '按本机到北京的球面距离，理论下限大约 %s ms。' "$floor"
+      if (( rtt * 100 / floor > 180 )); then
+        printf '实际明显高于这个下限，延迟这一项不会给满。'
+      fi
+    else
+      printf '没有可靠坐标，延迟按绝对毫秒分档，不跟理论下限比。'
+    fi
+  else
+    printf '终点没有给出可用的往返时间，延迟不加分，也不写成 0 ms。'
+  fi
+  if [[ $loss =~ ^[0-9]+$ ]]; then
+    if (( ROUTE_MTR )); then
+      printf '丢包用 mtr 最后一跳，约 %s%%。' "$loss"
+    else
+      printf '终点这一跳有回应，单次 traceroute 只能记成大约 %s%% 丢包，看不出 1%% 那种轻微丢包。' "$loss"
+    fi
+  else
+    printf '丢包未知，这一项不加分，也不当成 0%%。'
+  fi
+  if (( ROUTE_STAR_HOPS > 0 )); then
+    printf '中间有 %s 跳没有回应探测。路由器不回探测很常见，这些星号不算进丢包分。' "$ROUTE_STAR_HOPS"
+  fi
+  printf '\n'
+}
+route_section_china() {
+  local fam=$1
+  printf '\n%s【回国回程】%s\n' "$C_BOLD" "$C_NONE"
+  printf '三家分开测，再取平均。不可达记 0，并且算进平均，避免只把最好的一家展示出来。每一家的小分是线路档次（最多 60）、延迟（最多 25）、丢包（最多 15）。\n'
+  local tool
+  tool=$(route_trace_bin)
+  if [[ $tool == none ]]; then
+    printf '本机没有 traceroute、mtr 或 nexttrace，发不出路径探测。回国回程无法打分。\n'
+    ROUTE_CHINA_SCORE=na
+    return 0
+  fi
+  local carrier zh ip lat lon label class line_pts lat_pts loss_pts score
+  local -a scores=()
+  for carrier in telecom unicom mobile; do
+    zh=$(route_carrier_zh "$carrier")
+    local best_rank=-1 best_class=unknown best_ip="" best_label="" best_rtt=-1 best_loss=-1
+    local best_hops="" best_path="" best_stars=0 best_mtr=0 best_n=0
+    local tried=0 got=0
+    while read -r ip lat lon label; do
+      [[ -n $ip ]] || continue
+      tried=$((tried + 1))
+      (( tried > 3 )) && break
+      info "正在探测${zh}回程：${label}（${ip}）"
+      if ! route_probe "$ip"; then
+        printf '%s：%s（%s）没有探测到任何跳，换下一个地址。\n' "$zh" "$label" "$ip"
+        continue
+      fi
+      route_fill_path_asns
+      local -a class_words=()
+      read -r -a class_words <<<"$ROUTE_CLASS_TOKENS"
+      if ((${#class_words[@]})); then class=$(route_china_classify "$carrier" "${class_words[@]}")
+      else class=$(route_china_classify "$carrier"); fi
+      local rank=0
+      [[ $class != unknown ]] && rank=$((rank + 2))
+      (( ROUTE_REACHED )) && rank=$((rank + 1))
+      if (( rank > best_rank )); then
+        best_rank=$rank best_class=$class best_ip=$ip best_label=$label
+        best_rtt=$ROUTE_RTT best_loss=$ROUTE_LOSS
+        best_hops=$ROUTE_HOP_IPS best_path=$ROUTE_PATH_ASNS
+        best_stars=$ROUTE_STAR_HOPS best_mtr=$ROUTE_MTR best_n=$ROUTE_HOP_N
+        got=1
+      fi
+      (( rank >= 3 )) && break
+    done < <(route_china_targets "$fam" "$carrier")
+    if (( ! got )); then
+      printf '%s：准备的地址都没有回应。这一项按不可达记 0。这只说明这些测试地址没有回答，不能单独证明整张运营商网络都不通。\n' "$zh"
+      score=0
+      printf '%s\n' "$(route_china_item_text "$zh" "未能识别" 0 0 -1 -1)"
+      scores+=("$score")
+      continue
+    fi
+    ROUTE_HOP_IPS=$best_hops ROUTE_PATH_ASNS=$best_path ROUTE_STAR_HOPS=$best_stars
+    ROUTE_MTR=$best_mtr ROUTE_HOP_N=$best_n ROUTE_RTT=$best_rtt ROUTE_LOSS=$best_loss
+    route_china_explain "$carrier" "$best_class" "$best_label" "$best_ip" "$best_rtt" "$best_loss"
+    line_pts=$(route_china_line_points "$best_class")
+    if [[ $best_rtt =~ ^[0-9]+$ ]]; then lat_pts=$(route_latency_points "$best_rtt" "$(route_bj_floor)")
+    else lat_pts=-1; fi
+    if [[ $best_loss =~ ^[0-9]+$ ]]; then loss_pts=$(route_loss_points "$best_loss")
+    else loss_pts=-1; fi
+    score=$(route_china_carrier_score "$line_pts" "$lat_pts" "$loss_pts")
+    printf '%s\n' "$(route_china_item_text "$zh" "$(route_china_class_label "$best_class")" "$score" "$line_pts" "$lat_pts" "$loss_pts")"
+    scores+=("$score")
+  done
+  ROUTE_CHINA_SCORE=$(route_avg "${scores[@]}")
+  if [[ $ROUTE_CHINA_SCORE == na ]]; then
+    printf '回国回程无法打分。\n'
+  else
+    printf '三家平均之后，%s。\n' "$(route_grade_text "回国回程" "$ROUTE_CHINA_SCORE")"
+  fi
+}
+route_section_line() {
+  local fam=$1
+  printf '\n%s【国际线路】%s\n' "$C_BOLD" "$C_NONE"
+  printf '这一节只看「和谁连着」，不看某一次 traceroute 实际走了谁。上游来自 RIPEstat looking-glass：各采集点的 AS 路径里，紧挨在本 ASN 前面的那个 ASN。IP 反查 ASN 用 bgp.tools 的 43 端口（和 Team Cymru 同一类 whois），查不到再退回 RIPEstat。不抓 bgp.tools 的网页。邻居表里 left 方向如果超过 12 个，说明这张网太大，那些邻居不全是上游，就不拿来加分。交换中心用 PeeringDB 的 netixlan，按不重复的 ix_id 计数。\n'
+  printf '计分权重是上游最多 30（0/1/2/3/不少于 4 家对应 0/10/18/24/30）、Tier1 最多 40（0/1/2/3/不少于 4 家对应 0/18/28/35/40）、IX 最多 30（0/1/2至3/4至7/不少于 8 个对应 0/8/16/24/30）。三项缺一就不打分，避免把查询失败写成很差。Tier1 按这份名单：Cogent、Verizon、Sprint、Arelion、NTT、GTT、DTAG、Lumen、PCCW、Orange、Tata、Zayo、TI Sparkle、AT&T。Hurricane Electric 不是这份名单里的 Tier1，但会在下面点名。\n'
+  if [[ ! $ROUTE_ORIGIN =~ ^[0-9]+$ ]]; then
+    printf '没有本机源 ASN，上游和 IX 都无从查起。国际线路无法打分。\n'
+    ROUTE_LINE_SCORE=na
+    return 0
+  fi
+  if ! have curl || ! have jq; then
+    printf '没有 curl 或 jq，读不了 RIPEstat 和 PeeringDB 的 JSON。国际线路无法打分。\n'
+    ROUTE_LINE_SCORE=na
+    return 0
+  fi
+  info "正在查询 AS${ROUTE_ORIGIN} 的上游、Tier1 和 PeeringDB"
+  route_load_upstreams "$ROUTE_ORIGIN" "$fam"
+  local note
+  note=$(route_he_cogent_note "$fam" "$ROUTE_UPSTREAMS") || true
+  [[ -n $note ]] && printf '%s\n' "$note"
+  if (( ! ROUTE_UP_OK || ! ROUTE_IX_OK )); then
+    printf 'looking-glass 或 PeeringDB 没有给齐上游和 IX。国际线路无法打分。已经看到的碎片不会按 0 分算进总评。\n'
+    if (( ROUTE_UP_OK )); then
+      local -a up_words=()
+      read -r -a up_words <<<"$ROUTE_UPSTREAMS"
+      if ((${#up_words[@]})); then printf 'looking-glass 仍然看到这些上游：%s。\n' "$(route_fmt_asns "${up_words[@]}")"
+      else printf 'looking-glass 没有给出上游 ASN。\n'; fi
+    fi
+    if (( ROUTE_NEIGH_WIDE )); then
+      printf 'asn-neighbours 的响应很大，left 邻居明显超过用来筛上游的 12 家门槛，这份名单没有拿来当上游。\n'
+    fi
+    ROUTE_LINE_SCORE=na
+    return 0
+  fi
+  local nu nt up_pts t1_pts ix_pts t1s="" x
+  local -a up_words=()
+  read -r -a up_words <<<"$ROUTE_UPSTREAMS"
+  if ((${#up_words[@]})); then
+    nu=$(route_count_words "${up_words[@]}")
+    nt=$(route_count_tier1 "${up_words[@]}")
+  else
+    nu=0
+    nt=0
+  fi
+  for x in "${up_words[@]}"; do route_is_tier1 "$x" && t1s+="$x "; done
+  up_pts=$(route_line_part_up "$nu")
+  t1_pts=$(route_line_part_t1 "$nt")
+  ix_pts=$(route_line_part_ix "$ROUTE_IX")
+  ROUTE_LINE_SCORE=$(route_line_score "$nu" "$nt" "$ROUTE_IX")
+  if (( nu == 0 )); then
+    printf '采集点的路径里没有看到本 ASN 前面还有别的 ASN。这可能是前缀没传播到这些采集点，不等于已经证明没有上游。按查到的结果，上游家数是 0。\n'
+  else
+    printf '观察到的上游有 %s 家：%s。\n' "$nu" "$(route_fmt_asns "${up_words[@]}")"
+  fi
+  if (( nt == 0 )); then
+    printf '其中没有这份名单里的 Tier1。\n'
+  else
+    local -a t1_words=()
+    read -r -a t1_words <<<"$t1s"
+    printf '其中 Tier1 有 %s 家：%s。\n' "$nt" "$(route_fmt_asns "${t1_words[@]}")"
+  fi
+  if (( ROUTE_NEIGH_WIDE )); then
+    printf '邻居表太大，没有并进上游。上面的家数只来自 looking-glass。\n'
+  elif [[ $ROUTE_NEIGH_N =~ ^[0-9]+$ ]] && (( ROUTE_NEIGH_N <= 12 )); then
+    printf 'left 邻居有 %s 个，没有超过 12，已和 looking-glass 的结果合并后去重。\n' "$ROUTE_NEIGH_N"
+  fi
+  if (( ROUTE_IX == 0 )); then
+    printf 'PeeringDB 没有这个 ASN 的交换中心记录（网络名：%s）。IX 按 0 计，这是查到了空名单，不是接口失败。\n' "${ROUTE_PDB_NAME:-无}"
+  else
+    printf 'PeeringDB 上%s登记了 %s 个不重复的交换中心。' \
+      "${ROUTE_PDB_NAME:+（${ROUTE_PDB_NAME}）}" "$ROUTE_IX"
+    if [[ $ROUTE_FAC =~ ^[0-9]+$ ]]; then printf '设施记录 %s 条，只作说明，不进分数。' "$ROUTE_FAC"; fi
+    printf '\n'
+  fi
+  printf '分项是上游 %s/30、Tier1 %s/40、IX %s/30。%s。有多少家 Tier1，只说明互联条件；去具体目标时如果路径上没有这些 ASN，下一节会单独写。\n' \
+    "$up_pts" "$t1_pts" "$ix_pts" "$(route_grade_text "国际线路" "$ROUTE_LINE_SCORE")"
+}
+route_intl_one() { # 地址族 洲 权重。把该洲分数写入 ROUTE_REGION_SCORE（数字或 na 不用，死目标记空）
+  local fam=$1 cont=$2 weight=$3
+  local zh ip lat lon label floor class lat_pts score
+  local -a scores=()
+  local tried=0 answered=0
+  zh=$(route_cont_zh "$cont")
+  printf '\n%s（这一洲在总权重里占 %s）。\n' "$zh" "$weight"
+  while read -r ip lat lon label; do
+    [[ -n $ip ]] || continue
+    tried=$((tried + 1))
+    if (( tried > 2 && answered >= 2 )); then break; fi
+    if (( tried > 3 )); then break; fi
+    info "正在探测${zh}：${label}（${ip}）"
+    if ! route_probe "$ip"; then
+      printf '到%s（%s）没有探测到任何跳。测试地址会失效，这一条不计入平均。\n' "$label" "$ip"
+      continue
+    fi
+    route_fill_path_asns
+    if (( ! ROUTE_REACHED )) && [[ -z ${ROUTE_PATH_ASNS// } ]]; then
+      printf '到%s（%s）终点没有回应，中间也没有解析出 ASN。这一条不计入平均。\n' "$label" "$ip"
+      continue
+    fi
+    floor=$(route_pair_floor "$lat" "$lon")
+    local rtt_arg=-1
+    [[ $ROUTE_RTT =~ ^[0-9]+$ ]] && rtt_arg=$ROUTE_RTT
+    if [[ -z ${ROUTE_PATH_ASNS// } ]]; then class=unreach
+    else class=$(route_path_class "$ROUTE_CONT" "$cont" "$ROUTE_PATH_ASNS" "$rtt_arg" "$floor"); fi
+    if [[ $ROUTE_RTT =~ ^[0-9]+$ ]]; then lat_pts=$(route_intl_lat_points "$ROUTE_RTT" "$floor")
+    else lat_pts=0; fi
+    if [[ $class == unreach ]]; then score=0; else score=$(route_intl_target_score "$class" "$lat_pts"); fi
+    answered=$((answered + 1))
+    scores+=("$score")
+    printf '到%s（%s）。' "$label" "$ip"
+    if [[ -n ${ROUTE_PATH_ASNS// } ]]; then
+      local -a path_words=()
+      read -r -a path_words <<<"$ROUTE_PATH_ASNS"
+      printf '路径上的 ASN 是 %s。' "$(route_fmt_asns "${path_words[@]}")"
+    else
+      printf '没有解析出路径 ASN。'
+    fi
+    printf '按跳数和是否经过 Tier1，这一条记为%s。' "$(route_path_class_label "$class")"
+    if [[ $ROUTE_RTT =~ ^[0-9]+$ ]]; then
+      printf '往返约 %s ms。' "$ROUTE_RTT"
+      if [[ $floor =~ ^[0-9]+$ && $floor != 0 ]]; then
+        printf '按两端坐标，理论下限大约 %s ms，实际大约是下限的 %s.%s 倍。' \
+          "$floor" $((ROUTE_RTT / floor)) $(( (ROUTE_RTT * 10 / floor) % 10 ))
+      fi
+    else
+      printf '终点没有往返时间，延迟分记 0，路径档次仍然保留。'
+    fi
+    if [[ $class == detour ]]; then
+      local kind extra
+      kind=$(route_detour_kind "$ROUTE_CONT" "$cont" "$ROUTE_PATH_ASNS" "$rtt_arg" "$floor")
+      extra=$(route_detour_extra "$rtt_arg" "$floor")
+      if [[ $kind == us ]]; then
+        printf '这是绕美：路径上有以北美为中心的运营商，而这条路的两端并不该绕到北美。相对理论下限大约多出 %s ms。' "$extra"
+      elif [[ $kind == eu ]]; then
+        printf '这是绕欧：路径上有以欧洲为中心的运营商，而这条路的两端并不该绕到欧洲。相对理论下限大约多出 %s ms。' "$extra"
+      fi
+    fi
+    printf '这一条 %s/100（路径档最多 60，延迟相对下限最多 40）。\n' "$score"
+    if [[ -n ${ROUTE_UPSTREAMS// } && -n ${ROUTE_PATH_ASNS// } ]]; then
+      local un
+      un=$(route_unused_note "$ROUTE_UPSTREAMS" "$ROUTE_PATH_ASNS") || true
+      [[ -n $un ]] && printf '%s\n' "$un"
+    fi
+  done < <(route_intl_targets "$fam" "$cont")
+  if (( answered == 0 )); then
+    printf '%s的目标都没有给出可用路径，这一洲按不可达记 0，并计入加权。\n' "$zh"
+    ROUTE_REGION_SCORE=0
+  else
+    ROUTE_REGION_SCORE=$(route_avg "${scores[@]}")
+    printf '%s可用目标的平均是 %s/100。\n' "$zh" "$ROUTE_REGION_SCORE"
+  fi
+}
+route_section_intl() {
+  local fam=$1
+  printf '\n%s【国际互联】%s\n' "$C_BOLD" "$C_NONE"
+  printf '这一节看实际走到了哪里，和上一节的「有哪些上游」分开。路径档次按直连/对等、Tier1 中转、Tier2/3、多跳、绕路、不可达。延迟拿实测往返和理论下限比，下限仍是距离公里数除以 100。两端在同一洲却绕到北美或欧洲，或者从亚太去欧洲却绕进北美（反过来也一样），并且往返超过下限的两倍，就记成绕路，并写出大约多出来的毫秒。死掉的测试地址不拉低平均；某一洲全部没有回应，这一洲记 0。\n'
+  local tool
+  tool=$(route_trace_bin)
+  if [[ $tool == none ]]; then
+    printf '没有 traceroute、mtr 或 nexttrace。国际互联无法打分。\n'
+    ROUTE_INTL_SCORE=na
+    return 0
+  fi
+  local w_ap w_na w_eu
+  read -r w_ap w_na w_eu <<<"$(route_continent_weights "$ROUTE_CONT")"
+  printf '本机按接入位置算在%s。三洲权重是亚太 %s、北美 %s、欧洲 %s。权重大的是离这台机器所在洲更该走好的方向，不是三洲平均成一个和线路分混在一起的总分。\n' \
+    "$(route_cont_zh "$ROUTE_CONT")" "$w_ap" "$w_na" "$w_eu"
+  route_intl_one "$fam" apac "$w_ap"
+  local s_ap=$ROUTE_REGION_SCORE
+  route_intl_one "$fam" na "$w_na"
+  local s_na=$ROUTE_REGION_SCORE
+  route_intl_one "$fam" eu "$w_eu"
+  local s_eu=$ROUTE_REGION_SCORE
+  ROUTE_INTL_SCORE=$(route_intl_combine "$s_ap" "$w_ap" "$s_na" "$w_na" "$s_eu" "$w_eu")
+  printf '\n加权之后，%s。这个数只来自上面三洲的路径，没有把国际线路的上游分加进来。\n' \
+    "$(route_grade_text "国际互联" "$ROUTE_INTL_SCORE")"
+}
+route_section_summary() {
+  printf '\n%s【总评】%s\n' "$C_BOLD" "$C_NONE"
+  route_summary_text "$ROUTE_CHINA_SCORE" "$ROUTE_LINE_SCORE" "$ROUTE_INTL_SCORE"
+  printf '\n'
+}
+route_report_family() {
+  local fam=$1 ip=""
+  if [[ $fam == 4 ]]; then ip=${PUBLIC_IP4:-}; else ip=${PUBLIC_IP6:-}; fi
+  echo
+  hr
+  _green "  IPv${fam} 线路检测"
+  hr
+  ROUTE_CHINA_SCORE="" ROUTE_LINE_SCORE="" ROUTE_INTL_SCORE=""
+  ROUTE_UPSTREAMS="" ROUTE_ORIGIN=""
+  if [[ -z $ip ]]; then
+    printf '本机没有检测到公网 IPv%s，这一侧不打分，也不编一个看起来完整的结果。\n' "$fam"
+    return 0
+  fi
+  route_section_access "$fam" "$ip"
+  route_section_china "$fam"
+  route_section_line "$fam"
+  route_section_intl "$fam"
+  route_section_summary
+}
+route_print_limits() {
+  printf '\n%s【局限】%s\n' "$C_BOLD" "$C_NONE"
+  cat <<'EOF'
+这次只覆盖从 VPS 出发、发向大陆运营商的回程，以及从 VPS 向外的国际 traceroute。没有测从大陆到 VPS 的去程，报告里的回程分数不能拿去程来用。
+晚高峰和白天、工作日和周末，同一家上游的拥塞可能差一截。这是一次采样，不是全天结论。
+traceroute 和 mtr 看到的中间跳，很多路由器不回应探测，星号不等于丢包。最后一跳通了，只说明这一次探测的往返；去程和回程可以走不同的运营商。没装 mtr 时，丢包只看终点这一跳有没有回应，看不出百分之几的轻微丢包。装了 mtr 就用最后一跳的丢包率。
+Telegram 数据中心是任播，落点不一定是写在上面的那个城市，时延下限会因此偏。东京 WIDE、香港 HGC、弗里蒙特 HE、阿姆斯特丹 RIPE 用来减少「全是任播」的情况，但这些地址本身也会变。
+电信用的是上海、成都、湖南的电信地址，联通用北京、广东、湖南，移动用北京附近和骨干地址。IPv6 每家目前只放了一个运营商网段里的地址。地址不通就换下一个；三家都没回应时该项记 0，并写明是目标没回答。
+省网 ASN（例如电信 4812、联通 4808、移动 56048）在没有更高档次的骨干 ASN 时，按该运营商的普通档计，不升到 CN2、9929 或 CMIN2。
+IPv4 和 IPv6 是两份报告。没有公网 IPv6 时不为 IPv6 编分数。Hurricane Electric 和 Cogent 的 IPv6 长期不互联，只在 IPv6 上游里两家都出现时才会单独提醒。
+EOF
+}
+route_print_go_cmd() {
+  local ip=${SERVER_ADDR:-}
+  [[ -n $ip ]] || ip=${PUBLIC_IP4:-${PUBLIC_IP6:-}}
+  printf '\n%s【去程：请在你自己的电脑上跑】%s\n' "$C_BOLD" "$C_NONE"
+  if [[ -z $ip ]]; then
+    printf '没有可用的 VPS 地址，没法给出去程命令。\n'
+    return 0
+  fi
+  cat <<EOF
+下面测的是从你的电脑到这台 VPS（${ip}）的去程。不要在 VPS 上跑这些命令来代替去程。VPS 上的探测方向是反的。
+
+Linux / macOS：
+  traceroute -n -w 1 -q 1 ${ip}
+  nexttrace --traceroute ${ip}
+
+Windows：
+  tracert -d ${ip}
+
+看结果时沿途 ASN 靠近你的宽带那一侧，才是去程进了哪家骨干。和上面的回程不是同一条路。
+EOF
+}
+route_ensure_ips() {
+  if [[ -n ${PUBLIC_IP4:-} || -n ${PUBLIC_IP6:-} ]]; then return 0; fi
+  if have curl; then
+    detect_ip
+    return 0
+  fi
+  PUBLIC_IP4=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || true
+  PUBLIC_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || true
+}
+do_route() {
+  [[ -f $STATE_FILE ]] && load_state
+  [[ -n ${INIT_SYS:-} ]] || detect_init
+  step "线路检测"
+  printf '只做路由检测。不改 Xray、Hysteria2、sing-box 和防火墙，不重启服务，也不测流媒体解锁。\n'
+  if ! have curl && [[ $(route_trace_bin) == none ]]; then
+    die "没有 curl，也没有 traceroute、mtr 或 nexttrace，无法做线路检测。"
+  fi
+  mktmp
+  route_ensure_ips
+  local -a fams=()
+  case ${OPT_ROUTE_FAM:-} in
+    4) fams=(4) ;;
+    6) fams=(6) ;;
+    *) fams=(4 6) ;;
+  esac
+  local f
+  for f in "${fams[@]}"; do route_report_family "$f"; done
+  route_print_limits
+  route_print_go_cmd
 }
 
 # ============================================================
@@ -9367,7 +10778,8 @@ show_menu() {
     "卸载" \
     "切换 NAT 模式（当前: $(nat_pref_text)）" \
     "协议开关" \
-    "申请证书"
+    "申请证书" \
+    "线路检测（回程 / 国际线路 / 国际互联）"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -9388,6 +10800,7 @@ show_menu() {
     15) act=menu_nat_pref ;;
     16) act=menu_proto ;;
     17) act=menu_cert ;;
+    18) act=do_route ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -9430,7 +10843,8 @@ show_land_menu() {
     "网络调优（BBR / 队列算法 / 缓冲区 / 恢复）" \
     "改装为 Reality / Hysteria2 节点" \
     "卸载" \
-    "切换 NAT 模式（当前: $(nat_pref_text)）"
+    "切换 NAT 模式（当前: $(nat_pref_text)）" \
+    "线路检测（回程 / 国际线路 / 国际互联）"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -9445,6 +10859,7 @@ show_land_menu() {
     9) OPT_LAND=0; act=do_install ;;
     10) act=do_uninstall ;;
     11) act=menu_nat_pref ;;
+    12) act=do_route ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -9576,8 +10991,16 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
   proxy nat           NAT 信息 / 修改映射端口 / 端口跳跃
   proxy tune          网络调优（见上）
+  proxy route         线路检测（回程 / 国际线路 / 国际互联；不改配置、不重启）
+  proxy route ipv4    只测 IPv4
+  proxy route ipv6    只测 IPv6
   proxy land          落地转发 / 落地机信息（见上）
   proxy uninstall     卸载
+
+线路检测（未安装节点也可以；NAT 模式也可以。不改代理、不重启、不测流媒体）:
+  测的是 VPS 发向大陆的回程，以及从 VPS 向外的国际线路和国际互联。
+  三项分数分开，不合成一个总分。IPv4 和 IPv6 各一份报告。
+  去程（家里的电脑 → VPS）不会在这台机器上测，报告末尾给出可复制的命令。
 USAGE
 }
 
@@ -9760,6 +11183,12 @@ parse_args() {
       speed) OPT_ACTION=speed ;;
       firewall|fw) OPT_ACTION=firewall ;;
       nat) OPT_ACTION=nat ;;
+      route|routes)
+        OPT_ACTION=route
+        case ${2-} in
+          4|ipv4|v4) OPT_ROUTE_FAM=4; shift ;;
+          6|ipv6|v6) OPT_ROUTE_FAM=6; shift ;;
+        esac ;;
       cert|acme) OPT_ACTION=cert ;;
       cdn) OPT_ACTION=cdn ;;
       uninstall|remove) OPT_ACTION=uninstall ;;
@@ -9829,6 +11258,7 @@ main() {
     cert) do_cert ;;
     cdn) do_cdn ;;
     tune) do_tune ;;
+    route) do_route ;;
     land) do_land_cli ;;
     allow) land_menu_allow ;;
     uninstall) do_uninstall ;;
