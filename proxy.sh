@@ -10,6 +10,7 @@
 #   bash proxy.sh tune            # 网络调优（BBR / 队列算法 / 缓冲区；可单独使用，NAT/容器也可用）
 #   bash proxy.sh --land          # 落地机：只运行 Shadowsocks 2022（给中转机做出口，可设来源 IP 白名单）
 #   proxy land-add 'ss://...'     # 中转机：把出口切换到落地机
+#   bash proxy.sh --cert-domain example.com   # 可选：为自有域名申请公开证书（订阅 HTTPS + Hy2/TUIC/AnyTLS）
 #   bash proxy.sh --help          # 查看全部参数
 # 安装完成后可直接使用命令: proxy
 #
@@ -86,6 +87,26 @@ readonly LAND_FW_FILE="${STATE_DIR}/land-fw.nft"
 readonly LAND_FW_UNIT="/etc/systemd/system/proxy-oneclick-land-fw.service"
 readonly LAND_FW_RC="/etc/init.d/proxy-oneclick-land-fw"
 readonly RESOLV_BAK="${STATE_DIR}/resolv.conf.bak"
+# 可选的公开证书（Let's Encrypt）。不申请时下面的目录不会被创建，节点仍用自签证书。
+readonly CERT_NAME="proxy-oneclick"
+readonly CERT_BASE="/etc/proxy-oneclick"
+readonly CERT_DIR="${CERT_BASE}/certs"
+readonly CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
+readonly CERT_PRIVKEY="${CERT_DIR}/privkey.pem"
+readonly CERT_LIB="/usr/local/lib/proxy-oneclick"
+readonly SUB_PY="${CERT_LIB}/sub_https.py"
+readonly CERT_HOOK="${CERT_LIB}/cert-deploy.sh"
+readonly SUB_CONF="${CERT_DIR}/sub.json"
+readonly SUB_BODY="${CERT_DIR}/sub.txt"
+readonly SUB_CLASH="${CERT_DIR}/sub-clash.yaml"
+readonly SUB_UNIT="/etc/systemd/system/proxy-oneclick-sub.service"
+readonly SUB_RC="/etc/init.d/proxy-oneclick-sub"
+readonly SUB_LOG="/var/log/proxy-oneclick/sub.log"
+readonly CERT_TIMER_UNIT="/etc/systemd/system/proxy-oneclick-cert.timer"
+readonly CERT_RENEW_UNIT="/etc/systemd/system/proxy-oneclick-cert.service"
+readonly CERT_CRON="/etc/periodic/daily/proxy-oneclick-cert"
+readonly CERT_GROUP="proxy-cert"
+readonly SUB_USER="proxy-sub"
 # 公共 DNS64 服务器（nat64.net / Trex），仅在 IPv6-only 且用户同意时写入 /etc/resolv.conf
 readonly DNS64_SERVERS="2a00:1098:2b::1 2a00:1098:2c::1 2a01:4f8:c2c:123f::1"
 readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
@@ -132,6 +153,10 @@ OPT_LAND_ALLOW=""   # 落地机来源 IP 白名单（逗号分隔，none 清空�
 OPT_LAND_LINK=""    # 中转机 land-add 的 ss:// 链接
 OPT_LAND_ACT=""     # 中转机落地转发子命令: add | on | off | del | test
 OPT_FORCE=0         # land-add 测试不通过也强制启用
+OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
+OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）
+OPT_CERT_EMAIL=""   # 可选，交给 Let's Encrypt；空则不登记邮箱
+OPT_SUB_PORT=""     # 订阅 HTTPS 端口，默认 8447
 XRAY_LABEL=""       # 端口提示中的协议名（落地机为 Shadowsocks 2022）
 
 # 运行时变量（部分持久化到 STATE_FILE）
@@ -386,7 +411,7 @@ openrc_ready() { # 非 OpenRC 引导的精简容器缺少 softlevel 时 rc-servi
     mkdir -p /run/openrc && touch /run/openrc/softlevel
   fi
 }
-svc_log_file() { case $1 in xray) printf '%s' "$XRAY_LOG" ;; hysteria-server) printf '%s' "$HY_LOG" ;; sing-box) printf '%s' "$SB_LOG" ;; esac; }
+svc_log_file() { case $1 in xray) printf '%s' "$XRAY_LOG" ;; hysteria-server) printf '%s' "$HY_LOG" ;; sing-box) printf '%s' "$SB_LOG" ;; proxy-oneclick-sub) printf '%s' "$SUB_LOG" ;; esac; }
 svc_exists() {
   if is_openrc; then [[ -x /etc/init.d/$1 ]]; else systemctl cat "$1" >/dev/null 2>&1; fi
 }
@@ -460,7 +485,8 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             TROJAN_ENABLED TROJAN_PORT TROJAN_PASS TROJAN_EXT_PORT
             TUIC_ENABLED TUIC_PORT TUIC_PASS TUIC_EXT_PORT
             ANYTLS_ENABLED ANYTLS_PORT ANYTLS_PASS ANYTLS_EXT_PORT
-            OUTBOUND_IP)
+            OUTBOUND_IP
+            CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
@@ -480,6 +506,7 @@ NAT_SRC=""          # 本次安装 NAT_MODE 的来源：cli | manual | alpine | 
 # 已记住的出站策略：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6。空 = 还没问过。
 # 双栈且为空时保持原来的 AsIs / Hy2 happy eyeballs，直到交互询问或 --auto（默认 46）。
 OUTBOUND_IP=""
+CERT_ON=0 CERT_DOMAIN="" CERT_EMAIL="" SUB_PORT=8447 SUB_TOKEN=""
 OUTBOUND_EFFECTIVE=""   # 本次写配置实际使用的策略（单栈会强制 4 或 6，不覆盖 OUTBOUND_IP）
 OUTBOUND_IP_DONE=0      # 本次进程只决定一次
 
@@ -2324,6 +2351,7 @@ check_port_free() { # $1 proto $2 port $3 允许的进程名(正则)
     [[ $1 == udp && $2 == "$HY2_PORT" && hysteria =~ ^($3)$ ]] && svc_active hysteria-server && return 0
     [[ $1 == udp && $2 == "$TUIC_PORT" && ${TUIC_ENABLED:-0} == 1 && sing-box =~ ^($3)$ ]] && svc_active sing-box && return 0
     [[ $1 == udp && $2 == "$XRAY_PORT" && ${LAND_MODE:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
+    [[ $1 == tcp && $2 == "$SUB_PORT" && ${CERT_ON:-0} == 1 && $3 =~ python ]] && svc_active proxy-oneclick-sub && return 0
   fi
   warn "${1^^} 端口 $2 已被占用（进程: ${owner:-未知}）。"
   return 1
@@ -2362,6 +2390,7 @@ other_listen_ports() { # $1 = tcp|udp
     [[ $ip =~ ^(127\.|\[::1\]|::1|\[?fe80) ]] && continue
     [[ $ip == "127.0.0.53%lo" || $ip == 127.0.0.54 ]] && continue
     [[ $users =~ \"(xray|hysteria|sing-box|sshd|systemd-resolve|chronyd|dhclient|systemd-network)\" ]] && continue
+    [[ ${CERT_ON:-0} == 1 && $port == "$SUB_PORT" && $users == *python* ]] && continue
     [[ " $SSH_PORTS " == *" $port "* ]] && continue
     echo "$port"
   done | sort -un | tr '\n' ' ' || true
@@ -3031,17 +3060,25 @@ gen_hy2_cert() {
 write_hy2_config() {
   ensure_outbound_ip
   [[ -n $HY2_PASS ]] || HY2_PASS=$(rand_pass)
-  [[ -f $HY_CRT && -f $HY_KEY ]] || gen_hy2_cert
-  # 证书 CN 与当前 SNI 不一致时重新生成
-  if ! openssl x509 -noout -subject -in "$HY_CRT" 2>/dev/null | grep -q "CN *= *${SNI}\$"; then gen_hy2_cert; fi
-  HY2_PIN=$(openssl x509 -noout -fingerprint -sha256 -in "$HY_CRT" | cut -d= -f2)
+  local crt=$HY_CRT key=$HY_KEY
+  if tls_present_real; then
+    # 公开证书的 CN 是自有域名，不能按伪装 SNI 重新生成自签证书。
+    cert_grant_readers
+    crt=$CERT_FULLCHAIN
+    key=$CERT_PRIVKEY
+  else
+    [[ -f $HY_CRT && -f $HY_KEY ]] || gen_hy2_cert
+    # 证书 CN 与当前 SNI 不一致时重新生成
+    if ! openssl x509 -noout -subject -in "$HY_CRT" 2>/dev/null | grep -q "CN *= *${SNI}\$"; then gen_hy2_cert; fi
+    HY2_PIN=$(openssl x509 -noout -fingerprint -sha256 -in "$HY_CRT" | cut -d= -f2)
+  fi
   cat >"${HY_CONF}.tmp" <<HY
 # 由 proxy-oneclick 生成
 listen: :${HY2_PORT}
 
 tls:
-  cert: ${HY_CRT}
-  key: ${HY_KEY}
+  cert: ${crt}
+  key: ${key}
 
 auth:
   type: password
@@ -3060,11 +3097,17 @@ HY
     hy2_outbound_yaml >>"${HY_CONF}.tmp"
   fi
   local grp="root"; id hysteria >/dev/null 2>&1 && grp=hysteria
-  chown "root:${grp}" "${HY_CONF}.tmp" "$HY_KEY" "$HY_CRT"
-  chmod 640 "${HY_CONF}.tmp" "$HY_KEY"; chmod 644 "$HY_CRT"
+  if tls_present_real; then
+    chown "root:${grp}" "${HY_CONF}.tmp"
+    chmod 640 "${HY_CONF}.tmp"
+  else
+    chown "root:${grp}" "${HY_CONF}.tmp" "$HY_KEY" "$HY_CRT"
+    chmod 640 "${HY_CONF}.tmp" "$HY_KEY"; chmod 644 "$HY_CRT"
+  fi
   mv -f "${HY_CONF}.tmp" "$HY_CONF"
   selinux_fix "$HY_DIR"
-  ok "Hysteria2 配置已生成: ${HY_CONF}"
+  if tls_present_real; then ok "Hysteria2 配置已生成: ${HY_CONF}（证书 ${CERT_DOMAIN}）"
+  else ok "Hysteria2 配置已生成: ${HY_CONF}"; fi
 }
 
 restart_hy2() {
@@ -3141,6 +3184,10 @@ render_firewall() {
   (( ${XHTTP_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_PORT"
   (( ${TROJAN_ENABLED:-0} )) && fw_add_port tcp_ports "$TROJAN_PORT"
   (( ${ANYTLS_ENABLED:-0} )) && fw_add_port tcp_ports "$ANYTLS_PORT"
+  if (( ${CERT_ON:-0} == 1 )); then
+    fw_add_port tcp_ports 80
+    fw_add_port tcp_ports "${SUB_PORT:-8447}"
+  fi
   for p in $EXTRA_TCP; do fw_add_port tcp_ports "$p"; done
   udp_ports=""
   (( HY2_ENABLED )) && udp_ports="$HY2_PORT"
@@ -3425,7 +3472,7 @@ ask_extra_ports() {
   detect_ssh_ports
   t=$(other_listen_ports tcp); u=$(other_listen_ports udp)
   # 排除自身端口
-  t=$(for p in $t; do [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" ]] || echo "$p"; done | tr '\n' ' ')
+  t=$(for p in $t; do [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || ( ${CERT_ON:-0} == 1 && ( $p == "$SUB_PORT" || $p == 80 ) ) ]] || echo "$p"; done | tr '\n' ' ')
   u=$(for p in $u; do [[ $p == "$HY2_PORT" || $p == "$TUIC_PORT" ]] || echo "$p"; done | tr '\n' ' ')
   t=${t% } u=${u% }
   if [[ -n $t || -n $u ]]; then
@@ -3466,6 +3513,10 @@ cloud_fw_reminder() {
   (( ANYTLS_ENABLED )) && printf 'TCP   %-7s  AnyTLS\n' "$ANYTLS_PORT"
   (( HY2_ENABLED )) && printf 'UDP   %-7s  Hysteria2%s\n' "$HY2_PORT" "${HOP_RANGE:+  以及 UDP ${HOP_RANGE}}"
   (( TUIC_ENABLED )) && printf 'UDP   %-7s  TUIC v5\n' "$TUIC_PORT"
+  if (( ${CERT_ON:-0} == 1 )); then
+    printf 'TCP   %-7s  证书续期（HTTP-01，不提供订阅）\n' 80
+    printf 'TCP   %-7s  订阅 HTTPS\n' "$SUB_PORT"
+  fi
   echo "位置：云控制台安全组。Oracle Cloud 镜像可能还有自带 iptables。"
   hr
 }
@@ -3499,6 +3550,896 @@ F2B
 }
 
 # ============================================================
+#          可选：公开证书（Let's Encrypt）与订阅 HTTPS
+# ============================================================
+# 默认不申请。没有域名时 REALITY、以及 Hysteria2 / TUIC / AnyTLS 的自签证书都保持原样。
+# 申请之后：
+#   · HTTP-01 只用 TCP 80，不碰 REALITY 所在端口；
+#   · 订阅只在 HTTPS 上提供，明文 HTTP 不返回订阅内容；
+#   · Hysteria2 / TUIC / AnyTLS 出示这张证书，链接改用自有域名，不再带 insecure / pin；
+#   · REALITY 继续借用伪装站点，配置里不写入这张证书。
+# NAT 模式拒绝申请：公网 80 往往映射不到这台机器。systemd 用 timer 续期，OpenRC 用 daily cron。
+
+cert_cli_requested() { [[ -n ${OPT_CERT_DOMAIN:-} || ${OPT_CERT:-} == 1 ]]; }
+tls_present_real() {
+  [[ ${CERT_ON:-0} == 1 && -n ${CERT_DOMAIN:-} && -s ${CERT_FULLCHAIN:-} && -s ${CERT_PRIVKEY:-} ]]
+}
+tls_link_host() {
+  if tls_present_real; then printf '%s' "$CERT_DOMAIN"; else server_addr; fi
+}
+tls_link_sni() {
+  if tls_present_real; then printf '%s' "$CERT_DOMAIN"; else printf '%s' "$SNI"; fi
+}
+sub_url_raw() { printf 'https://%s:%s/sub/%s' "$CERT_DOMAIN" "$SUB_PORT" "$SUB_TOKEN"; }
+sub_clash_url_raw() { printf 'https://%s:%s/sub/%s/clash' "$CERT_DOMAIN" "$SUB_PORT" "$SUB_TOKEN"; }
+sub_url() { printf '%s\n' "$(sub_url_raw)"; }
+sub_clash_url() { printf '%s\n' "$(sub_clash_url_raw)"; }
+
+cert_domain_syntax() {
+  local d=${1,,}
+  [[ -n $d && ${#d} -le 253 ]] || return 1
+  [[ $d =~ ^[0-9.]+$ || $d == *:* ]] && return 1
+  [[ $d =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+}
+cert_email_syntax() { [[ $1 =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; }
+
+cert_resolved_ips() {
+  local d=$1 ip out=""
+  if have getent; then
+    while read -r ip _; do
+      ip=${ip,,}
+      [[ $ip =~ ^[0-9.]+$ || $ip == *:* ]] || continue
+      [[ " $out " == *" $ip "* ]] || out+="$ip "
+    done < <(getent ahosts "$d" 2>/dev/null || true)
+  fi
+  if [[ -z ${out// /} ]] && have dig; then
+    while read -r ip; do
+      ip=${ip,,}
+      [[ $ip =~ ^[0-9.]+$ || $ip == *:* ]] || continue
+      [[ " $out " == *" $ip "* ]] || out+="$ip "
+    done < <({ dig +short "$d" A; dig +short "$d" AAAA; } 2>/dev/null || true)
+  fi
+  printf '%s' "${out% }"
+}
+cert_ip_ours() {
+  local a out=""
+  [[ -n $PUBLIC_IP4 ]] && out+="$PUBLIC_IP4 "
+  [[ -n $PUBLIC_IP6 ]] && out+="${PUBLIC_IP6,,} "
+  if [[ ${SERVER_ADDR:-} =~ ^[0-9.]+$ || ${SERVER_ADDR:-} == *:* ]]; then out+="${SERVER_ADDR,,} "; fi
+  if have ip; then
+    while read -r a; do
+      a=${a%%/*}; a=${a,,}
+      [[ -z $a || $a == 127.* || $a == ::1 || $a == fe80:* || $a == fc* || $a == fd* ]] && continue
+      [[ " $out " == *" $a "* ]] || out+="$a "
+    done < <(ip -o addr show scope global 2>/dev/null | awk '{print $4}')
+  fi
+  printf '%s' "${out% }"
+}
+cert_domain_points_here() {
+  local d=$1 ips ours ip missing=""
+  ips=$(cert_resolved_ips "$d")
+  if [[ -z $ips ]]; then warn "域名 ${d} 没有解析出地址。"; return 1; fi
+  ours=$(cert_ip_ours)
+  if [[ -z $ours ]]; then warn "没有检测到本机地址，无法确认域名指向这里。"; return 1; fi
+  for ip in $ips; do
+    [[ " $ours " == *" ${ip,,} "* ]] || missing+="${ip} "
+  done
+  if [[ -n $missing ]]; then
+    warn "域名 ${d} 解析到 ${missing}，其中有不是本机的地址（本机: ${ours}）。"
+    return 1
+  fi
+  info "域名 ${d} 已解析到本机（${ips}）。"
+  return 0
+}
+cert_normalize_domain() {
+  CERT_DOMAIN=${CERT_DOMAIN,,}
+  CERT_DOMAIN=${CERT_DOMAIN%.}
+  CERT_DOMAIN=${CERT_DOMAIN// /}
+}
+
+sub_port_blocked() {
+  local p=$1
+  [[ $p == 80 ]] && return 0
+  (( ${REALITY_ENABLED:-0} == 1 )) && [[ $p == "$XRAY_PORT" ]] && return 0
+  (( ${XHTTP_ENABLED:-0} == 1 )) && [[ $p == "$XHTTP_PORT" ]] && return 0
+  (( ${TROJAN_ENABLED:-0} == 1 )) && [[ $p == "$TROJAN_PORT" ]] && return 0
+  (( ${ANYTLS_ENABLED:-0} == 1 )) && [[ $p == "$ANYTLS_PORT" ]] && return 0
+  return 1
+}
+choose_sub_port() {
+  local p=${SUB_PORT:-8447}
+  [[ -n $OPT_SUB_PORT ]] && p=$OPT_SUB_PORT
+  while :; do
+    if [[ -z $OPT_SUB_PORT ]]; then
+      ask p "订阅 HTTPS 端口（TCP，不要用 80，也不要占用 REALITY）" "${p:-8447}"
+      p=${p// /}
+    fi
+    if ! is_port "$p" || sub_port_blocked "$p"; then
+      warn "端口 ${p:-空} 不能用于订阅。80 只留给证书申请；已开启协议的 TCP 端口也不能占用。"
+      (( OPT_AUTO )) || [[ -n $OPT_SUB_PORT ]] && die "订阅端口不可用: ${p:-空}"
+      p=8447
+      continue
+    fi
+    if check_port_free tcp "$p" 'python3(\.[0-9]+)?'; then SUB_PORT=$p; return 0; fi
+    (( OPT_AUTO )) || [[ -n $OPT_SUB_PORT ]] && die "订阅端口 ${p} 已被占用。"
+    p=8447
+  done
+}
+
+cert_ensure_group() {
+  getent group "$CERT_GROUP" >/dev/null 2>&1 && return 0
+  if have groupadd; then groupadd --system "$CERT_GROUP" >/dev/null 2>&1 || true
+  elif have addgroup; then addgroup -S "$CERT_GROUP" >/dev/null 2>&1 || true
+  fi
+  getent group "$CERT_GROUP" >/dev/null 2>&1 || die "无法创建组 ${CERT_GROUP}。"
+}
+cert_add_member() {
+  local u=$1
+  id "$u" >/dev/null 2>&1 || return 0
+  if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx "$CERT_GROUP"; then return 0; fi
+  if have usermod; then usermod -aG "$CERT_GROUP" "$u" >/dev/null 2>&1 || true
+  elif have addgroup; then addgroup "$u" "$CERT_GROUP" >/dev/null 2>&1 || true
+  fi
+}
+cert_ensure_sub_user() {
+  cert_ensure_group
+  if id "$SUB_USER" >/dev/null 2>&1; then cert_add_member "$SUB_USER"; return 0; fi
+  local sh; sh=$(command -v nologin 2>/dev/null || true)
+  [[ -n $sh ]] || sh=/usr/sbin/nologin
+  if have useradd; then
+    useradd --system --no-create-home --shell "$sh" --gid "$CERT_GROUP" "$SUB_USER" >/dev/null 2>&1 || \
+      useradd --system -M -s "$sh" -g "$CERT_GROUP" "$SUB_USER" >/dev/null 2>&1 || true
+  elif have adduser; then
+    adduser -S -D -H -h /var/empty -s /sbin/nologin -G "$CERT_GROUP" "$SUB_USER" >/dev/null 2>&1 || true
+  fi
+  id "$SUB_USER" >/dev/null 2>&1 || die "无法创建用户 ${SUB_USER}，不能启动订阅 HTTPS。"
+}
+cert_grant_readers() {
+  cert_ensure_group
+  cert_ensure_sub_user
+  cert_add_member hysteria
+  cert_add_member sing-box
+  cert_add_member "$SUB_USER"
+  if [[ -d $CERT_DIR ]]; then
+    chown "root:${CERT_GROUP}" "$CERT_DIR" 2>/dev/null || true
+    chmod 750 "$CERT_DIR" 2>/dev/null || true
+  fi
+  if [[ -s $CERT_PRIVKEY ]]; then
+    chown "root:${CERT_GROUP}" "$CERT_FULLCHAIN" "$CERT_PRIVKEY" 2>/dev/null || true
+    chmod 644 "$CERT_FULLCHAIN" 2>/dev/null || true
+    chmod 640 "$CERT_PRIVKEY" 2>/dev/null || true
+  fi
+}
+
+cert_san_ok() {
+  local san esc
+  [[ -s $1 ]] || return 1
+  san=$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null || true)
+  [[ -n $san ]] || return 1
+  esc=${CERT_DOMAIN//./\\.}
+  grep -Eq "DNS:${esc}(,|[[:space:]]|$)" <<<"$san"
+}
+cert_current_ok() {
+  local f live="/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem"
+  for f in "$CERT_FULLCHAIN" "$live"; do
+    [[ -s $f ]] || continue
+    cert_san_ok "$f" || continue
+    openssl x509 -checkend 2592000 -noout -in "$f" >/dev/null 2>&1 || continue
+    return 0
+  done
+  return 1
+}
+cert_expiry_text() {
+  local end
+  [[ -s $CERT_FULLCHAIN ]] || { printf '未知'; return 0; }
+  end=$(openssl x509 -enddate -noout -in "$CERT_FULLCHAIN" 2>/dev/null | cut -d= -f2 || true)
+  if [[ -n $end ]]; then date -d "$end" '+%F' 2>/dev/null || printf '%s' "$end"
+  else printf '未知'; fi
+}
+
+install_certbot_pkg() {
+  have certbot && have python3 && return 0
+  step "安装 certbot 与 python3"
+  if [[ $PKG == dnf && $OS_ID != fedora ]] && ! rpm -q epel-release >/dev/null 2>&1; then
+    pkg_install epel-release 2>/dev/null || true
+  fi
+  if ! pkg_install certbot python3; then
+    die "无法安装 certbot 或 python3，不能申请证书。Debian/Ubuntu 用 apt；RHEL 系需要 EPEL 里的 certbot；Alpine 用 apk（需启用 community）。本次没有改动 REALITY。"
+  fi
+  if ! have certbot || ! have python3; then
+    die "certbot 或 python3 安装后仍不可用，不能申请证书。"
+  fi
+}
+cert_allow_80_now() {
+  (( ${FW_ENABLED:-0} == 1 )) || return 0
+  have nft || return 0
+  nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || return 0
+  if nft list chain inet "$NFT_TABLE" input 2>/dev/null | grep -Eq 'tcp dport \{[^}]*\b80\b|tcp dport 80( |$)'; then
+    return 0
+  fi
+  nft insert rule inet "$NFT_TABLE" input tcp dport 80 accept comment "acme-http-01" >/dev/null 2>&1 || \
+    warn "没能在现有防火墙里放行 TCP 80。若申请失败，请在防火墙和云安全组放行 80 后重试。"
+}
+
+write_sub_python() {
+  mkdir -p "$CERT_LIB"
+  cat >"$SUB_PY" <<'PY'
+#!/usr/bin/env python3
+"""HTTPS-only subscription listener. Never binds port 80 and never answers plain HTTP."""
+import json
+import socket
+import ssl
+import sys
+from http.server import BaseHTTPRequestHandler
+
+try:
+    from http.server import ThreadingHTTPServer as _HTTPServer
+except ImportError:  # Python 3.6
+    from socketserver import ThreadingMixIn
+    from http.server import HTTPServer
+
+    class _HTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+
+def load_conf(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    for key in ("port", "cert", "key", "token", "body", "clash"):
+        if key not in data:
+            raise SystemExit("missing config field")
+    token = str(data["token"])
+    if not token or "/" in token or ".." in token:
+        raise SystemExit("invalid token")
+    data["token"] = token
+    return data
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self._reply(True)
+
+    def do_HEAD(self):
+        self._reply(False)
+
+    def do_POST(self):
+        self._empty(404)
+
+    def _reply(self, send_body):
+        path = self.path.split("?", 1)[0]
+        if path.endswith("/") and path != "/":
+            path = path[:-1]
+        conf = self.server.conf
+        token = conf["token"]
+        target = None
+        ctype = "text/plain; charset=utf-8"
+        if path == "/sub/" + token:
+            target = conf["body"]
+        elif path == "/sub/" + token + "/clash":
+            target = conf["clash"]
+            ctype = "text/yaml; charset=utf-8"
+        if target is None:
+            self._empty(404)
+            return
+        try:
+            with open(target, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            self._empty(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(data)
+
+    def _empty(self, code):
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        code = args[1] if len(args) > 1 else "-"
+        sys.stderr.write("proxy-oneclick-sub %s %s\n" % (self.command, code))
+
+
+class TLSServer(_HTTPServer):
+    allow_reuse_address = True
+
+    def __init__(self, addr, handler, context):
+        super().__init__(addr, handler)
+        self.socket = context.wrap_socket(self.socket, server_side=True)
+
+
+def make_server(port, context):
+    last_err = None
+    try:
+        class V6(TLSServer):
+            address_family = socket.AF_INET6
+
+            def server_bind(self):
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                super(TLSServer, self).server_bind()
+
+        return V6(("::", port), Handler, context)
+    except OSError as exc:
+        last_err = exc
+
+    class V4(TLSServer):
+        address_family = socket.AF_INET
+
+    try:
+        return V4(("0.0.0.0", port), Handler, context)
+    except OSError:
+        raise last_err
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: sub_https.py config.json")
+    conf = load_conf(sys.argv[1])
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    if hasattr(ssl, "TLSVersion"):
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    else:
+        ctx.options |= getattr(ssl, "OP_NO_TLSv1", 0) | getattr(ssl, "OP_NO_TLSv1_1", 0)
+    ctx.load_cert_chain(conf["cert"], conf["key"])
+    httpd = make_server(int(conf["port"]), ctx)
+    httpd.conf = conf
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PY
+  chmod 755 "$SUB_PY"
+}
+write_cert_hook() {
+  mkdir -p "$CERT_LIB"
+  cat >"$CERT_HOOK" <<EOF
+#!/bin/sh
+# 由 proxy-oneclick 生成。certbot 续期成功后调用。
+# 只更新证书并重启 Hysteria2 / sing-box / 订阅服务，不重启 xray（REALITY 不使用这张证书）。
+src="/etc/letsencrypt/live/${CERT_NAME}"
+dst="${CERT_DIR}"
+grp="${CERT_GROUP}"
+case \${RENEWED_LINEAGE:-} in
+  "") ;;
+  */${CERT_NAME}|*/${CERT_NAME}/) ;;
+  *) exit 0 ;;
+esac
+[ -f "\$src/fullchain.pem" ] && [ -f "\$src/privkey.pem" ] || exit 0
+mkdir -p "\$dst"
+if ! getent group "\$grp" >/dev/null 2>&1; then
+  if command -v groupadd >/dev/null 2>&1; then groupadd --system "\$grp" >/dev/null 2>&1 || true
+  elif command -v addgroup >/dev/null 2>&1; then addgroup -S "\$grp" >/dev/null 2>&1 || true
+  fi
+fi
+cp -f "\$src/fullchain.pem" "\$dst/fullchain.pem.new"
+cp -f "\$src/privkey.pem" "\$dst/privkey.pem.new"
+chown "root:\${grp}" "\$dst/fullchain.pem.new" "\$dst/privkey.pem.new" 2>/dev/null || chown root "\$dst/fullchain.pem.new" "\$dst/privkey.pem.new"
+chmod 644 "\$dst/fullchain.pem.new"
+chmod 640 "\$dst/privkey.pem.new"
+mv -f "\$dst/fullchain.pem.new" "\$dst/fullchain.pem"
+mv -f "\$dst/privkey.pem.new" "\$dst/privkey.pem"
+chmod 750 "\$dst" 2>/dev/null || true
+chown "root:\${grp}" "\$dst" 2>/dev/null || true
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl try-restart hysteria-server.service >/dev/null 2>&1 || true
+  systemctl try-restart sing-box.service >/dev/null 2>&1 || true
+  systemctl try-restart proxy-oneclick-sub.service >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+  for s in hysteria-server sing-box proxy-oneclick-sub; do
+    if [ -x "/etc/init.d/\$s" ]; then rc-service "\$s" restart >/dev/null 2>&1 || true; fi
+  done
+fi
+exit 0
+EOF
+  chmod 755 "$CERT_HOOK"
+}
+write_cert_helpers() { write_sub_python; write_cert_hook; }
+
+cert_install_material() {
+  local live="/etc/letsencrypt/live/${CERT_NAME}"
+  [[ -s ${live}/fullchain.pem && -s ${live}/privkey.pem ]] || die "certbot 没有留下证书文件。"
+  cert_grant_readers
+  mkdir -p "$CERT_DIR" "$CERT_LIB" "$(dirname "$SUB_LOG")"
+  cp -f "${live}/fullchain.pem" "${CERT_FULLCHAIN}.new"
+  cp -f "${live}/privkey.pem" "${CERT_PRIVKEY}.new"
+  chown "root:${CERT_GROUP}" "${CERT_FULLCHAIN}.new" "${CERT_PRIVKEY}.new"
+  chmod 644 "${CERT_FULLCHAIN}.new"
+  chmod 640 "${CERT_PRIVKEY}.new"
+  mv -f "${CERT_FULLCHAIN}.new" "$CERT_FULLCHAIN"
+  mv -f "${CERT_PRIVKEY}.new" "$CERT_PRIVKEY"
+  chmod 755 "$CERT_BASE" 2>/dev/null || true
+  chmod 750 "$CERT_DIR"
+  chown "root:${CERT_GROUP}" "$CERT_DIR"
+  selinux_fix "$CERT_BASE" "$CERT_LIB"
+}
+certbot_issue() {
+  local log live="/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem"
+  local -a args=()
+  mktmp
+  log="${TMP_DIR}/certbot-issue.log"
+  if [[ -s $live ]] && ! cert_san_ok "$live"; then
+    info "已有证书不是 ${CERT_DOMAIN}，先删除再申请。"
+    certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true
+  fi
+  if [[ -n $CERT_EMAIL ]]; then args=(--email "$CERT_EMAIL" --no-eff-email)
+  else args=(--register-unsafely-without-email); fi
+  info "向 Let's Encrypt 申请 ${CERT_DOMAIN}（HTTP-01，端口 80）。不会改动 REALITY 的 TCP ${XRAY_PORT}。"
+  if ! certbot certonly --non-interactive --agree-tos \
+      --cert-name "$CERT_NAME" \
+      --standalone --preferred-challenges http --http-01-port 80 \
+      --keep-until-expiring \
+      --deploy-hook "$CERT_HOOK" \
+      -d "$CERT_DOMAIN" \
+      "${args[@]}" >"$log" 2>&1; then
+    tail -n 30 "$log" >&2 || true
+    die "申请证书失败。请确认域名已解析到本机、云安全组已放行 TCP 80、本机 80 端口空闲。REALITY（TCP ${XRAY_PORT}）没有改动。"
+  fi
+  ok "证书已签发: ${CERT_DOMAIN}"
+}
+
+cert_b64() {
+  if printf '' | base64 -w 0 >/dev/null 2>&1; then base64 -w 0
+  else base64 | tr -d '\n'; fi
+  printf '\n'
+}
+cert_render_links() {
+  local u r
+  if (( REALITY_ENABLED )); then
+    printf '%s\n' "$(vless_link "$UUID" "${NODE_NAME}-Reality" 1)"
+    if [[ -s $USERS_FILE ]]; then
+      while IFS=$'\t' read -r u r; do
+        [[ -n $u ]] || continue
+        printf '%s\n' "$(vless_link "$u" "${NODE_NAME}-${r}" 0)"
+      done <"$USERS_FILE"
+    fi
+  fi
+  if (( XHTTP_ENABLED )); then
+    printf '%s\n' "$(vless_xhttp_link "$UUID" "${NODE_NAME}-XHTTP" 1)"
+    if [[ -s $USERS_FILE ]]; then
+      while IFS=$'\t' read -r u r; do
+        [[ -n $u ]] || continue
+        printf '%s\n' "$(vless_xhttp_link "$u" "${NODE_NAME}-XHTTP-${r}" 0)"
+      done <"$USERS_FILE"
+    fi
+  fi
+  (( HY2_ENABLED )) && printf '%s\n' "$(hy2_link)"
+  (( TROJAN_ENABLED )) && printf '%s\n' "$(trojan_link)"
+  (( TUIC_ENABLED )) && printf '%s\n' "$(tuic_link)"
+  (( ANYTLS_ENABLED )) && printf '%s\n' "$(anytls_link)"
+}
+cert_write_bodies() {
+  tls_present_real || return 0
+  [[ -n $SUB_TOKEN ]] || return 0
+  cert_grant_readers
+  mkdir -p "$CERT_DIR"
+  cert_render_links | cert_b64 >"${SUB_BODY}.tmp"
+  mihomo_yaml >"${SUB_CLASH}.tmp"
+  chown "root:${CERT_GROUP}" "${SUB_BODY}.tmp" "${SUB_CLASH}.tmp" 2>/dev/null || true
+  chmod 640 "${SUB_BODY}.tmp" "${SUB_CLASH}.tmp"
+  mv -f "${SUB_BODY}.tmp" "$SUB_BODY"
+  mv -f "${SUB_CLASH}.tmp" "$SUB_CLASH"
+}
+cert_write_sub_conf() {
+  mkdir -p "$CERT_DIR"
+  jq -n --arg token "$SUB_TOKEN" --argjson port "$SUB_PORT" \
+    --arg cert "$CERT_FULLCHAIN" --arg key "$CERT_PRIVKEY" \
+    --arg body "$SUB_BODY" --arg clash "$SUB_CLASH" \
+    '{port: $port, cert: $cert, key: $key, token: $token, body: $body, clash: $clash}' \
+    >"${SUB_CONF}.tmp"
+  chown "root:${CERT_GROUP}" "${SUB_CONF}.tmp" 2>/dev/null || true
+  chmod 640 "${SUB_CONF}.tmp"
+  mv -f "${SUB_CONF}.tmp" "$SUB_CONF"
+}
+
+write_sub_service() {
+  local user=$SUB_USER py
+  id "$user" >/dev/null 2>&1 || user=root
+  py=$(command -v python3)
+  [[ -n $py ]] || die "未找到 python3，无法启动订阅 HTTPS。"
+  mkdir -p "$(dirname "$SUB_LOG")"
+  if is_openrc; then
+    cat >"$SUB_RC" <<RC
+#!/sbin/openrc-run
+# 由 proxy-oneclick 生成。只提供订阅 HTTPS，不监听 80。
+name="proxy-oneclick-sub"
+description="proxy-oneclick subscription HTTPS"
+supervisor=supervise-daemon
+command="${py}"
+command_args="${SUB_PY} ${SUB_CONF}"
+command_user="${user}:${CERT_GROUP}"
+output_log="${SUB_LOG}"
+error_log="${SUB_LOG}"
+respawn_delay=3
+respawn_max=0
+supervise_daemon_args="--env PYTHONUNBUFFERED=1"
+$(need_bind_cap "$SUB_PORT" && echo 'capabilities="^cap_net_bind_service"')
+
+depend() {
+  want net
+  after net
+}
+
+start_pre() {
+  checkpath -d -m 0755 -o "\${command_user}" "$(dirname "$SUB_LOG")"
+  checkpath -f -m 0644 -o "\${command_user}" "${SUB_LOG}"
+}
+RC
+    chmod 755 "$SUB_RC"
+  else
+    {
+      echo "# 由 proxy-oneclick 生成。只提供订阅 HTTPS，不监听 80。"
+      echo "[Unit]"
+      echo "Description=proxy-oneclick subscription HTTPS"
+      echo "After=network-online.target"
+      echo "Wants=network-online.target"
+      echo
+      echo "[Service]"
+      echo "User=${user}"
+      echo "Group=${CERT_GROUP}"
+      echo "WorkingDirectory=${CERT_DIR}"
+      echo "NoNewPrivileges=true"
+      if need_bind_cap "$SUB_PORT"; then
+        echo "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+        echo "AmbientCapabilities=CAP_NET_BIND_SERVICE"
+      fi
+      echo "Environment=PYTHONUNBUFFERED=1"
+      echo "ExecStart=${py} ${SUB_PY} ${SUB_CONF}"
+      echo "Restart=on-failure"
+      echo "RestartSec=3"
+      echo
+      echo "[Install]"
+      echo "WantedBy=multi-user.target"
+    } >"$SUB_UNIT"
+    systemctl daemon-reload
+  fi
+}
+write_renew_job() {
+  local bin; bin=$(command -v certbot)
+  [[ -n $bin ]] || die "未找到 certbot，无法安排续期。"
+  if is_openrc; then
+    mkdir -p "$(dirname "$CERT_CRON")"
+    cat >"$CERT_CRON" <<EOF
+#!/bin/sh
+# 由 proxy-oneclick 生成。每天检查一次，临近到期才真正续期。
+exec ${bin} renew --quiet --cert-name ${CERT_NAME}
+EOF
+    chmod 755 "$CERT_CRON"
+    if have rc-update; then
+      rc-update add crond default >/dev/null 2>&1 || rc-update add cron default >/dev/null 2>&1 || true
+      rc-service crond start >/dev/null 2>&1 || rc-service cron start >/dev/null 2>&1 || true
+    fi
+    ok "证书续期已交给 OpenRC 的每日任务（${CERT_CRON}）。"
+  else
+    cat >"$CERT_RENEW_UNIT" <<EOF
+[Unit]
+Description=Renew proxy-oneclick Let's Encrypt certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${bin} renew --quiet --cert-name ${CERT_NAME}
+EOF
+    cat >"$CERT_TIMER_UNIT" <<EOF
+[Unit]
+Description=Daily proxy-oneclick certificate renewal check
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || warn "证书续期定时器未能启用，请稍后执行 systemctl enable --now proxy-oneclick-cert.timer。"
+    ok "证书续期已交给 systemd 定时器（每天检查，到期前约 30 天续期）。"
+  fi
+}
+
+cert_selfcheck() {
+  local got="" want tmp httpbody
+  want=$(openssl x509 -in "$CERT_FULLCHAIN" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)
+  got=$( { echo | openssl s_client -connect "127.0.0.1:${SUB_PORT}" -servername "$CERT_DOMAIN" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; } || true)
+  if [[ -z $got || $got != "$want" ]]; then
+    warn "订阅 HTTPS 自检未通过：TCP ${SUB_PORT} 上没有出示 ${CERT_DOMAIN} 的证书。可查看 proxy status。"
+    return 0
+  fi
+  tmp=$(mktemp)
+  if curl -fsS --insecure --resolve "${CERT_DOMAIN}:${SUB_PORT}:127.0.0.1" --max-time 10 -o "$tmp" "$(sub_url_raw)"; then
+    if cmp -s "$tmp" "$SUB_BODY"; then ok "订阅 HTTPS 自检通过（${CERT_DOMAIN}:${SUB_PORT}）。"
+    else warn "订阅 HTTPS 已连通，但内容和当前节点列表不一致。"; fi
+  else
+    warn "订阅 HTTPS 握手正常，但拉取订阅失败。"
+  fi
+  httpbody=$(mktemp)
+  if curl -fsS --max-time 3 -o "$httpbody" "http://127.0.0.1:${SUB_PORT}/sub/${SUB_TOKEN}" 2>/dev/null \
+      && cmp -s "$httpbody" "$SUB_BODY"; then
+    rm -f "$tmp" "$httpbody"
+    die "订阅端口以明文 HTTP 返回了订阅内容，已中止。"
+  fi
+  rm -f "$tmp" "$httpbody"
+  return 0
+}
+cert_start_sub() {
+  tls_present_real || return 0
+  cert_grant_readers
+  write_cert_helpers
+  cert_write_sub_conf
+  cert_write_bodies
+  write_sub_service
+  write_renew_job
+  sd_reload
+  svc_enable proxy-oneclick-sub
+  svc_restart proxy-oneclick-sub || true
+  sleep 1
+  if ! svc_active proxy-oneclick-sub; then
+    svc_logs proxy-oneclick-sub 30 >&2 || true
+    die "订阅 HTTPS 服务启动失败。REALITY 没有改动。"
+  fi
+  ok "订阅 HTTPS 已监听 TCP ${SUB_PORT}（只接受 TLS；明文 HTTP 不提供订阅）。"
+  cert_selfcheck
+}
+
+cert_ask_domain() {
+  [[ -n $OPT_CERT_DOMAIN ]] && CERT_DOMAIN=$OPT_CERT_DOMAIN
+  [[ -n $OPT_CERT_EMAIL ]] && CERT_EMAIL=$OPT_CERT_EMAIL
+  cert_normalize_domain
+  while :; do
+    if [[ -z $CERT_DOMAIN ]]; then
+      (( OPT_AUTO )) && die "申请证书需要 --cert-domain <域名>。"
+      ask CERT_DOMAIN "域名（已解析到本机，例如 example.com）" ""
+      cert_normalize_domain
+    fi
+    if ! cert_domain_syntax "$CERT_DOMAIN"; then
+      warn "域名无效: ${CERT_DOMAIN:-空}。需要像 example.com 这样的域名，不能是 IP。"
+      (( OPT_AUTO )) || [[ -n $OPT_CERT_DOMAIN ]] && die "域名无效，已取消申请证书。REALITY 未改动。"
+      CERT_DOMAIN=""
+      OPT_CERT_DOMAIN=""
+      continue
+    fi
+    [[ -n $PUBLIC_IP4 || -n $PUBLIC_IP6 ]] || detect_ip
+    if cert_domain_points_here "$CERT_DOMAIN"; then break; fi
+    (( OPT_AUTO )) || [[ -n $OPT_CERT_DOMAIN ]] && die "域名 ${CERT_DOMAIN} 没有全部解析到本机，已取消申请证书。REALITY 未改动。"
+    confirm "重新填写域名？" y || die "已取消申请证书。REALITY 未改动。"
+    CERT_DOMAIN=""
+    OPT_CERT_DOMAIN=""
+  done
+  if [[ -n $CERT_EMAIL ]] && ! cert_email_syntax "$CERT_EMAIL"; then
+    die "邮箱格式无效: ${CERT_EMAIL}"
+  fi
+}
+cert_issue_flow() {
+  step "申请公开证书"
+  cert_ask_domain
+  choose_sub_port
+  [[ -n $SUB_TOKEN ]] || SUB_TOKEN=$(rand_hex 16)
+  install_certbot_pkg
+  write_cert_helpers
+  cert_allow_80_now
+  if cert_current_ok; then
+    info "证书仍有效（${CERT_DOMAIN}，到期 $(cert_expiry_text)），跳过重新申请。"
+  else
+    if port_in_use tcp 80; then
+      die "TCP 80 已被 $(port_owner tcp 80) 占用。HTTP-01 需要暂时独占 80，且不会改动 REALITY 的 TCP ${XRAY_PORT}。请释放 80 后重试。"
+    fi
+    certbot_issue
+  fi
+  cert_install_material
+  CERT_ON=1
+  cert_write_sub_conf
+  cert_write_bodies
+  save_state
+}
+cert_rewire_protocols() {
+  # 只改能出示这张证书的协议。不调用 write_xray_config，REALITY 继续借用伪装站点。
+  if (( HY2_ENABLED )) && [[ -x $HY_BIN ]]; then
+    write_hy2_config
+    restart_hy2
+  fi
+  if sb_needed && [[ -x $SB_BIN ]]; then
+    write_singbox_config
+    restart_singbox
+  fi
+}
+cert_turn_off() {
+  local quiet=${1-}
+  CERT_ON=0
+  svc_disable_stop proxy-oneclick-sub || true
+  if [[ ${INIT_SYS:-} == systemd ]] && have systemctl; then
+    systemctl disable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || true
+  fi
+  rm -f "$SUB_UNIT" "$SUB_RC" "$CERT_TIMER_UNIT" "$CERT_RENEW_UNIT" "$CERT_CRON"
+  sd_reload
+  if have certbot; then certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true; fi
+  rm -rf "$CERT_DIR" "$CERT_LIB"
+  if (( HY2_ENABLED )) && [[ -x $HY_BIN ]]; then
+    gen_hy2_cert
+    write_hy2_config
+    restart_hy2
+  fi
+  if sb_needed && [[ -x $SB_BIN ]]; then
+    write_singbox_config
+    restart_singbox
+  fi
+  if (( ! NAT_MODE && ${FW_ENABLED:-0} == 1 )); then apply_firewall; fi
+  save_state
+  if (( INSTALLED )); then save_info || true; fi
+  if [[ $quiet != quiet ]]; then
+    ok "已关闭证书。Hysteria2 / TUIC / AnyTLS 改回自签证书。订阅已停止。REALITY 未改动。"
+  fi
+}
+cert_remove_files() {
+  local had=0
+  [[ -d $CERT_DIR || -d $CERT_LIB || -f $SUB_UNIT || -f $SUB_RC || -f $CERT_TIMER_UNIT || -d /etc/letsencrypt/live/${CERT_NAME} ]] && had=1
+  svc_disable_stop proxy-oneclick-sub || true
+  if have systemctl; then systemctl disable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || true; fi
+  rm -f "$SUB_UNIT" "$SUB_RC" "$CERT_TIMER_UNIT" "$CERT_RENEW_UNIT" "$CERT_CRON"
+  sd_reload
+  if have certbot; then certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true; fi
+  rm -rf "$CERT_DIR" "$CERT_LIB" /var/log/proxy-oneclick
+  if id "$SUB_USER" >/dev/null 2>&1; then userdel "$SUB_USER" >/dev/null 2>&1 || deluser "$SUB_USER" >/dev/null 2>&1 || true; fi
+  if getent group "$CERT_GROUP" >/dev/null 2>&1; then groupdel "$CERT_GROUP" >/dev/null 2>&1 || delgroup "$CERT_GROUP" >/dev/null 2>&1 || true; fi
+  CERT_ON=0
+  (( had )) && ok "证书与订阅 HTTPS 已移除。"
+  return 0
+}
+
+setup_cert() {
+  (( LAND_MODE )) && return 0
+  if (( NAT_MODE )); then
+    if (( CERT_ON == 1 )); then
+      warn "NAT 模式无法在公网 80 上续期，已关闭证书。Hysteria2 / TUIC / AnyTLS 改回自签证书。REALITY 未改用该证书。"
+      cert_turn_off quiet
+    fi
+    return 0
+  fi
+  if [[ $OPT_CERT == 0 ]]; then
+    if (( CERT_ON == 1 )); then cert_turn_off; fi
+    return 0
+  fi
+  local want=0
+  if [[ -n $OPT_CERT_DOMAIN || $OPT_CERT == 1 ]]; then want=1
+  elif (( CERT_ON == 1 )) && [[ -n $CERT_DOMAIN ]]; then want=1
+  elif (( OPT_AUTO )); then return 0
+  elif confirm "是否申请公开可信证书（Let's Encrypt）？需要自有域名已解析到本机。用于订阅 HTTPS，以及 Hysteria2 / TUIC / AnyTLS（链接改用该域名，不再使用 insecure）。REALITY 仍借用伪装站点。默认不申请。" n; then
+    info "继续申请即表示同意 Let’s Encrypt 服务条款（https://letsencrypt.org/repository/）。"
+    want=1
+  fi
+  (( want )) || return 0
+  cert_issue_flow
+}
+
+cert_menu_issue() {
+  local d=${CERT_DOMAIN-}
+  ask d "域名（已解析到本机）" "$d"
+  OPT_CERT_DOMAIN=$d
+  cert_issue_flow
+  OPT_CERT_DOMAIN=""
+  cert_rewire_protocols
+  if (( FW_ENABLED )); then apply_firewall; fi
+  cert_start_sub
+  save_state
+  show_info
+}
+cert_menu_renew() {
+  tls_present_real || { warn "尚未申请证书。"; return 0; }
+  local owner=""
+  if port_in_use tcp 80; then
+    owner=$(port_owner tcp 80)
+    warn "TCP 80 被 ${owner:-其它进程} 占用，HTTP-01 无法续期。"
+    return 0
+  fi
+  cert_allow_80_now
+  local renew_args=(renew --cert-name "$CERT_NAME")
+  if openssl x509 -checkend 2592000 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+    info "证书尚未进入续期窗口（到期前 30 天才续）。当前到期 $(cert_expiry_text)。"
+    confirm "仍然向 Let's Encrypt 强制续期？" n || return 0
+    renew_args+=(--force-renewal)
+  fi
+  if certbot "${renew_args[@]}"; then
+    cert_install_material
+    cert_rewire_protocols
+    cert_start_sub
+    ok "续期检查完成。到期 $(cert_expiry_text)。"
+  else
+    warn "续期失败。请确认 TCP 80 可以从公网访问。REALITY 未改动。"
+  fi
+}
+menu_cert() {
+  need_node
+  [[ -n $OS_ID ]] || detect_os
+  if (( NAT_MODE )); then
+    die "NAT 模式不能申请证书：HTTP-01 需要公网 80 能访问到本机，NAT 小鸡通常没有这条映射。不申请时 REALITY 和自签证书保持原样。"
+  fi
+  while :; do
+    echo
+    if tls_present_real; then
+      printf '证书  %s\n' "$CERT_DOMAIN"
+      printf '到期  %s\n' "$(cert_expiry_text)"
+      printf '订阅  HTTPS %s:%s（完整链接在查看里，明文 HTTP 不提供）\n' "$CERT_DOMAIN" "$SUB_PORT"
+    else
+      echo "当前未申请证书。不申请时 REALITY 与自签的 Hysteria2 / TUIC / AnyTLS 保持原样。"
+    fi
+    ui_columns "oneclick proxy" "返回" \
+      "申请 / 更换域名" \
+      "立即续期" \
+      "查看订阅链接" \
+      "关闭证书（改回自签）"
+    local c
+    ask c "请选择" "0"
+    case $c in
+      1) cert_menu_issue ;;
+      2) cert_menu_renew ;;
+      3) if tls_present_real; then show_info; else warn "尚未申请证书。"; fi ;;
+      4) if ! tls_present_real; then info "当前没有证书。"; continue; fi
+         confirm "关闭证书后，Hysteria2 / TUIC / AnyTLS 改回自签，订阅 HTTPS 停止。REALITY 不变。确认？" n || continue
+         cert_turn_off ;;
+      *) return 0 ;;
+    esac
+  done
+}
+do_cert() {
+  load_state
+  [[ -n $INIT_SYS ]] || detect_init
+  [[ -n $OS_ID ]] || detect_os
+  if [[ $OPT_CERT == 0 ]]; then
+    (( INSTALLED )) || die "尚未安装。"
+    if (( CERT_ON != 1 )); then info "当前没有证书。"; return 0; fi
+    cert_turn_off
+    return 0
+  fi
+  need_node
+  if (( NAT_MODE )); then
+    die "NAT 模式不能申请证书：HTTP-01 需要公网 80 能访问到本机，NAT 小鸡通常没有这条映射。不申请时 REALITY 和自签证书保持原样。"
+  fi
+  if [[ -n $OPT_CERT_DOMAIN || $OPT_CERT == 1 ]]; then
+    cert_issue_flow
+    cert_rewire_protocols
+    if (( FW_ENABLED )); then apply_firewall; fi
+    cert_start_sub
+    save_state
+    show_info
+    return 0
+  fi
+  if [[ ! -t 0 && ! -r /dev/tty ]]; then die "非交互环境请使用 --cert-domain。"; fi
+  menu_cert
+}
+
+print_sub_block() {
+  tls_present_real || return 0
+  [[ -n $SUB_TOKEN ]] || return 0
+  local paint=${1:-0} W=62
+  echo
+  ui_bar '═' "$W" "$paint"
+  ui_center "订阅（仅 HTTPS）" "$W" "$paint"
+  ui_bar '─' "$W" "$paint"
+  printf '域名  %s\n' "$CERT_DOMAIN"
+  printf '端口  %s  TCP\n' "$SUB_PORT"
+  node_link_note "$paint" "明文 HTTP 不提供订阅。Hysteria2 / TUIC / AnyTLS 使用这张证书。"
+  node_link_note "$paint" "REALITY 仍借用伪装站点 ${SNI}，不使用这张证书。"
+  echo "v2rayN / v2rayNG / Shadowrocket"
+  sub_url
+  echo "mihomo"
+  sub_clash_url
+  if (( paint )); then echo; print_qr "$(sub_url_raw)"; fi
+  ui_bar '═' "$W" "$paint"
+}
+
+# ============================================================
 #                        链接 / 二维码 / 客户端配置
 # ============================================================
 server_addr() {
@@ -3529,9 +4470,11 @@ vless_link() { # $1 uuid $2 名称 $3 是否包含 pqv(1/0)
 }
 
 hy2_link() {
-  local addr q
-  addr=$(host_fmt "$(server_addr)")
-  q="sni=${SNI}&insecure=1&pinSHA256=${HY2_PIN}"
+  local addr q sni
+  addr=$(host_fmt "$(tls_link_host)")
+  sni=$(tls_link_sni)
+  if tls_present_real; then q="sni=${sni}"
+  else q="sni=${sni}&insecure=1&pinSHA256=${HY2_PIN}"; fi
   [[ -n $(pub_hop) ]] && q+="&mport=$(pub_hop)"
   printf 'hysteria2://%s@%s:%s/?%s#%s' "$(urlencode "$HY2_PASS")" "$addr" "$(pub_hy2_port)" "$q" "$(urlencode "${NODE_NAME}-Hy2")"
 }
@@ -3552,15 +4495,19 @@ trojan_link() {
   printf 'trojan://%s@%s:%s?%s#%s' "$(urlencode "$TROJAN_PASS")" "$addr" "$(pub_trojan_port)" "$q" "$(urlencode "${NODE_NAME}-Trojan")"
 }
 tuic_link() {
-  local addr q
-  addr=$(host_fmt "$(server_addr)")
-  q="congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${SNI}&allow_insecure=1&insecure=1"
+  local addr q sni
+  addr=$(host_fmt "$(tls_link_host)")
+  sni=$(tls_link_sni)
+  if tls_present_real; then q="congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}"
+  else q="congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}&allow_insecure=1&insecure=1"; fi
   printf 'tuic://%s:%s@%s:%s?%s#%s' "$(urlencode "$UUID")" "$(urlencode "$TUIC_PASS")" "$addr" "$(pub_tuic_port)" "$q" "$(urlencode "${NODE_NAME}-TUIC")"
 }
 anytls_link() {
-  local addr q
-  addr=$(host_fmt "$(server_addr)")
-  q="security=tls&type=tcp&sni=${SNI}&fp=chrome&insecure=1&allowInsecure=1"
+  local addr q sni
+  addr=$(host_fmt "$(tls_link_host)")
+  sni=$(tls_link_sni)
+  if tls_present_real; then q="security=tls&type=tcp&sni=${sni}&fp=chrome"
+  else q="security=tls&type=tcp&sni=${sni}&fp=chrome&insecure=1&allowInsecure=1"; fi
   printf 'anytls://%s@%s:%s?%s#%s' "$(urlencode "$ANYTLS_PASS")" "$addr" "$(pub_anytls_port)" "$q" "$(urlencode "${NODE_NAME}-AnyTLS")"
 }
 
@@ -3610,23 +4557,35 @@ Y
   fi
   fi
   if (( HY2_ENABLED )); then
+    local hy_host hy_sni
+    hy_host=$(tls_link_host)
+    hy_sni=$(tls_link_sni)
     cat <<Y
   - name: "${NODE_NAME}-Hy2"
     type: hysteria2
-    server: ${addr}
+    server: ${hy_host}
     port: $(pub_hy2_port)
 Y
     if [[ -n $(pub_hop) ]]; then
       if [[ $(pub_hop) == *,* ]]; then printf '    ports: "%s"\n    hop-interval: 30\n' "$(pub_hop)"
       else printf '    ports: %s\n    hop-interval: 30\n' "$(pub_hop)"; fi
     fi
-    cat <<Y
+    if tls_present_real; then
+      cat <<Y
     password: "${HY2_PASS}"
-    sni: ${SNI}
+    sni: ${hy_sni}
+    alpn:
+      - h3
+Y
+    else
+      cat <<Y
+    password: "${HY2_PASS}"
+    sni: ${hy_sni}
     fingerprint: ${pin_hex}
     alpn:
       - h3
 Y
+    fi
   fi
   if (( XHTTP_ENABLED )); then
     cat <<Y
@@ -3665,33 +4624,39 @@ Y
 Y
   fi
   if (( TUIC_ENABLED )); then
+    local tu_host tu_sni
+    tu_host=$(tls_link_host)
+    tu_sni=$(tls_link_sni)
     cat <<Y
   - name: "${NODE_NAME}-TUIC"
     type: tuic
-    server: ${addr}
+    server: ${tu_host}
     port: $(pub_tuic_port)
     uuid: ${UUID}
     password: "${TUIC_PASS}"
-    sni: ${SNI}
+    sni: ${tu_sni}
     alpn: [h3]
     congestion-controller: bbr
     udp-relay-mode: native
-    skip-cert-verify: true
-    udp: true
 Y
+    if tls_present_real; then printf '    udp: true\n'
+    else printf '    skip-cert-verify: true\n    udp: true\n'; fi
   fi
   if (( ANYTLS_ENABLED )); then
+    local at_host at_sni
+    at_host=$(tls_link_host)
+    at_sni=$(tls_link_sni)
     cat <<Y
   - name: "${NODE_NAME}-AnyTLS"
     type: anytls
-    server: ${addr}
+    server: ${at_host}
     port: $(pub_anytls_port)
     password: "${ANYTLS_PASS}"
-    sni: ${SNI}
+    sni: ${at_sni}
     client-fingerprint: chrome
-    skip-cert-verify: true
-    udp: true
 Y
+    if tls_present_real; then printf '    udp: true\n'
+    else printf '    skip-cert-verify: true\n    udp: true\n'; fi
   fi
 }
 
@@ -3756,7 +4721,8 @@ print_node_links() { # $1=1 屏幕着色并附二维码；$1=0 纯文本
   fi
   if (( HY2_ENABLED )); then
     hp=$(pub_hop)
-    node_link_head "$paint" "Hysteria2" "${NODE_NAME}-Hy2" "$(server_addr)" "$(pub_hy2_port)  UDP${hp:+  跳跃 ${hp}}"
+    node_link_head "$paint" "Hysteria2" "${NODE_NAME}-Hy2" "$(tls_link_host)" "$(pub_hy2_port)  UDP${hp:+  跳跃 ${hp}}"
+    if tls_present_real; then node_link_note "$paint" "证书 ${CERT_DOMAIN}，按正常校验，不要开 insecure"; fi
     qr=$(hy2_link)
     node_link_uri "$qr"
     if [[ -n $hp ]]; then
@@ -3774,16 +4740,18 @@ print_node_links() { # $1=1 屏幕着色并附二维码；$1=0 纯文本
     node_link_end "$paint"
   fi
   if (( TUIC_ENABLED )); then
-    node_link_head "$paint" "TUIC v5" "${NODE_NAME}-TUIC" "$(server_addr)" "$(pub_tuic_port)  UDP"
+    node_link_head "$paint" "TUIC v5" "${NODE_NAME}-TUIC" "$(tls_link_host)" "$(pub_tuic_port)  UDP"
     node_link_note "$paint" "v2rayNG 不能导入，请用 v2rayN / sing-box / mihomo"
+    if tls_present_real; then node_link_note "$paint" "证书 ${CERT_DOMAIN}，按正常校验，不要开 insecure"; fi
     qr=$(tuic_link)
     node_link_uri "$qr"
     (( paint )) && { echo; print_qr "$qr"; }
     node_link_end "$paint"
   fi
   if (( ANYTLS_ENABLED )); then
-    node_link_head "$paint" "AnyTLS" "${NODE_NAME}-AnyTLS" "$(server_addr)" "$(pub_anytls_port)  TCP"
+    node_link_head "$paint" "AnyTLS" "${NODE_NAME}-AnyTLS" "$(tls_link_host)" "$(pub_anytls_port)  TCP"
     node_link_note "$paint" "v2rayNG 不能导入，请用 v2rayN / sing-box / mihomo"
+    if tls_present_real; then node_link_note "$paint" "证书 ${CERT_DOMAIN}，按正常校验，不要开 insecure"; fi
     qr=$(anytls_link)
     node_link_uri "$qr"
     (( paint )) && { echo; print_qr "$qr"; }
@@ -3809,6 +4777,7 @@ print_node_links() { # $1=1 屏幕着色并附二维码；$1=0 纯文本
       fi
     done <"$USERS_FILE"
   fi
+  print_sub_block "$paint"
 }
 
 build_info() { # 输出完整信息（无颜色），用于保存文件
@@ -3831,6 +4800,7 @@ build_info() { # 输出完整信息（无颜色），用于保存文件
 save_info() {
   if (( LAND_MODE )); then land_build_info >"${INFO_FILE}.tmp"; else build_info >"${INFO_FILE}.tmp"; fi
   chmod 600 "${INFO_FILE}.tmp"; mv -f "${INFO_FILE}.tmp" "$INFO_FILE"
+  if tls_present_real; then cert_write_bodies || warn "订阅文件写入失败。"; fi
 }
 
 show_info() {
@@ -3884,7 +4854,8 @@ default_node_name() {
 # ============================================================
 # XHTTP 采用 Xray 官方「VLESS + XHTTP + REALITY」：与 Vision 共用同一把 Reality 密钥和 SNI，
 # 单独 TCP 端口，不需要自己的域名。mode 固定 stream-one（REALITY 直连；避免客户端 auto 握手失败）。
-# TUIC v5 / AnyTLS 由 sing-box 提供，自签证书（CN = 所选 SNI），不要求自有域名。
+# TUIC v5 / AnyTLS 由 sing-box 提供。默认自签证书（CN = 所选 SNI），不要求自有域名。
+# 申请了公开证书时，这两个协议和 Hysteria2 改用那张证书，链接里的地址和 SNI 换成自有域名。
 # Trojan 走 Xray + REALITY。Shadowsocks 2022 只存在于落地机，这里不加直连入站。
 xray_inbound_needed() {
   (( ${REALITY_ENABLED:-0} || ${XHTTP_ENABLED:-0} || ${TROJAN_ENABLED:-0} )) && return 0
@@ -3905,6 +4876,10 @@ proto_fw_extra() {
   (( TROJAN_ENABLED )) && s+="；TCP ${TROJAN_PORT}（Trojan）"
   (( ANYTLS_ENABLED )) && s+="；TCP ${ANYTLS_PORT}（AnyTLS）"
   (( TUIC_ENABLED )) && s+="；UDP ${TUIC_PORT}（TUIC）"
+  if (( ${CERT_ON:-0} == 1 )); then
+    s+="；TCP 80（证书续期）"
+    s+="；TCP ${SUB_PORT}（订阅 HTTPS）"
+  fi
   printf '%s' "$s"
 }
 ensure_proto_secrets() {
@@ -4183,6 +5158,10 @@ install_singbox() {
 }
 sb_copy_cert() {
   mkdir -p "$HY_DIR" "$SB_DIR"
+  if tls_present_real; then
+    cert_grant_readers
+    return 0
+  fi
   [[ -f $HY_CRT && -f $HY_KEY ]] || gen_hy2_cert
   if ! openssl x509 -noout -subject -in "$HY_CRT" 2>/dev/null | grep -q "CN *= *${SNI}\$"; then gen_hy2_cert; fi
   cp -f "$HY_CRT" "$SB_CRT"
@@ -4197,12 +5176,13 @@ write_singbox_config() {
   [[ -x $SB_BIN ]] || die "未找到 sing-box，无法写入 TUIC / AnyTLS 配置。"
   ensure_proto_secrets
   sb_copy_cert
-  local tmp="${SB_CONF}.tmp"
+  local tmp="${SB_CONF}.tmp" crt=$SB_CRT key=$SB_KEY
+  if tls_present_real; then crt=$CERT_FULLCHAIN; key=$CERT_PRIVKEY; fi
   jq -n \
     --argjson tuic "${TUIC_ENABLED:-0}" --argjson any "${ANYTLS_ENABLED:-0}" \
     --argjson tport "${TUIC_PORT:-0}" --argjson aport "${ANYTLS_PORT:-0}" \
     --arg uuid "$UUID" --arg tpw "$TUIC_PASS" --arg apw "$ANYTLS_PASS" \
-    --arg crt "$SB_CRT" --arg key "$SB_KEY" --argjson nets "$PRIV_NETS_JSON" '
+    --arg crt "$crt" --arg key "$key" --argjson nets "$PRIV_NETS_JSON" '
     {
       log: {level: "warn"},
       inbounds: (
@@ -4826,12 +5806,18 @@ resolve_mode() {
 
 do_install() {
   load_state
+  if cert_cli_requested && { [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; }; then
+    die "落地机只运行 Shadowsocks 2022，不能申请证书，也不提供订阅。"
+  fi
   # 落地机：--land，或已安装为落地机且未指定 --no-land
   if [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; then do_install_land; return; fi
   local was_land=$LAND_MODE
   LAND_MODE=0
   preflight      # decide_nat_mode：命令行 / 菜单设置 / Alpine / 已安装 / 自动检测，端口设置前确定 NAT_MODE
   resolve_mode
+  if (( NAT_MODE )) && cert_cli_requested; then
+    die "NAT 模式不能申请证书：Let's Encrypt 的 HTTP-01 需要公网 80 端口能访问到本机，NAT 小鸡通常没有这条映射。请去掉 --cert-domain。不带该参数时，安装方式与现在相同。"
+  fi
   take_lock
     if (( was_land )); then
     info "由落地机改装为 Reality / XHTTP / Hysteria2 节点：移除落地机白名单规则，停止 Shadowsocks，重新生成节点配置。"
@@ -4930,26 +5916,30 @@ do_install() {
     svc_disable_stop xray
   fi
 
-  if (( HY2_ENABLED )); then
-    install_hysteria
-    write_hy2_config
-    save_state
-    restart_hy2
+  if (( HY2_ENABLED )); then install_hysteria
   elif [[ -x $HY_BIN || -f $HY_UNIT || -f $HY_RC ]]; then
     info "已关闭 Hysteria2，移除相关组件 ..."
     remove_hysteria
   fi
-  if sb_needed; then
-    install_singbox
-    write_singbox_config
-    save_state
-    restart_singbox
+  if sb_needed; then install_singbox
   elif [[ -x $SB_BIN || -f $SB_UNIT || -f $SB_RC ]]; then
     info "已关闭 TUIC / AnyTLS，停止 sing-box（密码保留）。"
     svc_disable_stop sing-box
   fi
+  setup_cert
+  if (( HY2_ENABLED )); then
+    write_hy2_config
+    save_state
+    restart_hy2
+  fi
+  if sb_needed; then
+    write_singbox_config
+    save_state
+    restart_singbox
+  fi
 
   apply_firewall
+  if tls_present_real; then cert_start_sub; fi
   (( NAT_MODE )) || setup_fail2ban
   INSTALLED=1
   save_state
@@ -5773,7 +6763,11 @@ menu_change_sni() {
   mldsa_decide
   apply_all
   ( trap - ERR; set +e; reality_selftest ) || true
-  ok "SNI 已由 ${old} 更换为 ${SNI}。客户端需要更新链接（Hysteria2 证书指纹也已变化）。"
+  if tls_present_real; then
+    ok "SNI 已由 ${old} 更换为 ${SNI}。REALITY / XHTTP / Trojan 需要更新链接。Hysteria2 / TUIC / AnyTLS 仍使用 ${CERT_DOMAIN} 的证书。"
+  else
+    ok "SNI 已由 ${old} 更换为 ${SNI}。客户端需要更新链接（Hysteria2 证书指纹也已变化）。"
+  fi
   show_info
 }
 
@@ -5788,7 +6782,7 @@ menu_regen_keys() {
   TROJAN_PASS=$(rand_pass)
   TUIC_PASS=$(rand_pass)
   ANYTLS_PASS=$(rand_pass)
-  if (( HY2_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )); then gen_hy2_cert; fi
+  if (( HY2_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )) && ! tls_present_real; then gen_hy2_cert; fi
   apply_all
   ok "已重新生成全部密钥。"
   show_info
@@ -5939,6 +6933,7 @@ menu_status() {
   local s svcs="xray hysteria-server sing-box proxy-oneclick-fw fail2ban"
   if (( NAT_MODE )); then svcs="xray hysteria-server sing-box"; [[ -n $HOP_RANGE ]] && svcs+=" proxy-oneclick-hop"; fi
   if (( LAND_MODE )); then svcs="xray"; [[ -f $LAND_FW_UNIT || -f $LAND_FW_RC ]] && svcs+=" proxy-oneclick-land-fw"; fi
+  (( ${CERT_ON:-0} == 1 )) && svcs+=" proxy-oneclick-sub"
   for s in $svcs; do
     local st; st=$(svc_state "$s")
     [[ -z $st ]] && st="unknown"
@@ -5973,6 +6968,11 @@ menu_status() {
   elif [[ -f $SYSCTL_FILE ]]; then printf '  网络调优:       v1.1.x 默认（BBR + fq）\n'
   else printf '  网络调优:       未应用（proxy tune）\n'; fi
   printf '  时间同步:       %s\n' "$(time_sync_status)"
+  if (( ${CERT_ON:-0} == 1 )) || svc_exists proxy-oneclick-sub; then
+    printf '  证书:           %s  到期 %s\n' "${CERT_DOMAIN:-未设置}" "$(cert_expiry_text)"
+    if svc_active proxy-oneclick-sub; then printf '  订阅 HTTPS:     运行中（TCP %s，明文 HTTP 不提供）\n' "$SUB_PORT"
+    else printf '  订阅 HTTPS:     未运行（TCP %s）\n' "$SUB_PORT"; fi
+  fi
   echo; _cyan "  监听端口："
   local lx lh
   lx=$(ss -Htlnp 2>/dev/null | awk '/xray/{print "   TCP "$4"  xray"}') || true
@@ -6160,6 +7160,7 @@ do_uninstall() {
   ok "Xray 已移除"
   remove_hysteria purge; ok "Hysteria2 已移除"
   remove_singbox; ok "sing-box 已移除"
+  cert_remove_files
   remove_nat_hop
   remove_firewall; land_fw_remove; ok "防火墙 / 端口跳跃 / 落地机白名单规则已移除"
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; ok "fail2ban 规则已移除（fail2ban 软件包保留）"; fi
@@ -6304,7 +7305,8 @@ show_menu() {
     "安装为落地机（Shadowsocks 2022 出口，给其它中转机用）" \
     "卸载" \
     "切换 NAT 模式（当前: $(nat_pref_text)）" \
-    "协议开关"
+    "协议开关" \
+    "申请证书"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -6324,6 +7326,7 @@ show_menu() {
     14) act=do_uninstall ;;
     15) act=menu_nat_pref ;;
     16) act=menu_proto ;;
+    17) act=menu_cert ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -6415,6 +7418,12 @@ usage() {
   --anytls-port <端口> AnyTLS TCP 端口（默认 8445）
   --hop <a-b|none>    Hysteria2 端口跳跃范围（默认 20000-50000，none 关闭）
   --name <名称>       节点名称（默认 国家-城市）
+  --cert-domain <域名>  可选：为已解析到本机的自有域名申请 Let's Encrypt 证书
+                      订阅只走 HTTPS；Hysteria2 / TUIC / AnyTLS 改用该证书和域名
+                      REALITY 仍借用伪装站点，不使用这张证书。NAT 模式不可用
+  --cert-email <邮箱> 可选，登记给 Let's Encrypt；不填则不登记邮箱
+  --sub-port <端口>   订阅 HTTPS 端口（默认 8447，不能是 80，也不能占用 REALITY）
+  --no-cert           关闭已申请的证书，Hysteria2 / TUIC / AnyTLS 改回自签
   --no-firewall       不配置 nftables 防火墙
   --no-upgrade        跳过系统软件包升级
   --no-tune           跳过 sysctl 网络调优
@@ -6471,6 +7480,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
 管理命令:
   proxy               打开交互菜单
   proxy info          查看链接 / 二维码 / mihomo 配置
+  proxy cert          申请 / 续期 / 关闭公开证书（订阅 HTTPS）
   proxy proto         单独打开或关闭协议（不删除已有密钥）
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
@@ -6523,6 +7533,31 @@ parse_args() {
       --hop) [[ ${2-} == none ]] || is_range "${2-}" || valid_segs "${2-}" || die "--hop 参数无效（例如 20000-50000 或 none）"; OPT_HOP=$2; shift ;;
       --no-hop) OPT_HOP=none ;;
       --name) [[ -n ${2-} ]] || die "--name 需要参数"; OPT_NAME=$(tr -cd 'A-Za-z0-9_.-' <<<"$2"); shift ;;
+      --cert-domain)
+        [[ -n ${2-} ]] || die "--cert-domain 需要域名"
+        OPT_CERT_DOMAIN=${2,,}; OPT_CERT_DOMAIN=${OPT_CERT_DOMAIN%.}
+        cert_domain_syntax "$OPT_CERT_DOMAIN" || die "--cert-domain 不是可用的域名: $2（不能是 IP）"
+        OPT_CERT=1; shift ;;
+      --cert-domain=*)
+        OPT_CERT_DOMAIN=${1#*=}; OPT_CERT_DOMAIN=${OPT_CERT_DOMAIN,,}; OPT_CERT_DOMAIN=${OPT_CERT_DOMAIN%.}
+        cert_domain_syntax "$OPT_CERT_DOMAIN" || die "--cert-domain 不是可用的域名: ${OPT_CERT_DOMAIN}（不能是 IP）"
+        OPT_CERT=1 ;;
+      --cert-email)
+        [[ -n ${2-} ]] || die "--cert-email 需要邮箱"
+        cert_email_syntax "$2" || die "--cert-email 格式无效: $2"
+        OPT_CERT_EMAIL=$2; shift ;;
+      --cert-email=*)
+        cert_email_syntax "${1#*=}" || die "--cert-email 格式无效: ${1#*=}"
+        OPT_CERT_EMAIL=${1#*=} ;;
+      --sub-port)
+        is_port "${2-}" || die "--sub-port 参数无效"
+        [[ $2 == 80 ]] && die "--sub-port 不能是 80（80 只用于证书申请的 HTTP-01）"
+        OPT_SUB_PORT=$2; shift ;;
+      --sub-port=*)
+        OPT_SUB_PORT=${1#*=}; is_port "$OPT_SUB_PORT" || die "--sub-port 参数无效"
+        [[ $OPT_SUB_PORT == 80 ]] && die "--sub-port 不能是 80（80 只用于证书申请的 HTTP-01）" ;;
+      --cert) OPT_CERT=1 ;;
+      --no-cert) OPT_CERT=0 ;;
       --no-firewall) OPT_FIREWALL=0 ;;
       --no-upgrade) OPT_UPGRADE=0 ;;
       --no-tune) OPT_TUNE=0 ;;
@@ -6588,15 +7623,17 @@ parse_args() {
       speed) OPT_ACTION=speed ;;
       firewall|fw) OPT_ACTION=firewall ;;
       nat) OPT_ACTION=nat ;;
+      cert|acme) OPT_ACTION=cert ;;
       uninstall|remove) OPT_ACTION=uninstall ;;
       *) usage; die "未知参数: $1" ;;
     esac
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_CERT_DOMAIN || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
+  [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert
   # 只给了 --land-allow：修改落地机白名单
   [[ -z $OPT_ACTION && -n $OPT_LAND_ALLOW ]] && OPT_ACTION=allow
   # 只给了调优参数（或单独的 --tune）：执行独立调优
@@ -6651,6 +7688,7 @@ main() {
     speed) menu_speed ;;
     firewall) menu_firewall ;;
     nat) menu_nat ;;
+    cert) do_cert ;;
     tune) do_tune ;;
     land) do_land_cli ;;
     allow) land_menu_allow ;;
