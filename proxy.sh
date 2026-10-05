@@ -9440,20 +9440,43 @@ route_china_classify() { # 运营商 以及 ASN / IP 混排
     *) printf 'unknown' ;;
   esac
 }
-route_china_prefer() { # 候选档 是否到达 往返 当前档 是否到达 往返。输出 1 表示候选应替换当前
-  local cand=$1 cur=$4 cp bp
-  cp=$(route_china_line_points "$cand")
-  bp=$(route_china_line_points "$cur")
-  [[ $cand == unknown || -z $cand ]] && cp=0
-  [[ $cur == unknown || -z $cur ]] && bp=0
-  # 未能识别不参与比档。已经认出的档次里，取更低的一档。
-  if (( bp == 0 && cp > 0 )); then printf 1; return 0; fi
-  if (( cp == 0 || cp > bp )); then printf 0; return 0; fi
-  if (( cp < bp )); then printf 1; return 0; fi
-  local cr=${2:-0} ct=${3:-} br=${5:-0} bt=${6:-}
+route_china_majority() { # 档次... 得票最多的一档；票数相同取更低的一档。未能识别不投票
+  local -A votes=()
+  local c n best="" best_n=0 known x
+  local -a order=(163 4837 cmnet ctg_163 cn2_gt cn2_unknown cug cmi ctg_cn2 gia cuii cmin2)
+  for c in "$@"; do
+    [[ -z $c || $c == unknown ]] && continue
+    votes[$c]=$(( ${votes[$c]:-0} + 1 ))
+  done
+  for c in "${order[@]}"; do
+    n=${votes[$c]:-0}
+    if (( n == 0 )); then continue; fi
+    if (( best_n == 0 || n > best_n )); then
+      best=$c
+      best_n=$n
+    fi
+  done
+  for c in "${!votes[@]}"; do
+    known=0
+    for x in "${order[@]}"; do
+      [[ $x == "$c" ]] && known=1
+    done
+    if (( known )); then continue; fi
+    n=${votes[$c]:-0}
+    if [[ -z $best ]] || (( n > best_n )); then
+      best=$c
+      best_n=$n
+    fi
+  done
+  if [[ -z $best ]]; then printf unknown; else printf '%s' "$best"; fi
+  return 0
+}
+route_china_same_better() { # 候选到达 候选往返 当前到达 当前往返。同一档里先要到达，再要有往返
+  local cr=${1:-0} ct=${2:-} br=${3:-0} bt=${4:-}
   [[ $cr =~ ^[0-9]+$ ]] || cr=0
   [[ $br =~ ^[0-9]+$ ]] || br=0
   if (( cr && ! br )); then printf 1; return 0; fi
+  if (( ! cr && br )); then printf 0; return 0; fi
   if [[ $ct =~ ^[0-9]+$ && ! $bt =~ ^[0-9]+$ ]]; then printf 1; return 0; fi
   printf 0
   return 0
@@ -9477,7 +9500,7 @@ route_china_telecom_notes() { # 采用的档次；第二参是多行「标签|�
     printf '电信各探测目标：%s。\n' "$names"
   fi
   if ((${#seen_cls[@]} > 1)); then
-    printf '电信这几个探测目标档次不一致。计分采用其中最低的一档，避免把普通 163 标成 GIA 或 GT。\n'
+    printf '电信这几个探测目标档次不一致。计分采用出现次数最多的一档；次数相同则采用更低的一档。\n'
   fi
   if [[ $best == 163 ]]; then
     printf '探测到 163，与常见业务路径可能不同。\n'
@@ -10856,7 +10879,7 @@ route_china_explain() {
 route_section_china() {
   local fam=$1
   printf '\n%s【回国回程】%s\n' "$C_BOLD" "$C_NONE"
-  printf '三家分开测，再取平均。某一家地址都测不通时记 0，并且算进平均。线路档次最多 60、延迟最多 25、丢包最多 15。延迟或丢包没测到时不按 0 分，只按测到的项目折算到 100，并写成未测。到北京的理论下限不到 40 毫秒时，延迟改按绝对毫秒分档，近距离的几十毫秒不再被比例压得很低。只有星号、解析不出自治系统的探测按测不通，不写成未能识别。电信 IPv4 会多测几个目标，包括挂在 CN2（AS4809）上的地址，不只看递归 DNS。每个目标的档次都会写出来；档次不一致时计分用看到的最低档，避免把普通 163 标成 GIA 或 GT。回程探测目标可能与业务流量路径不同。\n'
+  printf '三家分开测，再取平均。某一家地址都测不通时记 0，并且算进平均。线路档次最多 60、延迟最多 25、丢包最多 15。延迟或丢包没测到时不按 0 分，只按测到的项目折算到 100，并写成未测。到北京的理论下限不到 40 毫秒时，延迟改按绝对毫秒分档，近距离的几十毫秒不再被比例压得很低。只有星号、解析不出自治系统的探测按测不通，不写成未能识别。电信 IPv4 会多测几个目标，包括挂在 CN2（AS4809）上的地址，不只看递归 DNS。每个目标的档次都会写出来。档次不一致时按出现次数最多的一档计分，次数相同则用更低的一档。回程探测目标可能与业务流量路径不同。\n'
   local tool
   tool=$(route_trace_bin)
   if [[ $tool == none ]]; then
@@ -10872,6 +10895,8 @@ route_section_china() {
     local best_rank=-1 best_class=unknown best_ip="" best_label="" best_rtt=-1 best_loss=-1
     local best_hops="" best_path="" best_stars=0 best_mtr=0 best_ping=0 best_n=0
     local best_reached=0 tried=0 got=0 cap=3 ct_seen=""
+    local -a ct_class=() ct_label=() ct_ip=() ct_reached=() ct_rtt=() ct_loss=()
+    local -a ct_hops=() ct_path=() ct_stars=() ct_mtr=() ct_ping=() ct_hopn=()
     [[ $carrier == telecom ]] && cap=6
     while read -r ip lat lon label; do
       [[ -n $ip ]] || continue
@@ -10896,27 +10921,61 @@ route_section_china() {
       [[ $class != unknown ]] && rank=$((rank + 2))
       (( ROUTE_REACHED )) && rank=$((rank + 1))
       if [[ $carrier == telecom ]]; then
-        if [[ -z $best_ip ]]; then
-          take=1
-        elif [[ $(route_china_prefer "$class" "$ROUTE_REACHED" "$ROUTE_RTT" "$best_class" "$best_reached" "$best_rtt") == 1 ]]; then
-          take=1
-        fi
-      elif (( rank > best_rank )); then
-        take=1
-      fi
-      if (( take )); then
-        best_rank=$rank best_class=$class best_ip=$ip best_label=$label
-        best_rtt=$ROUTE_RTT best_loss=$ROUTE_LOSS best_reached=$ROUTE_REACHED
-        best_hops=$ROUTE_HOP_IPS best_path=$ROUTE_PATH_ASNS
-        best_stars=$ROUTE_STAR_HOPS best_mtr=$ROUTE_MTR best_ping=$ROUTE_PING best_n=$ROUTE_HOP_N
-        got=1
-      fi
-      if [[ $carrier == telecom ]]; then
+        ct_class+=("$class")
+        ct_label+=("$label")
+        ct_ip+=("$ip")
+        ct_reached+=("${ROUTE_REACHED:-0}")
+        ct_rtt+=("$ROUTE_RTT")
+        ct_loss+=("$ROUTE_LOSS")
+        ct_hops+=("$ROUTE_HOP_IPS")
+        ct_path+=("$ROUTE_PATH_ASNS")
+        ct_stars+=("$ROUTE_STAR_HOPS")
+        ct_mtr+=("$ROUTE_MTR")
+        ct_ping+=("$ROUTE_PING")
+        ct_hopn+=("$ROUTE_HOP_N")
         ct_seen+="${label}|$(route_china_class_label "$class")"$'\n'
+        got=1
       else
+        if (( rank > best_rank )); then take=1; fi
+        if (( take )); then
+          best_rank=$rank best_class=$class best_ip=$ip best_label=$label
+          best_rtt=$ROUTE_RTT best_loss=$ROUTE_LOSS best_reached=$ROUTE_REACHED
+          best_hops=$ROUTE_HOP_IPS best_path=$ROUTE_PATH_ASNS
+          best_stars=$ROUTE_STAR_HOPS best_mtr=$ROUTE_MTR best_ping=$ROUTE_PING best_n=$ROUTE_HOP_N
+          got=1
+        fi
         (( rank >= 3 )) && break
       fi
     done < <(route_china_targets "$fam" "$carrier")
+    if [[ $carrier == telecom && ${#ct_class[@]} -gt 0 ]]; then
+      local win="" i best_i=-1
+      win=$(route_china_majority "${ct_class[@]}")
+      for i in "${!ct_class[@]}"; do
+        [[ ${ct_class[i]} == "$win" ]] || continue
+        if (( best_i < 0 )); then
+          best_i=$i
+          continue
+        fi
+        if [[ $(route_china_same_better "${ct_reached[i]}" "${ct_rtt[i]}" "${ct_reached[best_i]}" "${ct_rtt[best_i]}") == 1 ]]; then
+          best_i=$i
+        fi
+      done
+      if (( best_i >= 0 )); then
+        best_class=${ct_class[best_i]}
+        best_label=${ct_label[best_i]}
+        best_ip=${ct_ip[best_i]}
+        best_reached=${ct_reached[best_i]}
+        best_rtt=${ct_rtt[best_i]}
+        best_loss=${ct_loss[best_i]}
+        best_hops=${ct_hops[best_i]}
+        best_path=${ct_path[best_i]}
+        best_stars=${ct_stars[best_i]}
+        best_mtr=${ct_mtr[best_i]}
+        best_ping=${ct_ping[best_i]}
+        best_n=${ct_hopn[best_i]}
+        got=1
+      fi
+    fi
     if (( ! got )); then
       printf '%s：这些地址都测不通。这一项记 0，并算进平均。这只说明准备的测试地址没有回答，不能单独证明整张运营商网络都不通。\n' "$zh"
       score=0
@@ -10928,6 +10987,7 @@ route_section_china() {
     [[ $best_rtt =~ ^[0-9]+$ ]] && responded_lat=$((responded_lat + 1))
     ROUTE_HOP_IPS=$best_hops ROUTE_PATH_ASNS=$best_path ROUTE_STAR_HOPS=$best_stars
     ROUTE_MTR=$best_mtr ROUTE_PING=$best_ping ROUTE_HOP_N=$best_n ROUTE_RTT=$best_rtt ROUTE_LOSS=$best_loss
+    ROUTE_REACHED=$best_reached
     route_china_explain "$carrier" "$best_class" "$best_label" "$best_ip" "$best_rtt" "$best_loss"
     if [[ $carrier == telecom ]]; then
       route_china_telecom_notes "$best_class" "$ct_seen"
@@ -11224,7 +11284,7 @@ route_print_limits() {
 traceroute 和 mtr 看到的中间跳，很多路由器不回应探测，星号不等于丢包。TCP/8080 打到运营商 DNS 常常没有往返，这时会改用 ICMP traceroute、ICMP mtr 或 ping。延迟或丢包没测到就写成未测，不按 0 分打进档次。去程和回程可以走不同的运营商。
 若报告里延迟仍是未测，在这台 VPS 上先确认 ping 能通，再跑一次 proxy route。
 Telegram 数据中心是任播，落点不一定是写在上面的那个城市，时延下限会因此偏。东京 WIDE、香港 HGC、弗里蒙特 HE、阿姆斯特丹 Leaseweb 用来减少「全是任播」的情况，但这些地址本身也会变。东京 WIDE 换过仍会回应探测的地址。阿姆斯特丹不再用已经不回应的 RIPE 地址。
-电信 IPv4 同时探测挂在 CN2（AS4809）上的河南、福建、江苏地址，以及广东电信 DNS。递归 DNS 经常被送进 163，不能单靠它判断有没有 CN2 GIA。每个目标的档次都会写出来；同一家取看到的最低档，避免把普通 163 标成 GIA 或 GT。GIA 仍要求路径里有 AS4809 和 59.43，且没有 202.97、也没有 AS4134。59.43 和 202.97 同时出现是 CN2 GT，只有 202.97 是 163。回程探测目标可能与业务流量路径不同。联通用天津、广东、湖南，不再使用已经不回应的北京联通 DNS。移动用北京附近和骨干地址。IPv6 每家目前只放了一个运营商网段里的地址。单个地址没回应就换下一个，不写进报告；某一家全部测不通时该项记 0，并写明测不通。只有星号、解析不出自治系统时也按测不通，不写成未能识别。
+电信 IPv4 同时探测挂在 CN2（AS4809）上的河南、福建、江苏地址，以及广东电信 DNS。递归 DNS 经常被送进 163，不能单靠它判断有没有 CN2 GIA。每个目标的档次都会写出来。同一家按出现次数最多的一档计分，次数相同则用更低的一档。GIA 仍要求路径里有 AS4809 和 59.43，且没有 202.97、也没有 AS4134。59.43 和 202.97 同时出现是 CN2 GT，只有 202.97 是 163。回程探测目标可能与业务流量路径不同。联通用天津、广东、湖南，不再使用已经不回应的北京联通 DNS。移动用北京附近和骨干地址。IPv6 每家目前只放了一个运营商网段里的地址。单个地址没回应就换下一个，不写进报告；某一家全部测不通时该项记 0，并写明测不通。只有星号、解析不出自治系统时也按测不通，不写成未能识别。
 到北京的理论下限不到 40 毫秒时，回国延迟按绝对毫秒分档。绕路按往返超过下限两倍、且多出不少于 30 毫秒判断；不要求路径上一定出现另一洲的骨干。直连要求中间没有别的运营商。国际线路的路径上游只取紧挨本机的下一跳，不含中国回程运营商和目标 ASN。PeeringDB 查询失败时国际线路无法打分，不会一直卡住。
 省网 ASN（例如电信 4812、联通 4808、移动 56048）在没有更高档次的骨干 ASN 时，按该运营商的普通档计，不升到 CN2、9929 或 CMIN2。AS0、私有 ASN 不计入路径跳数。
 IPv4 和 IPv6 是两份报告。没有公网 IPv6 时不为 IPv6 编分数。Hurricane Electric 和 Cogent 的 IPv6 长期不互联，只在 IPv6 上游里两家都出现时才会单独提醒。
