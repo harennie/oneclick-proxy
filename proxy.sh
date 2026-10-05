@@ -2467,6 +2467,8 @@ install_xray() {
     fi
   fi
   [[ -x $XRAY_BIN ]] || die "未找到 ${XRAY_BIN}，Xray 安装可能失败。"
+  # 官方脚本会沿用已有 User=（常见为 xray）。配置是 root:nobody 组 640，必须在启动前改成 nobody。
+  ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
   ok "Xray 已安装: $("$XRAY_BIN" version | awk 'NR==1{print $2}')"
 }
 
@@ -2973,6 +2975,63 @@ singbox_apply_ip_strategy() { # $1 临时配置。TUIC / AnyTLS 走 sing-box 的
 
 # NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
 PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
+
+# 配置只给服务进程读：root 拥有，该用户主组 640。
+own_svc_config() { # $1 文件 $2 运行用户
+  local f=$1 user=$2 grp=root
+  if id "$user" >/dev/null 2>&1; then
+    grp=$(id -gn "$user")
+  elif [[ $user == nobody ]]; then
+    grp=nogroup
+  fi
+  chown "root:${grp}" "$f" || die "无法设置 ${f} 的属主，${user} 将读不到配置。"
+  chmod 640 "$f" || die "无法设置 ${f} 的权限。"
+}
+xray_unit_user() { # $1 unit。没有 User= 时按 nobody（与自建服务一致）。
+  local unit=${1:-$XRAY_UNIT} u=""
+  [[ -f $unit ]] || { printf '%s' nobody; return 0; }
+  u=$(sed -n -E 's/^[[:space:]]*User[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' "$unit" | tail -n 1)
+  [[ -n $u ]] || u=nobody
+  printf '%s' "$u"
+}
+# 普通模式官方 xray.service 会留下或沿用 User=xray。配置若仍是 nobody 组，xray 读不到。
+# 成功时运行用户为 nobody（返回 0）。系统没有 nobody 时不改 unit，返回 1，调用方按实际 User= 授权。
+ensure_xray_runs_as_nobody() { # 可选 $1 unit $2 drop-in
+  direct_mode && return 0
+  is_openrc && return 0
+  local unit=${1:-$XRAY_UNIT}
+  local drop=${2:-/etc/systemd/system/xray.service.d/zz-proxy-oneclick-user.conf}
+  [[ -f $unit ]] || return 0
+  id nobody >/dev/null 2>&1 || return 1
+  local grp changed=0 want have=""
+  grp=$(id -gn nobody)
+  mkdir -p "$(dirname "$drop")" || die "无法创建 Xray 服务目录：$(dirname "$drop")"
+  want="# 由 proxy-oneclick 生成：配置为 root:${grp} 640，进程必须是 nobody
+[Service]
+User=nobody
+Group=${grp}"
+  [[ -f $drop ]] && have=$(<"$drop")
+  if [[ $have != "$want" ]]; then
+    printf '%s\n' "$want" >"$drop" || die "无法写入 Xray 服务用户覆盖：${drop}"
+    changed=1
+  fi
+  if grep -qE '^[[:space:]]*User[[:space:]]*=' "$unit" && ! grep -qE '^[[:space:]]*User[[:space:]]*=[[:space:]]*nobody[[:space:]]*$' "$unit"; then
+    sed -i -E 's/^[[:space:]]*User[[:space:]]*=.*/User=nobody/' "$unit" || die "无法把 Xray 服务用户改为 nobody。"
+    changed=1
+  fi
+  if grep -qE '^[[:space:]]*Group[[:space:]]*=' "$unit"; then
+    local gcur
+    gcur=$(sed -n -E 's/^[[:space:]]*Group[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' "$unit" | tail -n 1)
+    if [[ $gcur != "$grp" ]]; then
+      sed -i -E "s/^[[:space:]]*Group[[:space:]]*=.*/Group=${grp}/" "$unit" || die "无法把 Xray 服务组改为 ${grp}。"
+      changed=1
+    fi
+  fi
+  if (( changed )) && [[ $unit == "$XRAY_UNIT" ]] && have systemctl && [[ -d /run/systemd/system ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  return 0
+}
 write_xray_config() {
   local clients tmp seed="" cplain tclients
   clients=$(xray_clients_json)
@@ -3055,9 +3114,13 @@ write_xray_config() {
     die "Xray 配置校验失败（xray run -test），未应用新配置。"
   fi
   rm -f "${tmp}.log"
-  # xray 以 nobody 运行：root 所有、nobody 组可读
-  local grp; grp=$(id -gn nobody 2>/dev/null || echo nogroup)
-  chown "root:${grp}" "$tmp"; chmod 640 "$tmp"
+  # 普通模式先把官方 unit 固定为 nobody，再按实际运行用户授权（NAT / 落地机 / Alpine 的 unit 已是 nobody）。
+  local xu=nobody
+  if ! ensure_xray_runs_as_nobody "$XRAY_UNIT"; then
+    xu=$(xray_unit_user "$XRAY_UNIT")
+    warn "系统没有 nobody 用户，已按 Xray 服务用户 ${xu} 设置配置权限。"
+  fi
+  own_svc_config "$tmp" "$xu"
   if [[ -f $XRAY_CONF ]]; then mkdir -p "$BACKUP_DIR"; cp -a "$XRAY_CONF" "${BACKUP_DIR}/xray-config.json.bak" 2>/dev/null || true; fi
   mv -f "$tmp" "$XRAY_CONF"
   selinux_fix "$(dirname "$XRAY_CONF")"
@@ -7180,6 +7243,7 @@ write_singbox_config() {
   sb_copy_cert
   local tmp="${SB_CONF}.tmp" crt=$SB_CRT key=$SB_KEY
   if tls_present_real; then crt=$CERT_FULLCHAIN; key=$CERT_PRIVKEY; fi
+  # sing-box 1.11 起不写 listen 时默认只绑 127.0.0.1。文档中的双栈地址是 "::"。
   jq -n \
     --argjson tuic "${TUIC_ENABLED:-0}" --argjson any "${ANYTLS_ENABLED:-0}" \
     --argjson tport "${TUIC_PORT:-0}" --argjson aport "${ANYTLS_PORT:-0}" \
@@ -7190,13 +7254,13 @@ write_singbox_config() {
       inbounds: (
         []
         + (if $tuic == 1 then [{
-            type: "tuic", tag: "tuic-in", listen_port: $tport,
+            type: "tuic", tag: "tuic-in", listen: "::", listen_port: $tport,
             users: [{name: "main", uuid: $uuid, password: $tpw}],
             congestion_control: "bbr", zero_rtt_handshake: false,
             tls: {enabled: true, certificate_path: $crt, key_path: $key, alpn: ["h3"]}
           }] else [] end)
         + (if $any == 1 then [{
-            type: "anytls", tag: "anytls-in", listen_port: $aport,
+            type: "anytls", tag: "anytls-in", listen: "::", listen_port: $aport,
             users: [{name: "main", password: $apw}],
             tls: {enabled: true, certificate_path: $crt, key_path: $key}
           }] else [] end)
@@ -7220,7 +7284,9 @@ write_singbox_config() {
     die "sing-box 配置校验失败，未应用新配置。"
   fi
   rm -f "${tmp}.log"
-  chmod 640 "$tmp"
+  local sb_user=root
+  id sing-box >/dev/null 2>&1 && sb_user=sing-box
+  own_svc_config "$tmp" "$sb_user"
   mv -f "$tmp" "$SB_CONF"
   selinux_fix "$SB_DIR"
   ok "sing-box 配置已生成: ${SB_CONF}"
