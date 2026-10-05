@@ -3341,7 +3341,8 @@ UNIT
   nft delete table ip "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
   nft delete table ip6 "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
   systemctl restart proxy-oneclick-fw || { nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true; die "加载防火墙规则失败，已回滚。"; }
-  ok "nftables 规则已加载（入站默认拒绝）。已放行 SSH 端口: ${SSH_PORTS}；TCP ${XRAY_PORT}${EXTRA_TCP:+ $EXTRA_TCP}$( ((HY2_ENABLED)) && echo "；UDP ${HY2_PORT}${HOP_RANGE:+ + ${HOP_RANGE}}")${EXTRA_UDP:+；UDP $EXTRA_UDP}$(proto_fw_extra)"
+  ok "nftables 规则已加载（入站默认拒绝）。"
+  fw_print_allows
 }
 
 remove_firewall() {
@@ -3539,6 +3540,75 @@ ask_extra_ports() {
   fi
 }
 
+# 只打印，不改规则。端口和 render_firewall 用同一套开关。
+FW_ALLOW_SEEN=""
+fw_allow_seen() { [[ " ${FW_ALLOW_SEEN} " == *" ${1,,}/$2 "* ]]; }
+fw_allow_row() { # $1 协议名 $2 tcp|udp $3 端口或范围
+  local name=$1 fam=$2 port=$3
+  [[ -n $port && $port != 0 ]] || return 0
+  FW_ALLOW_SEEN+=" ${fam,,}/${port}"
+  printf '  %s  %s  %s\n' "$(ui_pad "$name" 22)" "$(ui_pad "${fam^^}" 4)" "$port"
+}
+fw_print_allows() {
+  local p
+  FW_ALLOW_SEEN=""
+  if (( ${LAND_MODE:-0} )); then
+    echo "本机防火墙：落地机不用这套默认拒绝规则。来源限制见白名单。"
+    return 0
+  fi
+  if (( ${NAT_MODE:-0} )); then
+    echo "本机防火墙：NAT 模式不设置。入站能不能进来，看服务商的端口映射。"
+    return 0
+  fi
+  if (( ${FW_ENABLED:-0} == 1 )); then
+    printf '%s本机防火墙：入站默认拒绝。%s下面没有的端口，新连接会被丢掉。\n' "$C_WARN" "$C_NONE"
+    echo "已建立的连接、本机回环和 ICMP 仍然放行。"
+    if have nft && ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+      echo "表 inet ${NFT_TABLE} 还没加载。下面是按配置应该放行的端口，重载后才生效。"
+    fi
+  else
+    echo "本机防火墙：没有由本脚本接管，也没有做默认拒绝。"
+    echo "下面是各协议要用的端口。系统防火墙和云安全组需要自己放行。"
+  fi
+  echo
+  printf '  %s  %s  %s\n' "$(ui_pad "协议" 22)" "$(ui_pad "类型" 4)" "端口"
+  (( ${REALITY_ENABLED:-0} == 1 )) && fw_allow_row "Reality" tcp "$XRAY_PORT"
+  (( ${XHTTP_ENABLED:-0} == 1 )) && fw_allow_row "XHTTP" tcp "$XHTTP_PORT"
+  (( ${HY2_ENABLED:-0} == 1 )) && fw_allow_row "Hysteria2" udp "$HY2_PORT"
+  (( ${TROJAN_ENABLED:-0} == 1 )) && fw_allow_row "Trojan" tcp "$TROJAN_PORT"
+  (( ${TUIC_ENABLED:-0} == 1 )) && fw_allow_row "TUIC" udp "$TUIC_PORT"
+  (( ${ANYTLS_ENABLED:-0} == 1 )) && fw_allow_row "AnyTLS" tcp "$ANYTLS_PORT"
+  (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && fw_allow_row "CDN XHTTP" tcp "$XHTTP_TLS_PORT"
+  (( ${WS_ENABLED:-0} == 1 )) && fw_allow_row "CDN WebSocket" tcp "$WS_PORT"
+  if cert_is_public; then fw_allow_row "订阅" tcp "${SUB_PORT:-8447}"; fi
+  if cert_http_open; then fw_allow_row "证书申请" tcp 80; fi
+  if [[ -z ${SSH_PORTS// } ]]; then
+    if (( ${FW_ENABLED:-0} == 1 )); then
+      printf '  %s  还没检测到。重载前先检测，避免把登录端口关在外面。\n' "$(ui_pad "SSH" 22)"
+    else
+      printf '  %s  未检测\n' "$(ui_pad "SSH" 22)"
+    fi
+  else
+    for p in $SSH_PORTS; do fw_allow_row "SSH" tcp "$p"; done
+  fi
+  if (( ${HY2_ENABLED:-0} == 1 )) && [[ -n ${HOP_RANGE:-} ]]; then
+    fw_allow_row "Hysteria2 端口跳跃" udp "$HOP_RANGE"
+  fi
+  for p in ${EXTRA_TCP-}; do fw_allow_seen tcp "$p" || fw_allow_row "额外放行" tcp "$p"; done
+  for p in ${EXTRA_UDP-}; do fw_allow_seen udp "$p" || fw_allow_row "额外放行" udp "$p"; done
+  echo
+  if cert_http_open; then echo "证书申请的 TCP 80 只给 HTTP-01 续期，不提供订阅，也不跑代理。"; fi
+  if cert_is_public; then echo "订阅是客户端拉取节点的 HTTPS，不是 Reality。"; fi
+  (( ${XHTTP_TLS_ENABLED:-0} == 1 || ${WS_ENABLED:-0} == 1 )) && echo "CDN 这两行给 Cloudflare 回源，不是 Reality。"
+  if (( ${HY2_ENABLED:-0} == 1 )) && [[ -n ${HOP_RANGE:-} ]]; then
+    echo "端口跳跃的 UDP ${HOP_RANGE} 会转到 Hysteria2 的 UDP ${HY2_PORT}。"
+  fi
+  if (( ${FW_ENABLED:-0} == 1 )); then
+    echo "云安全组要另外放行上面这些端口。脚本改不到云上的防火墙。"
+  fi
+  return 0
+}
+
 cloud_fw_reminder() {
   echo
   hr
@@ -3561,22 +3631,8 @@ cloud_fw_reminder() {
     hr
     return 0
   fi
-  printf '%s请在云服务商安全组放行%s\n' "$C_WARN" "$C_NONE"
-  (( REALITY_ENABLED )) && printf 'TCP   %-7s  VLESS-REALITY\n' "$XRAY_PORT"
-  (( XHTTP_ENABLED )) && printf 'TCP   %-7s  VLESS-XHTTP\n' "$XHTTP_PORT"
-  (( TROJAN_ENABLED )) && printf 'TCP   %-7s  Trojan\n' "$TROJAN_PORT"
-  (( ANYTLS_ENABLED )) && printf 'TCP   %-7s  AnyTLS\n' "$ANYTLS_PORT"
-  (( HY2_ENABLED )) && printf 'UDP   %-7s  Hysteria2%s\n' "$HY2_PORT" "${HOP_RANGE:+  以及 UDP ${HOP_RANGE}}"
-  (( TUIC_ENABLED )) && printf 'UDP   %-7s  TUIC v5\n' "$TUIC_PORT"
-  (( XHTTP_TLS_ENABLED )) && printf 'TCP   %-7s  XHTTP+TLS（CDN 回源，不是 REALITY）\n' "$XHTTP_TLS_PORT"
-  (( WS_ENABLED )) && printf 'TCP   %-7s  WebSocket+TLS（CDN 回源，不是 REALITY）\n' "$WS_PORT"
-  if cert_http_open; then
-    printf 'TCP   %-7s  证书续期（HTTP-01，不提供订阅）\n' 80
-  fi
-  if cert_is_public; then
-    printf 'TCP   %-7s  订阅 HTTPS\n' "$SUB_PORT"
-  fi
-  echo "位置：云控制台安全组。Oracle Cloud 镜像可能还有自带 iptables。"
+  fw_print_allows
+  echo "Oracle Cloud 镜像可能还有自带 iptables。"
   hr
 }
 
@@ -6818,18 +6874,6 @@ proto_xray_brief() {
   [[ -n $s ]] || s="无入站"
   printf '%s' "$s"
 }
-proto_fw_extra() {
-  local s=""
-  (( XHTTP_ENABLED )) && s+="；TCP ${XHTTP_PORT}（XHTTP）"
-  (( TROJAN_ENABLED )) && s+="；TCP ${TROJAN_PORT}（Trojan）"
-  (( ANYTLS_ENABLED )) && s+="；TCP ${ANYTLS_PORT}（AnyTLS）"
-  (( XHTTP_TLS_ENABLED )) && s+="；TCP ${XHTTP_TLS_PORT}（XHTTP+TLS，CDN）"
-  (( WS_ENABLED )) && s+="；TCP ${WS_PORT}（WebSocket+TLS，CDN）"
-  (( TUIC_ENABLED )) && s+="；UDP ${TUIC_PORT}（TUIC）"
-  if cert_http_open; then s+="；TCP 80（证书续期）"; fi
-  if cert_is_public; then s+="；TCP ${SUB_PORT}（订阅 HTTPS）"; fi
-  printf '%s' "$s"
-}
 ensure_proto_secrets() {
   [[ $XHTTP_PATH == /* && $XHTTP_PATH =~ ^/[A-Za-z0-9_-]+$ ]] || XHTTP_PATH="/$(rand_hex 8)"
   [[ -n $TROJAN_PASS ]] || TROJAN_PASS=$(rand_pass)
@@ -8967,7 +9011,10 @@ menu_status() {
     elif svc_active proxy-oneclick-sub; then printf '  订阅 HTTPS:     运行中（TCP %s，明文 HTTP 不提供）\n' "$SUB_PORT"
     else printf '  订阅 HTTPS:     未运行（TCP %s）\n' "$SUB_PORT"; fi
   fi
-  echo; _cyan "  监听端口："
+  echo
+  fw_print_allows
+  echo
+  _cyan "  监听端口："
   local lx lh
   lx=$(ss -Htlnp 2>/dev/null | awk '/xray/{print "   TCP "$4"  xray"}') || true
   lh=$(ss -Hulnp 2>/dev/null | awk '/hysteria/{print "   UDP "$4"  hysteria"}') || true
@@ -8992,7 +9039,7 @@ menu_status() {
   elif (( NAT_MODE )); then
     echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看端口跳跃规则   4) 实时跟踪 Xray 日志   0) 返回"
   else
-    echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看防火墙规则   4) 实时跟踪 Xray 日志   0) 返回"
+    echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看 nftables 原文   4) 实时跟踪 Xray 日志   0) 返回"
   fi
   local c; ask c "请选择" "0"
   case $c in
@@ -9001,6 +9048,7 @@ menu_status() {
     3) if (( NAT_MODE )); then if [[ -n $HOP_RANGE ]]; then show_hop_rules; fi
        elif (( LAND_MODE )); then nft list table inet "$LAND_NFT_TABLE" 2>/dev/null || warn "未启用 nftables 白名单。"
        else
+         echo "下面是 nftables 原文。哪一端口属于哪个协议，看上面的中文列表。"
          nft list table inet "$NFT_TABLE" 2>/dev/null || warn "未找到本脚本的防火墙表。"
          nft list table ip "${NFT_TABLE}_nat" 2>/dev/null || true
        fi ;;
@@ -9114,8 +9162,8 @@ menu_firewall() {
   if (( LAND_MODE )); then land_menu_allow; return; fi
   if (( NAT_MODE )); then warn "NAT 模式不管理防火墙（入站由服务商端口映射控制）。"; menu_nat; return; fi
   echo; hr; _green "  防火墙管理"; hr
-  echo "  当前状态: $( ((FW_ENABLED)) && echo 由本脚本管理 || echo 未启用)   SSH 端口: ${SSH_PORTS:-未检测}"
-  echo "  额外放行: TCP [${EXTRA_TCP}]  UDP [${EXTRA_UDP}]"
+  fw_print_allows
+  hr
   echo "  1) 放行额外 TCP 端口  2) 放行额外 UDP 端口  3) 取消额外放行  4) 重新检测 SSH 端口并重载  5) 停用本脚本防火墙  6) 启用本脚本防火墙  0) 返回"
   local c p; ask c "请选择" "0"
   case $c in
@@ -9523,9 +9571,9 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy user          用户管理
   proxy update        更新组件
   proxy update-script 只更新本脚本
-  proxy status        运行状态 / 日志
+  proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
   proxy speed         测速 / 延迟提示
-  proxy firewall      防火墙管理（NAT 模式为 NAT 信息 / 端口跳跃）
+  proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
   proxy nat           NAT 信息 / 修改映射端口 / 端口跳跃
   proxy tune          网络调优（见上）
   proxy land          落地转发 / 落地机信息（见上）
