@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # proxy.sh —— VLESS + REALITY + Vision、VLESS + XHTTP + REALITY、Hysteria2 一键安装 / 管理脚本
-# 可选（默认不装）：Trojan + REALITY、TUIC v5、AnyTLS。Shadowsocks 2022 仅用于落地机。
+# 可选（默认不装）：Trojan + REALITY、TUIC v5、AnyTLS，以及需要自有域名和公开证书的
+# VLESS + XHTTP + TLS、VLESS + WebSocket + TLS（放在 CDN 后面，不是 REALITY）。Shadowsocks 2022 仅用于落地机。
 #
 # 用法:
 #   bash proxy.sh                 # 交互式菜单
@@ -10,6 +11,12 @@
 #   bash proxy.sh tune            # 网络调优（BBR / 队列算法 / 缓冲区；可单独使用，NAT/容器也可用）
 #   bash proxy.sh --land          # 落地机：只运行 Shadowsocks 2022（给中转机做出口，可设来源 IP 白名单）
 #   proxy land-add 'ss://...'     # 中转机：把出口切换到落地机
+#   bash proxy.sh --cert-domain example.com   # 可选：默认 Let's Encrypt 单域名 HTTP-01
+#   bash proxy.sh --cert-kind wildcard --cert-domain example.com --cf-dns-token <令牌>
+#   bash proxy.sh --cert-kind cf-origin --cf-origin-key <钥匙> --cert-domain cdn.example.com
+#   bash proxy.sh --xhttp-tls --ws-tls --cert-domain example.com
+#                                 # 可选：CDN 上的 XHTTP+TLS / WebSocket+TLS（默认不装，不替换 REALITY）
+#   bash proxy.sh route           # 线路检测：回程 / 国际线路 / 国际互联（不改配置）
 #   bash proxy.sh --help          # 查看全部参数
 # 安装完成后可直接使用命令: proxy
 #
@@ -86,6 +93,40 @@ readonly LAND_FW_FILE="${STATE_DIR}/land-fw.nft"
 readonly LAND_FW_UNIT="/etc/systemd/system/proxy-oneclick-land-fw.service"
 readonly LAND_FW_RC="/etc/init.d/proxy-oneclick-land-fw"
 readonly RESOLV_BAK="${STATE_DIR}/resolv.conf.bak"
+# 可选的公开证书（Let's Encrypt）。不申请时下面的目录不会被创建，节点仍用自签证书。
+readonly CERT_NAME="proxy-oneclick"
+readonly CERT_BASE="/etc/proxy-oneclick"
+readonly CERT_DIR="${CERT_BASE}/certs"
+readonly CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
+readonly CERT_PRIVKEY="${CERT_DIR}/privkey.pem"
+readonly CERT_LIB="/usr/local/lib/proxy-oneclick"
+readonly SUB_PY="${CERT_LIB}/sub_https.py"
+readonly CERT_HOOK="${CERT_LIB}/cert-deploy.sh"
+readonly SUB_CONF="${CERT_DIR}/sub.json"
+readonly SUB_BODY="${CERT_DIR}/sub.txt"
+readonly SUB_CLASH="${CERT_DIR}/sub-clash.yaml"
+readonly SUB_UNIT="/etc/systemd/system/proxy-oneclick-sub.service"
+readonly SUB_RC="/etc/init.d/proxy-oneclick-sub"
+readonly SUB_LOG="/var/log/proxy-oneclick/sub.log"
+readonly CERT_TIMER_UNIT="/etc/systemd/system/proxy-oneclick-cert.timer"
+readonly CERT_RENEW_UNIT="/etc/systemd/system/proxy-oneclick-cert.service"
+readonly CERT_CRON="/etc/periodic/daily/proxy-oneclick-cert"
+readonly CERT_GROUP="proxy-cert"
+readonly SUB_USER="proxy-sub"
+# CDN 上的 XHTTP+TLS / WebSocket+TLS 读这份证书副本（nobody 能读）。REALITY 入站不引用它。
+readonly XRAY_CERT_DIR="/usr/local/etc/xray/certs"
+readonly XRAY_CERT_FULL="${XRAY_CERT_DIR}/fullchain.pem"
+readonly XRAY_CERT_KEY="${XRAY_CERT_DIR}/privkey.pem"
+readonly CDN_FLAG="${CERT_BASE}/cdn-xray"
+# 令牌和 EAB 只放在这些 600 文件里，不写入 state.env。
+readonly CERT_DNS_TOKEN="${CERT_BASE}/cf-dns.token"
+readonly CERT_ZEROSSL_EAB="${CERT_BASE}/zerossl.eab"
+readonly CERT_ORIGIN_KEY="${CERT_BASE}/cf-origin.key"
+readonly CERT_DNS_AUTH="${CERT_LIB}/dns-auth.sh"
+readonly CERT_DNS_CLEAN="${CERT_LIB}/dns-cleanup.sh"
+readonly CERT_TXT_DIR="/var/lib/proxy-oneclick/acme-txt"
+readonly ZEROSSL_SERVER="https://acme.zerossl.com/v2/DV90"
+readonly CF_ORIGIN_API="https://api.cloudflare.com/client/v4/certificates"
 # 公共 DNS64 服务器（nat64.net / Trex），仅在 IPv6-only 且用户同意时写入 /etc/resolv.conf
 readonly DNS64_SERVERS="2a00:1098:2b::1 2a00:1098:2c::1 2a01:4f8:c2c:123f::1"
 readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
@@ -106,6 +147,10 @@ OPT_TUIC=""         # 空=默认关; 1/0
 OPT_TUIC_PORT=""
 OPT_ANYTLS=""       # 空=默认关; 1/0
 OPT_ANYTLS_PORT=""
+OPT_XHTTP_TLS=""    # 空=默认关。VLESS + XHTTP + TLS，给 CDN，不是 REALITY 那条 XHTTP
+OPT_XHTTP_TLS_PORT=""
+OPT_WS=""           # 空=默认关。VLESS + WebSocket + TLS，给 CDN
+OPT_WS_PORT=""
 OPT_HOP=""          # "20000-50000" 或 "none"
 OPT_FIREWALL=1
 OPT_UPGRADE=""      # 空=默认（普通模式 1，NAT 模式 0）
@@ -132,6 +177,17 @@ OPT_LAND_ALLOW=""   # 落地机来源 IP 白名单（逗号分隔，none 清空�
 OPT_LAND_LINK=""    # 中转机 land-add 的 ss:// 链接
 OPT_LAND_ACT=""     # 中转机落地转发子命令: add | on | off | del | test
 OPT_FORCE=0         # land-add 测试不通过也强制启用
+OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
+OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）
+OPT_CERT_EMAIL=""   # 可选，交给 Let's Encrypt；空则不登记邮箱
+OPT_SUB_PORT=""     # 订阅 HTTPS 端口，默认 8447
+OPT_CERT_KIND=""    # 空=Let's Encrypt 单域名。le|wildcard|multi|zerossl|zerossl-wildcard|zerossl-multi|cf-origin
+OPT_CERT_NAMES=""   # 多域名或源站证书的名字，逗号分隔
+OPT_CERT_LINK=""    # 通配符证书写进链接的具体主机名，默认为根域名
+OPT_CF_DNS_TOKEN="" # Cloudflare API 令牌，只用于 DNS-01。不写入 state.env
+OPT_CF_ORIGIN_KEY="" # Cloudflare Origin CA Key。出现即表示申请源站证书
+OPT_ZEROSSL_KID=""
+OPT_ZEROSSL_HMAC=""
 XRAY_LABEL=""       # 端口提示中的协议名（落地机为 Shadowsocks 2022）
 
 # 运行时变量（部分持久化到 STATE_FILE）
@@ -386,7 +442,7 @@ openrc_ready() { # 非 OpenRC 引导的精简容器缺少 softlevel 时 rc-servi
     mkdir -p /run/openrc && touch /run/openrc/softlevel
   fi
 }
-svc_log_file() { case $1 in xray) printf '%s' "$XRAY_LOG" ;; hysteria-server) printf '%s' "$HY_LOG" ;; sing-box) printf '%s' "$SB_LOG" ;; esac; }
+svc_log_file() { case $1 in xray) printf '%s' "$XRAY_LOG" ;; hysteria-server) printf '%s' "$HY_LOG" ;; sing-box) printf '%s' "$SB_LOG" ;; proxy-oneclick-sub) printf '%s' "$SUB_LOG" ;; esac; }
 svc_exists() {
   if is_openrc; then [[ -x /etc/init.d/$1 ]]; else systemctl cat "$1" >/dev/null 2>&1; fi
 }
@@ -460,7 +516,11 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             TROJAN_ENABLED TROJAN_PORT TROJAN_PASS TROJAN_EXT_PORT
             TUIC_ENABLED TUIC_PORT TUIC_PASS TUIC_EXT_PORT
             ANYTLS_ENABLED ANYTLS_PORT ANYTLS_PASS ANYTLS_EXT_PORT
-            OUTBOUND_IP)
+            XHTTP_TLS_ENABLED XHTTP_TLS_PORT XHTTP_TLS_PATH
+            WS_ENABLED WS_PORT WS_PATH
+            OUTBOUND_IP
+            CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
+            CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
@@ -470,6 +530,9 @@ XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT=""
 TROJAN_ENABLED=0 TROJAN_PORT=8444 TROJAN_PASS="" TROJAN_EXT_PORT=""
 TUIC_ENABLED=0 TUIC_PORT=8446 TUIC_PASS="" TUIC_EXT_PORT=""
 ANYTLS_ENABLED=0 ANYTLS_PORT=8445 ANYTLS_PASS="" ANYTLS_EXT_PORT=""
+# CDN 线路默认关闭。2083 / 2087 是 Cloudflare 允许回源的 HTTPS 端口，避开 REALITY 的 443。
+XHTTP_TLS_ENABLED=0 XHTTP_TLS_PORT=2083 XHTTP_TLS_PATH=""
+WS_ENABLED=0 WS_PORT=2087 WS_PATH=""
 STATE_HAS_XHTTP=0
 EXTRA_TCP="" EXTRA_UDP="" DISABLED_FW="" SWAP_CREATED=0 SERVER_ADDR=""
 NAT_MODE=0 NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE=""
@@ -480,6 +543,9 @@ NAT_SRC=""          # 本次安装 NAT_MODE 的来源：cli | manual | alpine | 
 # 已记住的出站策略：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6。空 = 还没问过。
 # 双栈且为空时保持原来的 AsIs / Hy2 happy eyeballs，直到交互询问或 --auto（默认 46）。
 OUTBOUND_IP=""
+CERT_ON=0 CERT_DOMAIN="" CERT_EMAIL="" SUB_PORT=8447 SUB_TOKEN=""
+# 旧状态文件没有这几项时保持 Let's Encrypt 单域名 HTTP-01，已经签好的公开证书行为不变。
+CERT_CA=letsencrypt CERT_SCOPE=single CERT_NAMES="" CERT_PUBLIC=1 CERT_CHALLENGE=http
 OUTBOUND_EFFECTIVE=""   # 本次写配置实际使用的策略（单栈会强制 4 或 6，不覆盖 OUTBOUND_IP）
 OUTBOUND_IP_DONE=0      # 本次进程只决定一次
 
@@ -2324,6 +2390,9 @@ check_port_free() { # $1 proto $2 port $3 允许的进程名(正则)
     [[ $1 == udp && $2 == "$HY2_PORT" && hysteria =~ ^($3)$ ]] && svc_active hysteria-server && return 0
     [[ $1 == udp && $2 == "$TUIC_PORT" && ${TUIC_ENABLED:-0} == 1 && sing-box =~ ^($3)$ ]] && svc_active sing-box && return 0
     [[ $1 == udp && $2 == "$XRAY_PORT" && ${LAND_MODE:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
+    [[ $1 == tcp && $2 == "$SUB_PORT" ]] && cert_is_public && [[ $3 =~ python ]] && svc_active proxy-oneclick-sub && return 0
+    [[ $1 == tcp && $2 == "$XHTTP_TLS_PORT" && ${XHTTP_TLS_ENABLED:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
+    [[ $1 == tcp && $2 == "$WS_PORT" && ${WS_ENABLED:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
   fi
   warn "${1^^} 端口 $2 已被占用（进程: ${owner:-未知}）。"
   return 1
@@ -2362,6 +2431,7 @@ other_listen_ports() { # $1 = tcp|udp
     [[ $ip =~ ^(127\.|\[::1\]|::1|\[?fe80) ]] && continue
     [[ $ip == "127.0.0.53%lo" || $ip == 127.0.0.54 ]] && continue
     [[ $users =~ \"(xray|hysteria|sing-box|sshd|systemd-resolve|chronyd|dhclient|systemd-network)\" ]] && continue
+    [[ ${CERT_ON:-0} == 1 && $port == "$SUB_PORT" && $users == *python* ]] && continue
     [[ " $SSH_PORTS " == *" $port "* ]] && continue
     echo "$port"
   done | sort -un | tr '\n' ' ' || true
@@ -2536,6 +2606,8 @@ xray_need_cap() {
   (( ${REALITY_ENABLED:-1} )) && need_bind_cap "$XRAY_PORT" && return 0
   (( ${XHTTP_ENABLED:-0} )) && need_bind_cap "$XHTTP_PORT" && return 0
   (( ${TROJAN_ENABLED:-0} )) && need_bind_cap "$TROJAN_PORT" && return 0
+  (( ${XHTTP_TLS_ENABLED:-0} )) && need_bind_cap "$XHTTP_TLS_PORT" && return 0
+  (( ${WS_ENABLED:-0} )) && need_bind_cap "$WS_PORT" && return 0
   return 1
 }
 sb_needed() { (( ${TUIC_ENABLED:-0} || ${ANYTLS_ENABLED:-0} )); }
@@ -2962,6 +3034,10 @@ write_xray_config() {
       ]
     }
   }' >"$tmp"
+    if ! cdn_attach_inbounds "$tmp" "$cplain"; then
+      rm -f "$tmp" "${tmp}.cdn"
+      return 1
+    fi
     relay_inject "$tmp"   # 中转机：落地出站（保存在状态文件中，每次重新生成配置都会重新加入）
     if [[ $(jq '.inbounds | length' "$tmp") == 0 ]]; then
       rm -f "$tmp"
@@ -2971,7 +3047,11 @@ write_xray_config() {
   ensure_outbound_ip
   xray_apply_ip_strategy "$tmp" || die "写入 Xray 出站地址族失败。"
   if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$tmp" >"${tmp}.log" 2>&1; then
-    cat "${tmp}.log" >&2; rm -f "$tmp" "${tmp}.log"
+    cat "${tmp}.log" >&2
+    if cdn_wanted; then
+      cdn_explain xray_config
+    fi
+    rm -f "$tmp" "${tmp}.log"
     die "Xray 配置校验失败（xray run -test），未应用新配置。"
   fi
   rm -f "${tmp}.log"
@@ -3031,17 +3111,25 @@ gen_hy2_cert() {
 write_hy2_config() {
   ensure_outbound_ip
   [[ -n $HY2_PASS ]] || HY2_PASS=$(rand_pass)
-  [[ -f $HY_CRT && -f $HY_KEY ]] || gen_hy2_cert
-  # 证书 CN 与当前 SNI 不一致时重新生成
-  if ! openssl x509 -noout -subject -in "$HY_CRT" 2>/dev/null | grep -q "CN *= *${SNI}\$"; then gen_hy2_cert; fi
-  HY2_PIN=$(openssl x509 -noout -fingerprint -sha256 -in "$HY_CRT" | cut -d= -f2)
+  local crt=$HY_CRT key=$HY_KEY
+  if tls_present_real; then
+    # 公开证书的 CN 是自有域名，不能按伪装 SNI 重新生成自签证书。
+    cert_grant_readers
+    crt=$CERT_FULLCHAIN
+    key=$CERT_PRIVKEY
+  else
+    [[ -f $HY_CRT && -f $HY_KEY ]] || gen_hy2_cert
+    # 证书 CN 与当前 SNI 不一致时重新生成
+    if ! openssl x509 -noout -subject -in "$HY_CRT" 2>/dev/null | grep -q "CN *= *${SNI}\$"; then gen_hy2_cert; fi
+    HY2_PIN=$(openssl x509 -noout -fingerprint -sha256 -in "$HY_CRT" | cut -d= -f2)
+  fi
   cat >"${HY_CONF}.tmp" <<HY
 # 由 proxy-oneclick 生成
 listen: :${HY2_PORT}
 
 tls:
-  cert: ${HY_CRT}
-  key: ${HY_KEY}
+  cert: ${crt}
+  key: ${key}
 
 auth:
   type: password
@@ -3060,11 +3148,17 @@ HY
     hy2_outbound_yaml >>"${HY_CONF}.tmp"
   fi
   local grp="root"; id hysteria >/dev/null 2>&1 && grp=hysteria
-  chown "root:${grp}" "${HY_CONF}.tmp" "$HY_KEY" "$HY_CRT"
-  chmod 640 "${HY_CONF}.tmp" "$HY_KEY"; chmod 644 "$HY_CRT"
+  if tls_present_real; then
+    chown "root:${grp}" "${HY_CONF}.tmp"
+    chmod 640 "${HY_CONF}.tmp"
+  else
+    chown "root:${grp}" "${HY_CONF}.tmp" "$HY_KEY" "$HY_CRT"
+    chmod 640 "${HY_CONF}.tmp" "$HY_KEY"; chmod 644 "$HY_CRT"
+  fi
   mv -f "${HY_CONF}.tmp" "$HY_CONF"
   selinux_fix "$HY_DIR"
-  ok "Hysteria2 配置已生成: ${HY_CONF}"
+  if tls_present_real; then ok "Hysteria2 配置已生成: ${HY_CONF}（证书 ${CERT_DOMAIN}）"
+  else ok "Hysteria2 配置已生成: ${HY_CONF}"; fi
 }
 
 restart_hy2() {
@@ -3141,6 +3235,10 @@ render_firewall() {
   (( ${XHTTP_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_PORT"
   (( ${TROJAN_ENABLED:-0} )) && fw_add_port tcp_ports "$TROJAN_PORT"
   (( ${ANYTLS_ENABLED:-0} )) && fw_add_port tcp_ports "$ANYTLS_PORT"
+  (( ${XHTTP_TLS_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_TLS_PORT"
+  (( ${WS_ENABLED:-0} )) && fw_add_port tcp_ports "$WS_PORT"
+  if cert_http_open; then fw_add_port tcp_ports 80; fi
+  if cert_is_public; then fw_add_port tcp_ports "${SUB_PORT:-8447}"; fi
   for p in $EXTRA_TCP; do fw_add_port tcp_ports "$p"; done
   udp_ports=""
   (( HY2_ENABLED )) && udp_ports="$HY2_PORT"
@@ -3244,7 +3342,8 @@ UNIT
   nft delete table ip "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
   nft delete table ip6 "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
   systemctl restart proxy-oneclick-fw || { nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true; die "加载防火墙规则失败，已回滚。"; }
-  ok "nftables 规则已加载（入站默认拒绝）。已放行 SSH 端口: ${SSH_PORTS}；TCP ${XRAY_PORT}${EXTRA_TCP:+ $EXTRA_TCP}$( ((HY2_ENABLED)) && echo "；UDP ${HY2_PORT}${HOP_RANGE:+ + ${HOP_RANGE}}")${EXTRA_UDP:+；UDP $EXTRA_UDP}$(proto_fw_extra)"
+  ok "nftables 规则已加载（入站默认拒绝）。"
+  fw_print_allows
 }
 
 remove_firewall() {
@@ -3425,7 +3524,12 @@ ask_extra_ports() {
   detect_ssh_ports
   t=$(other_listen_ports tcp); u=$(other_listen_ports udp)
   # 排除自身端口
-  t=$(for p in $t; do [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" ]] || echo "$p"; done | tr '\n' ' ')
+  t=$(for p in $t; do
+    if [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || $p == "$XHTTP_TLS_PORT" || $p == "$WS_PORT" ]] || cert_port_owned "$p"; then
+      continue
+    fi
+    echo "$p"
+  done | tr '\n' ' ')
   u=$(for p in $u; do [[ $p == "$HY2_PORT" || $p == "$TUIC_PORT" ]] || echo "$p"; done | tr '\n' ' ')
   t=${t% } u=${u% }
   if [[ -n $t || -n $u ]]; then
@@ -3435,6 +3539,75 @@ ask_extra_ports() {
       EXTRA_UDP="$(tr ' ' '\n' <<<"$EXTRA_UDP $u" | awk 'NF' | sort -un | tr '\n' ' ')"; EXTRA_UDP=${EXTRA_UDP% }
     fi
   fi
+}
+
+# 只打印，不改规则。端口和 render_firewall 用同一套开关。
+FW_ALLOW_SEEN=""
+fw_allow_seen() { [[ " ${FW_ALLOW_SEEN} " == *" ${1,,}/$2 "* ]]; }
+fw_allow_row() { # $1 协议名 $2 tcp|udp $3 端口或范围
+  local name=$1 fam=$2 port=$3
+  [[ -n $port && $port != 0 ]] || return 0
+  FW_ALLOW_SEEN+=" ${fam,,}/${port}"
+  printf '  %s  %s  %s\n' "$(ui_pad "$name" 22)" "$(ui_pad "${fam^^}" 4)" "$port"
+}
+fw_print_allows() {
+  local p
+  FW_ALLOW_SEEN=""
+  if (( ${LAND_MODE:-0} )); then
+    echo "本机防火墙：落地机不用这套默认拒绝规则。来源限制见白名单。"
+    return 0
+  fi
+  if (( ${NAT_MODE:-0} )); then
+    echo "本机防火墙：NAT 模式不设置。入站能不能进来，看服务商的端口映射。"
+    return 0
+  fi
+  if (( ${FW_ENABLED:-0} == 1 )); then
+    printf '%s本机防火墙：入站默认拒绝。%s下面没有的端口，新连接会被丢掉。\n' "$C_WARN" "$C_NONE"
+    echo "已建立的连接、本机回环和 ICMP 仍然放行。"
+    if have nft && ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+      echo "表 inet ${NFT_TABLE} 还没加载。下面是按配置应该放行的端口，重载后才生效。"
+    fi
+  else
+    echo "本机防火墙：没有由本脚本接管，也没有做默认拒绝。"
+    echo "下面是各协议要用的端口。系统防火墙和云安全组需要自己放行。"
+  fi
+  echo
+  printf '  %s  %s  %s\n' "$(ui_pad "协议" 22)" "$(ui_pad "类型" 4)" "端口"
+  (( ${REALITY_ENABLED:-0} == 1 )) && fw_allow_row "Reality" tcp "$XRAY_PORT"
+  (( ${XHTTP_ENABLED:-0} == 1 )) && fw_allow_row "XHTTP" tcp "$XHTTP_PORT"
+  (( ${HY2_ENABLED:-0} == 1 )) && fw_allow_row "Hysteria2" udp "$HY2_PORT"
+  (( ${TROJAN_ENABLED:-0} == 1 )) && fw_allow_row "Trojan" tcp "$TROJAN_PORT"
+  (( ${TUIC_ENABLED:-0} == 1 )) && fw_allow_row "TUIC" udp "$TUIC_PORT"
+  (( ${ANYTLS_ENABLED:-0} == 1 )) && fw_allow_row "AnyTLS" tcp "$ANYTLS_PORT"
+  (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && fw_allow_row "CDN XHTTP" tcp "$XHTTP_TLS_PORT"
+  (( ${WS_ENABLED:-0} == 1 )) && fw_allow_row "CDN WebSocket" tcp "$WS_PORT"
+  if cert_is_public; then fw_allow_row "订阅" tcp "${SUB_PORT:-8447}"; fi
+  if cert_http_open; then fw_allow_row "证书申请" tcp 80; fi
+  if [[ -z ${SSH_PORTS// } ]]; then
+    if (( ${FW_ENABLED:-0} == 1 )); then
+      printf '  %s  还没检测到。重载前先检测，避免把登录端口关在外面。\n' "$(ui_pad "SSH" 22)"
+    else
+      printf '  %s  未检测\n' "$(ui_pad "SSH" 22)"
+    fi
+  else
+    for p in $SSH_PORTS; do fw_allow_row "SSH" tcp "$p"; done
+  fi
+  if (( ${HY2_ENABLED:-0} == 1 )) && [[ -n ${HOP_RANGE:-} ]]; then
+    fw_allow_row "Hysteria2 端口跳跃" udp "$HOP_RANGE"
+  fi
+  for p in ${EXTRA_TCP-}; do fw_allow_seen tcp "$p" || fw_allow_row "额外放行" tcp "$p"; done
+  for p in ${EXTRA_UDP-}; do fw_allow_seen udp "$p" || fw_allow_row "额外放行" udp "$p"; done
+  echo
+  if cert_http_open; then echo "证书申请的 TCP 80 只给 HTTP-01 续期，不提供订阅，也不跑代理。"; fi
+  if cert_is_public; then echo "订阅是客户端拉取节点的 HTTPS，不是 Reality。"; fi
+  (( ${XHTTP_TLS_ENABLED:-0} == 1 || ${WS_ENABLED:-0} == 1 )) && echo "CDN 这两行给 Cloudflare 回源，不是 Reality。"
+  if (( ${HY2_ENABLED:-0} == 1 )) && [[ -n ${HOP_RANGE:-} ]]; then
+    echo "端口跳跃的 UDP ${HOP_RANGE} 会转到 Hysteria2 的 UDP ${HY2_PORT}。"
+  fi
+  if (( ${FW_ENABLED:-0} == 1 )); then
+    echo "云安全组要另外放行上面这些端口。脚本改不到云上的防火墙。"
+  fi
+  return 0
 }
 
 cloud_fw_reminder() {
@@ -3459,14 +3632,8 @@ cloud_fw_reminder() {
     hr
     return 0
   fi
-  printf '%s请在云服务商安全组放行%s\n' "$C_WARN" "$C_NONE"
-  (( REALITY_ENABLED )) && printf 'TCP   %-7s  VLESS-REALITY\n' "$XRAY_PORT"
-  (( XHTTP_ENABLED )) && printf 'TCP   %-7s  VLESS-XHTTP\n' "$XHTTP_PORT"
-  (( TROJAN_ENABLED )) && printf 'TCP   %-7s  Trojan\n' "$TROJAN_PORT"
-  (( ANYTLS_ENABLED )) && printf 'TCP   %-7s  AnyTLS\n' "$ANYTLS_PORT"
-  (( HY2_ENABLED )) && printf 'UDP   %-7s  Hysteria2%s\n' "$HY2_PORT" "${HOP_RANGE:+  以及 UDP ${HOP_RANGE}}"
-  (( TUIC_ENABLED )) && printf 'UDP   %-7s  TUIC v5\n' "$TUIC_PORT"
-  echo "位置：云控制台安全组。Oracle Cloud 镜像可能还有自带 iptables。"
+  fw_print_allows
+  echo "Oracle Cloud 镜像可能还有自带 iptables。"
   hr
 }
 
@@ -3499,6 +3666,2781 @@ F2B
 }
 
 # ============================================================
+#          可选：证书（默认 Let's Encrypt 单域名）与订阅 HTTPS
+# ============================================================
+# 默认不申请。没有域名时 REALITY、以及 Hysteria2 / TUIC / AnyTLS 的自签证书都保持原样。
+# 不写种类时仍是 Let's Encrypt 单域名 HTTP-01。其它种类：通配符（DNS-01）、多域名、
+# ZeroSSL（同样三种公开证书）、Cloudflare 源站证书（只有 Cloudflare 信任，只给 CDN）。
+# 公开证书申请之后：
+#   · HTTP-01 只用 TCP 80，不碰 REALITY 所在端口；通配符改走 DNS-01，不占 80；
+#   · 订阅只在 HTTPS 上提供，明文 HTTP 不返回订阅内容；
+#   · Hysteria2 / TUIC / AnyTLS 出示这张证书，链接改用自有域名，不再带 insecure / pin；
+#   · REALITY 继续借用伪装站点，配置里不写入这张证书。
+#   · 可选的 CDN 线路（XHTTP+TLS / WebSocket+TLS）可以使用公开证书或源站证书。
+#     续期钩子只在 /etc/proxy-oneclick/cdn-xray 存在时才把证书拷给 Xray 并重启 Xray。
+# 源站证书不会打开订阅，也不会交给 Hysteria2 / TUIC / AnyTLS。
+# 换种类时先关掉旧证书再申请新的，不改 REALITY。
+# NAT 模式拒绝全部种类。公开证书的续期：systemd timer 或 OpenRC daily cron。
+
+cert_cli_requested() {
+  [[ -n ${OPT_CERT_DOMAIN:-} || ${OPT_CERT:-} == 1 || -n ${OPT_CERT_KIND:-} || -n ${OPT_CERT_NAMES:-} || -n ${OPT_CF_ORIGIN_KEY:-} || -n ${OPT_ZEROSSL_KID:-} ]]
+}
+# 公开可信：Let's Encrypt / ZeroSSL。旧状态没有 CERT_PUBLIC 时默认就是这种。
+cert_is_public() {
+  [[ ${CERT_ON:-0} == 1 && ${CERT_PUBLIC:-1} == 1 && ${CERT_CA:-letsencrypt} != cloudflare ]]
+}
+# Hysteria2 / TUIC / AnyTLS / 订阅。Cloudflare 源站证书不算。
+tls_present_real() {
+  cert_is_public && [[ -n ${CERT_DOMAIN:-} && -s ${CERT_FULLCHAIN:-} && -s ${CERT_PRIVKEY:-} ]]
+}
+# CDN 两条线路。公开证书和 Cloudflare 源站证书都可以。
+tls_for_cdn() {
+  [[ ${CERT_ON:-0} == 1 && -n ${CERT_DOMAIN:-} && -s ${CERT_FULLCHAIN:-} && -s ${CERT_PRIVKEY:-} ]]
+}
+cert_http_open() { [[ ${CERT_ON:-0} == 1 && ${CERT_CHALLENGE:-http} == http ]]; }
+cert_port_owned() {
+  cert_http_open && [[ $1 == 80 ]] && return 0
+  cert_is_public && [[ $1 == "${SUB_PORT:-}" ]] && return 0
+  return 1
+}
+tls_link_host() {
+  if tls_present_real; then printf '%s' "$CERT_DOMAIN"; else server_addr; fi
+}
+tls_link_sni() {
+  if tls_present_real; then printf '%s' "$CERT_DOMAIN"; else printf '%s' "$SNI"; fi
+}
+sub_url_raw() { printf 'https://%s:%s/sub/%s' "$CERT_DOMAIN" "$SUB_PORT" "$SUB_TOKEN"; }
+sub_clash_url_raw() { printf 'https://%s:%s/sub/%s/clash' "$CERT_DOMAIN" "$SUB_PORT" "$SUB_TOKEN"; }
+sub_url() { printf '%s\n' "$(sub_url_raw)"; }
+sub_clash_url() { printf '%s\n' "$(sub_clash_url_raw)"; }
+
+cert_domain_syntax() {
+  local d=${1,,}
+  [[ -n $d && ${#d} -le 253 ]] || return 1
+  [[ $d =~ ^[0-9.]+$ || $d == *:* ]] && return 1
+  [[ $d =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+}
+cert_email_syntax() { [[ $1 =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; }
+
+cert_resolved_ips() {
+  local d=$1 ip out=""
+  if have getent; then
+    while read -r ip _; do
+      ip=${ip,,}
+      [[ $ip =~ ^[0-9.]+$ || $ip == *:* ]] || continue
+      [[ " $out " == *" $ip "* ]] || out+="$ip "
+    done < <(getent ahosts "$d" 2>/dev/null || true)
+  fi
+  if [[ -z ${out// /} ]] && have dig; then
+    while read -r ip; do
+      ip=${ip,,}
+      [[ $ip =~ ^[0-9.]+$ || $ip == *:* ]] || continue
+      [[ " $out " == *" $ip "* ]] || out+="$ip "
+    done < <({ dig +short "$d" A; dig +short "$d" AAAA; } 2>/dev/null || true)
+  fi
+  printf '%s' "${out% }"
+}
+cert_ip_ours() {
+  local a out=""
+  [[ -n $PUBLIC_IP4 ]] && out+="$PUBLIC_IP4 "
+  [[ -n $PUBLIC_IP6 ]] && out+="${PUBLIC_IP6,,} "
+  if [[ ${SERVER_ADDR:-} =~ ^[0-9.]+$ || ${SERVER_ADDR:-} == *:* ]]; then out+="${SERVER_ADDR,,} "; fi
+  if have ip; then
+    while read -r a; do
+      a=${a%%/*}; a=${a,,}
+      [[ -z $a || $a == 127.* || $a == ::1 || $a == fe80:* || $a == fc* || $a == fd* ]] && continue
+      [[ " $out " == *" $a "* ]] || out+="$a "
+    done < <(ip -o addr show scope global 2>/dev/null | awk '{print $4}')
+  fi
+  printf '%s' "${out% }"
+}
+cert_domain_points_here() {
+  local d=$1 ips ours ip missing=""
+  ips=$(cert_resolved_ips "$d")
+  if [[ -z $ips ]]; then warn "域名 ${d} 没有解析出地址。"; return 1; fi
+  ours=$(cert_ip_ours)
+  if [[ -z $ours ]]; then warn "没有检测到本机地址，无法确认域名指向这里。"; return 1; fi
+  for ip in $ips; do
+    [[ " $ours " == *" ${ip,,} "* ]] || missing+="${ip} "
+  done
+  if [[ -n $missing ]]; then
+    warn "域名 ${d} 解析到 ${missing}，其中有不是本机的地址（本机: ${ours}）。"
+    return 1
+  fi
+  info "域名 ${d} 已解析到本机（${ips}）。"
+  return 0
+}
+cert_normalize_domain() {
+  CERT_DOMAIN=${CERT_DOMAIN,,}
+  CERT_DOMAIN=${CERT_DOMAIN%.}
+  CERT_DOMAIN=${CERT_DOMAIN// /}
+}
+
+sub_port_blocked() {
+  local p=$1
+  [[ $p == 80 ]] && return 0
+  (( ${REALITY_ENABLED:-0} == 1 )) && [[ $p == "$XRAY_PORT" ]] && return 0
+  (( ${XHTTP_ENABLED:-0} == 1 )) && [[ $p == "$XHTTP_PORT" ]] && return 0
+  (( ${TROJAN_ENABLED:-0} == 1 )) && [[ $p == "$TROJAN_PORT" ]] && return 0
+  (( ${ANYTLS_ENABLED:-0} == 1 )) && [[ $p == "$ANYTLS_PORT" ]] && return 0
+  (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && [[ $p == "$XHTTP_TLS_PORT" ]] && return 0
+  (( ${WS_ENABLED:-0} == 1 )) && [[ $p == "$WS_PORT" ]] && return 0
+  return 1
+}
+choose_sub_port() {
+  local p=${SUB_PORT:-8447}
+  [[ -n $OPT_SUB_PORT ]] && p=$OPT_SUB_PORT
+  while :; do
+    if [[ -z $OPT_SUB_PORT ]]; then
+      ask p "订阅 HTTPS 端口（TCP，不要用 80，也不要占用 REALITY）" "${p:-8447}"
+      p=${p// /}
+    fi
+    if ! is_port "$p" || sub_port_blocked "$p"; then
+      warn "端口 ${p:-空} 不能用于订阅。80 只留给证书申请；已开启协议的 TCP 端口也不能占用。"
+      (( OPT_AUTO )) || [[ -n $OPT_SUB_PORT ]] && die "订阅端口不可用: ${p:-空}"
+      p=8447
+      continue
+    fi
+    if check_port_free tcp "$p" 'python3(\.[0-9]+)?'; then SUB_PORT=$p; return 0; fi
+    (( OPT_AUTO )) || [[ -n $OPT_SUB_PORT ]] && die "订阅端口 ${p} 已被占用。"
+    p=8447
+  done
+}
+
+cert_ensure_group() {
+  getent group "$CERT_GROUP" >/dev/null 2>&1 && return 0
+  if have groupadd; then groupadd --system "$CERT_GROUP" >/dev/null 2>&1 || true
+  elif have addgroup; then addgroup -S "$CERT_GROUP" >/dev/null 2>&1 || true
+  fi
+  getent group "$CERT_GROUP" >/dev/null 2>&1 || die "无法创建组 ${CERT_GROUP}。"
+}
+cert_add_member() {
+  local u=$1
+  id "$u" >/dev/null 2>&1 || return 0
+  if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx "$CERT_GROUP"; then return 0; fi
+  if have usermod; then usermod -aG "$CERT_GROUP" "$u" >/dev/null 2>&1 || true
+  elif have addgroup; then addgroup "$u" "$CERT_GROUP" >/dev/null 2>&1 || true
+  fi
+}
+cert_ensure_sub_user() {
+  cert_ensure_group
+  if id "$SUB_USER" >/dev/null 2>&1; then cert_add_member "$SUB_USER"; return 0; fi
+  local sh; sh=$(command -v nologin 2>/dev/null || true)
+  [[ -n $sh ]] || sh=/usr/sbin/nologin
+  if have useradd; then
+    useradd --system --no-create-home --shell "$sh" --gid "$CERT_GROUP" "$SUB_USER" >/dev/null 2>&1 || \
+      useradd --system -M -s "$sh" -g "$CERT_GROUP" "$SUB_USER" >/dev/null 2>&1 || true
+  elif have adduser; then
+    adduser -S -D -H -h /var/empty -s /sbin/nologin -G "$CERT_GROUP" "$SUB_USER" >/dev/null 2>&1 || true
+  fi
+  id "$SUB_USER" >/dev/null 2>&1 || die "无法创建用户 ${SUB_USER}，不能启动订阅 HTTPS。"
+}
+cert_grant_readers() {
+  cert_ensure_group
+  cert_ensure_sub_user
+  cert_add_member hysteria
+  cert_add_member sing-box
+  cert_add_member "$SUB_USER"
+  if [[ -d $CERT_DIR ]]; then
+    chown "root:${CERT_GROUP}" "$CERT_DIR" 2>/dev/null || true
+    chmod 750 "$CERT_DIR" 2>/dev/null || true
+  fi
+  if [[ -s $CERT_PRIVKEY ]]; then
+    chown "root:${CERT_GROUP}" "$CERT_FULLCHAIN" "$CERT_PRIVKEY" 2>/dev/null || true
+    chmod 644 "$CERT_FULLCHAIN" 2>/dev/null || true
+    chmod 640 "$CERT_PRIVKEY" 2>/dev/null || true
+  fi
+}
+
+cert_regex_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//./\\.}
+  s=${s//\*/\\*}
+  s=${s//\[/\\[}
+  s=${s//\]/\\]}
+  printf '%s' "$s"
+}
+cert_name_covered() { # $1 证书文件 $2 名字。*.example.com 只覆盖一级，不覆盖根域名。
+  local file=$1 name=$2 san esc wild w p left
+  [[ -s $file ]] || return 1
+  san=$(openssl x509 -in "$file" -noout -ext subjectAltName 2>/dev/null || true)
+  [[ -n $san ]] || return 1
+  esc=$(cert_regex_escape "$name")
+  grep -Eq "DNS:${esc}(,|[[:space:]]|$)" <<<"$san" && return 0
+  [[ $name == \*.* ]] && return 1
+  wild=$(grep -Eo 'DNS:\*\.[A-Za-z0-9.-]+' <<<"$san" || true)
+  while read -r w; do
+    [[ -n $w ]] || continue
+    w=${w#DNS:}
+    p=${w#\*.}
+    [[ $name == *".${p}" ]] || continue
+    left=${name%".$p"}
+    [[ -n $left && $left != '*' && $left != *.* ]] && return 0
+  done <<<"$wild"
+  return 1
+}
+cert_san_ok() {
+  local f=$1 n names
+  [[ -s $f ]] || return 1
+  [[ -n ${CERT_DOMAIN:-} ]] || return 1
+  cert_name_covered "$f" "$CERT_DOMAIN" || return 1
+  names=${CERT_NAMES:-$CERT_DOMAIN}
+  local -a arr=()
+  IFS=',' read -ra arr <<< "$names"
+  for n in "${arr[@]}"; do
+    [[ -n $n ]] || continue
+    cert_name_covered "$f" "$n" || return 1
+  done
+}
+cert_issuer_ok() {
+  local iss
+  iss=$(openssl x509 -in "$1" -noout -issuer 2>/dev/null || true)
+  iss=${iss,,}
+  case ${CERT_CA:-letsencrypt} in
+    letsencrypt) [[ $iss == *"let's encrypt"* || $iss == *"lets encrypt"* ]] ;;
+    zerossl) [[ $iss == *zerossl* ]] ;;
+    cloudflare) [[ $iss == *cloudflare* ]] ;;
+    *) return 1 ;;
+  esac
+}
+cert_current_ok() {
+  local f live="/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem"
+  if [[ ${CERT_CA:-letsencrypt} == cloudflare ]]; then
+    [[ -s $CERT_FULLCHAIN ]] || return 1
+    cert_san_ok "$CERT_FULLCHAIN" || return 1
+    cert_issuer_ok "$CERT_FULLCHAIN" || return 1
+    openssl x509 -checkend 2592000 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  for f in "$CERT_FULLCHAIN" "$live"; do
+    [[ -s $f ]] || continue
+    cert_san_ok "$f" || continue
+    cert_issuer_ok "$f" || continue
+    openssl x509 -checkend 2592000 -noout -in "$f" >/dev/null 2>&1 || continue
+    return 0
+  done
+  return 1
+}
+cert_lineage_reusable() {
+  local live="/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem"
+  [[ -s $live ]] || return 1
+  cert_san_ok "$live" || return 1
+  cert_issuer_ok "$live" || return 1
+}
+cert_expiry_text() {
+  local end
+  [[ -s $CERT_FULLCHAIN ]] || { printf '未知'; return 0; }
+  end=$(openssl x509 -enddate -noout -in "$CERT_FULLCHAIN" 2>/dev/null | cut -d= -f2 || true)
+  if [[ -n $end ]]; then date -d "$end" '+%F' 2>/dev/null || printf '%s' "$end"
+  else printf '未知'; fi
+}
+
+install_certbot_pkg() {
+  have certbot && have python3 && return 0
+  step "安装 certbot 与 python3"
+  if [[ $PKG == dnf && $OS_ID != fedora ]] && ! rpm -q epel-release >/dev/null 2>&1; then
+    pkg_install epel-release 2>/dev/null || true
+  fi
+  if ! pkg_install certbot python3; then
+    die "无法安装 certbot 或 python3，不能申请证书。Debian/Ubuntu 用 apt；RHEL 系需要 EPEL 里的 certbot；Alpine 用 apk（需启用 community）。本次没有改动 REALITY。"
+  fi
+  if ! have certbot || ! have python3; then
+    die "certbot 或 python3 安装后仍不可用，不能申请证书。"
+  fi
+}
+cert_allow_80_now() {
+  (( ${FW_ENABLED:-0} == 1 )) || return 0
+  have nft || return 0
+  nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || return 0
+  if nft list chain inet "$NFT_TABLE" input 2>/dev/null | grep -Eq 'tcp dport \{[^}]*\b80\b|tcp dport 80( |$)'; then
+    return 0
+  fi
+  nft insert rule inet "$NFT_TABLE" input tcp dport 80 accept comment "acme-http-01" >/dev/null 2>&1 || \
+    warn "没能在现有防火墙里放行 TCP 80。若申请失败，请在防火墙和云安全组放行 80 后重试。"
+}
+
+write_sub_python() {
+  mkdir -p "$CERT_LIB"
+  cat >"$SUB_PY" <<'PY'
+#!/usr/bin/env python3
+"""HTTPS-only subscription listener. Never binds port 80 and never answers plain HTTP."""
+import json
+import socket
+import ssl
+import sys
+from http.server import BaseHTTPRequestHandler
+
+try:
+    from http.server import ThreadingHTTPServer as _HTTPServer
+except ImportError:  # Python 3.6
+    from socketserver import ThreadingMixIn
+    from http.server import HTTPServer
+
+    class _HTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+
+def load_conf(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    for key in ("port", "cert", "key", "token", "body", "clash"):
+        if key not in data:
+            raise SystemExit("missing config field")
+    token = str(data["token"])
+    if not token or "/" in token or ".." in token:
+        raise SystemExit("invalid token")
+    data["token"] = token
+    return data
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self._reply(True)
+
+    def do_HEAD(self):
+        self._reply(False)
+
+    def do_POST(self):
+        self._empty(404)
+
+    def _reply(self, send_body):
+        path = self.path.split("?", 1)[0]
+        if path.endswith("/") and path != "/":
+            path = path[:-1]
+        conf = self.server.conf
+        token = conf["token"]
+        target = None
+        ctype = "text/plain; charset=utf-8"
+        if path == "/sub/" + token:
+            target = conf["body"]
+        elif path == "/sub/" + token + "/clash":
+            target = conf["clash"]
+            ctype = "text/yaml; charset=utf-8"
+        if target is None:
+            self._empty(404)
+            return
+        try:
+            with open(target, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            self._empty(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(data)
+
+    def _empty(self, code):
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        code = args[1] if len(args) > 1 else "-"
+        sys.stderr.write("proxy-oneclick-sub %s %s\n" % (self.command, code))
+
+
+class TLSServer(_HTTPServer):
+    allow_reuse_address = True
+
+    def __init__(self, addr, handler, context):
+        super().__init__(addr, handler)
+        self.socket = context.wrap_socket(self.socket, server_side=True)
+
+
+def make_server(port, context):
+    last_err = None
+    try:
+        class V6(TLSServer):
+            address_family = socket.AF_INET6
+
+            def server_bind(self):
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                super(TLSServer, self).server_bind()
+
+        return V6(("::", port), Handler, context)
+    except OSError as exc:
+        last_err = exc
+
+    class V4(TLSServer):
+        address_family = socket.AF_INET
+
+    try:
+        return V4(("0.0.0.0", port), Handler, context)
+    except OSError:
+        raise last_err
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: sub_https.py config.json")
+    conf = load_conf(sys.argv[1])
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    if hasattr(ssl, "TLSVersion"):
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    else:
+        ctx.options |= getattr(ssl, "OP_NO_TLSv1", 0) | getattr(ssl, "OP_NO_TLSv1_1", 0)
+    ctx.load_cert_chain(conf["cert"], conf["key"])
+    httpd = make_server(int(conf["port"]), ctx)
+    httpd.conf = conf
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PY
+  chmod 755 "$SUB_PY"
+}
+write_cert_hook() {
+  mkdir -p "$CERT_LIB"
+  cat >"$CERT_HOOK" <<EOF
+#!/bin/sh
+# 由 proxy-oneclick 生成。certbot 续期成功后调用。
+# 只更新证书并重启 Hysteria2 / sing-box / 订阅服务。
+# REALITY 入站不使用这张证书。仅当 CDN 的 XHTTP/WS 已打开时，才把证书拷给 Xray 并重启 Xray。
+src="/etc/letsencrypt/live/${CERT_NAME}"
+dst="${CERT_DIR}"
+grp="${CERT_GROUP}"
+case \${RENEWED_LINEAGE:-} in
+  "") ;;
+  */${CERT_NAME}|*/${CERT_NAME}/) ;;
+  *) exit 0 ;;
+esac
+[ -f "\$src/fullchain.pem" ] && [ -f "\$src/privkey.pem" ] || exit 0
+mkdir -p "\$dst"
+if ! getent group "\$grp" >/dev/null 2>&1; then
+  if command -v groupadd >/dev/null 2>&1; then groupadd --system "\$grp" >/dev/null 2>&1 || true
+  elif command -v addgroup >/dev/null 2>&1; then addgroup -S "\$grp" >/dev/null 2>&1 || true
+  fi
+fi
+cp -f "\$src/fullchain.pem" "\$dst/fullchain.pem.new"
+cp -f "\$src/privkey.pem" "\$dst/privkey.pem.new"
+chown "root:\${grp}" "\$dst/fullchain.pem.new" "\$dst/privkey.pem.new" 2>/dev/null || chown root "\$dst/fullchain.pem.new" "\$dst/privkey.pem.new"
+chmod 644 "\$dst/fullchain.pem.new"
+chmod 640 "\$dst/privkey.pem.new"
+mv -f "\$dst/fullchain.pem.new" "\$dst/fullchain.pem"
+mv -f "\$dst/privkey.pem.new" "\$dst/privkey.pem"
+chmod 750 "\$dst" 2>/dev/null || true
+chown "root:\${grp}" "\$dst" 2>/dev/null || true
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl try-restart hysteria-server.service >/dev/null 2>&1 || true
+  systemctl try-restart sing-box.service >/dev/null 2>&1 || true
+  systemctl try-restart proxy-oneclick-sub.service >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+  for s in hysteria-server sing-box proxy-oneclick-sub; do
+    if [ -x "/etc/init.d/\$s" ]; then rc-service "\$s" restart >/dev/null 2>&1 || true; fi
+  done
+fi
+if [ -f "${CDN_FLAG}" ]; then
+  xdir="${XRAY_CERT_DIR}"
+  mkdir -p "\$xdir"
+  cp -f "\$dst/fullchain.pem" "\$xdir/fullchain.pem"
+  cp -f "\$dst/privkey.pem" "\$xdir/privkey.pem"
+  xgrp=\$(id -gn nobody 2>/dev/null || echo nogroup)
+  chown "root:\$xgrp" "\$xdir/fullchain.pem" "\$xdir/privkey.pem" 2>/dev/null || true
+  chmod 644 "\$xdir/fullchain.pem"
+  chmod 640 "\$xdir/privkey.pem"
+  chmod 750 "\$xdir" 2>/dev/null || true
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl try-restart xray.service >/dev/null 2>&1 || true
+  elif command -v rc-service >/dev/null 2>&1; then
+    if [ -x /etc/init.d/xray ]; then rc-service xray restart >/dev/null 2>&1 || true; fi
+  fi
+fi
+exit 0
+EOF
+  chmod 755 "$CERT_HOOK"
+}
+write_cert_helpers() { write_sub_python; write_cert_hook; }
+
+cert_install_material() {
+  if [[ ${CERT_CA:-letsencrypt} == cloudflare ]]; then
+    [[ -s $CERT_FULLCHAIN && -s $CERT_PRIVKEY ]] || die "源站证书文件不在。"
+    cert_grant_readers
+    mkdir -p "$CERT_LIB" "$(dirname "$SUB_LOG")"
+    chmod 755 "$CERT_BASE" 2>/dev/null || true
+    chmod 750 "$CERT_DIR"
+    chown "root:${CERT_GROUP}" "$CERT_DIR"
+    selinux_fix "$CERT_BASE" "$CERT_LIB"
+    return 0
+  fi
+  local live="/etc/letsencrypt/live/${CERT_NAME}"
+  if [[ ! -s ${live}/fullchain.pem || ! -s ${live}/privkey.pem ]]; then
+    [[ -s $CERT_FULLCHAIN && -s $CERT_PRIVKEY ]] || die "certbot 没有留下证书文件。"
+    cert_grant_readers
+    mkdir -p "$CERT_LIB" "$(dirname "$SUB_LOG")"
+    chmod 755 "$CERT_BASE" 2>/dev/null || true
+    chmod 750 "$CERT_DIR"
+    chown "root:${CERT_GROUP}" "$CERT_DIR"
+    selinux_fix "$CERT_BASE" "$CERT_LIB"
+    return 0
+  fi
+  cert_grant_readers
+  mkdir -p "$CERT_DIR" "$CERT_LIB" "$(dirname "$SUB_LOG")"
+  cp -f "${live}/fullchain.pem" "${CERT_FULLCHAIN}.new"
+  cp -f "${live}/privkey.pem" "${CERT_PRIVKEY}.new"
+  chown "root:${CERT_GROUP}" "${CERT_FULLCHAIN}.new" "${CERT_PRIVKEY}.new"
+  chmod 644 "${CERT_FULLCHAIN}.new"
+  chmod 640 "${CERT_PRIVKEY}.new"
+  mv -f "${CERT_FULLCHAIN}.new" "$CERT_FULLCHAIN"
+  mv -f "${CERT_PRIVKEY}.new" "$CERT_PRIVKEY"
+  chmod 755 "$CERT_BASE" 2>/dev/null || true
+  chmod 750 "$CERT_DIR"
+  chown "root:${CERT_GROUP}" "$CERT_DIR"
+  selinux_fix "$CERT_BASE" "$CERT_LIB"
+}
+certbot_issue() {
+  local log live="/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem"
+  local -a args=() dargs=() arr=()
+  local n who="Let's Encrypt"
+  mktmp
+  log="${TMP_DIR}/certbot-issue.log"
+  if [[ -s $live ]] && ! cert_lineage_reusable; then
+    info "已有证书的名字或签发机构与这次不一致，先删除再申请。"
+    certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true
+  fi
+  if [[ -n $CERT_EMAIL ]]; then args=(--email "$CERT_EMAIL" --no-eff-email)
+  else args=(--register-unsafely-without-email); fi
+  if [[ ${CERT_CA:-letsencrypt} == zerossl ]]; then
+    who="ZeroSSL"
+    cert_load_eab || die "没有 ZeroSSL 的 EAB 凭据。"
+    args+=(--server "$ZEROSSL_SERVER" --eab-kid "$ZEROSSL_KID" --eab-hmac-key "$ZEROSSL_HMAC")
+  fi
+  IFS=',' read -ra arr <<< "${CERT_NAMES:-$CERT_DOMAIN}"
+  for n in "${arr[@]}"; do
+    [[ -n $n ]] || continue
+    dargs+=(-d "$n")
+  done
+  # 默认路径保持原来的 Let's Encrypt 单域名 HTTP-01，参数顺序不改。
+  if [[ ${CERT_CA:-letsencrypt} == letsencrypt && ${CERT_SCOPE:-single} == single && ${CERT_CHALLENGE:-http} == http ]]; then
+    info "向 Let's Encrypt 申请 ${CERT_DOMAIN}（HTTP-01，端口 80）。不会改动 REALITY 的 TCP ${XRAY_PORT}。"
+    if ! certbot certonly --non-interactive --agree-tos \
+        --cert-name "$CERT_NAME" \
+        --standalone --preferred-challenges http --http-01-port 80 \
+        --keep-until-expiring \
+        --deploy-hook "$CERT_HOOK" \
+        -d "$CERT_DOMAIN" \
+        "${args[@]}" >"$log" 2>&1; then
+      tail -n 30 "$log" >&2 || true
+      cert_fail_explain "$log"
+      die "申请证书失败。REALITY（TCP ${XRAY_PORT}）没有改动，也没有改用这张证书。"
+    fi
+    ok "证书已签发: ${CERT_DOMAIN}"
+    return 0
+  fi
+  if [[ ${CERT_CHALLENGE:-http} == dns ]]; then
+    info "向 ${who} 申请通配符（DNS-01）：${CERT_NAMES}。不占用 80，也不改 REALITY 的 TCP ${XRAY_PORT}。"
+    if ! certbot certonly --non-interactive --agree-tos \
+        --cert-name "$CERT_NAME" \
+        --manual --preferred-challenges dns \
+        --manual-auth-hook "$CERT_DNS_AUTH" \
+        --manual-cleanup-hook "$CERT_DNS_CLEAN" \
+        --manual-public-ip-logging-ok \
+        --keep-until-expiring \
+        --deploy-hook "$CERT_HOOK" \
+        "${dargs[@]}" \
+        "${args[@]}" >"$log" 2>&1; then
+      tail -n 40 "$log" >&2 || true
+      cert_fail_explain "$log"
+      die "申请证书失败。REALITY（TCP ${XRAY_PORT}）没有改动，也没有改用这张证书。"
+    fi
+  else
+    info "向 ${who} 申请证书（HTTP-01，端口 80）：${CERT_NAMES:-$CERT_DOMAIN}。不会改动 REALITY 的 TCP ${XRAY_PORT}。"
+    if ! certbot certonly --non-interactive --agree-tos \
+        --cert-name "$CERT_NAME" \
+        --standalone --preferred-challenges http --http-01-port 80 \
+        --keep-until-expiring \
+        --deploy-hook "$CERT_HOOK" \
+        "${dargs[@]}" \
+        "${args[@]}" >"$log" 2>&1; then
+      tail -n 40 "$log" >&2 || true
+      cert_fail_explain "$log"
+      die "申请证书失败。REALITY（TCP ${XRAY_PORT}）没有改动，也没有改用这张证书。"
+    fi
+  fi
+  ok "证书已签发: ${CERT_NAMES:-$CERT_DOMAIN}"
+}
+
+cert_b64() {
+  if printf '' | base64 -w 0 >/dev/null 2>&1; then base64 -w 0
+  else base64 | tr -d '\n'; fi
+  printf '\n'
+}
+cert_render_links() {
+  local u r
+  if (( REALITY_ENABLED )); then
+    printf '%s\n' "$(vless_link "$UUID" "${NODE_NAME}-Reality" 1)"
+    if [[ -s $USERS_FILE ]]; then
+      while IFS=$'\t' read -r u r; do
+        [[ -n $u ]] || continue
+        printf '%s\n' "$(vless_link "$u" "${NODE_NAME}-${r}" 0)"
+      done <"$USERS_FILE"
+    fi
+  fi
+  if (( XHTTP_ENABLED )); then
+    printf '%s\n' "$(vless_xhttp_link "$UUID" "${NODE_NAME}-XHTTP" 1)"
+    if [[ -s $USERS_FILE ]]; then
+      while IFS=$'\t' read -r u r; do
+        [[ -n $u ]] || continue
+        printf '%s\n' "$(vless_xhttp_link "$u" "${NODE_NAME}-XHTTP-${r}" 0)"
+      done <"$USERS_FILE"
+    fi
+  fi
+  (( HY2_ENABLED )) && printf '%s\n' "$(hy2_link)"
+  (( TROJAN_ENABLED )) && printf '%s\n' "$(trojan_link)"
+  (( TUIC_ENABLED )) && printf '%s\n' "$(tuic_link)"
+  (( ANYTLS_ENABLED )) && printf '%s\n' "$(anytls_link)"
+  cdn_render_links
+}
+cert_write_bodies() {
+  tls_present_real || return 0
+  [[ -n $SUB_TOKEN ]] || return 0
+  cert_grant_readers
+  mkdir -p "$CERT_DIR"
+  cert_render_links | cert_b64 >"${SUB_BODY}.tmp"
+  mihomo_yaml >"${SUB_CLASH}.tmp"
+  chown "root:${CERT_GROUP}" "${SUB_BODY}.tmp" "${SUB_CLASH}.tmp" 2>/dev/null || true
+  chmod 640 "${SUB_BODY}.tmp" "${SUB_CLASH}.tmp"
+  mv -f "${SUB_BODY}.tmp" "$SUB_BODY"
+  mv -f "${SUB_CLASH}.tmp" "$SUB_CLASH"
+}
+cert_write_sub_conf() {
+  mkdir -p "$CERT_DIR"
+  jq -n --arg token "$SUB_TOKEN" --argjson port "$SUB_PORT" \
+    --arg cert "$CERT_FULLCHAIN" --arg key "$CERT_PRIVKEY" \
+    --arg body "$SUB_BODY" --arg clash "$SUB_CLASH" \
+    '{port: $port, cert: $cert, key: $key, token: $token, body: $body, clash: $clash}' \
+    >"${SUB_CONF}.tmp"
+  chown "root:${CERT_GROUP}" "${SUB_CONF}.tmp" 2>/dev/null || true
+  chmod 640 "${SUB_CONF}.tmp"
+  mv -f "${SUB_CONF}.tmp" "$SUB_CONF"
+}
+
+write_sub_service() {
+  local user=$SUB_USER py
+  id "$user" >/dev/null 2>&1 || user=root
+  py=$(command -v python3)
+  [[ -n $py ]] || die "未找到 python3，无法启动订阅 HTTPS。"
+  mkdir -p "$(dirname "$SUB_LOG")"
+  if is_openrc; then
+    cat >"$SUB_RC" <<RC
+#!/sbin/openrc-run
+# 由 proxy-oneclick 生成。只提供订阅 HTTPS，不监听 80。
+name="proxy-oneclick-sub"
+description="proxy-oneclick subscription HTTPS"
+supervisor=supervise-daemon
+command="${py}"
+command_args="${SUB_PY} ${SUB_CONF}"
+command_user="${user}:${CERT_GROUP}"
+output_log="${SUB_LOG}"
+error_log="${SUB_LOG}"
+respawn_delay=3
+respawn_max=0
+supervise_daemon_args="--env PYTHONUNBUFFERED=1"
+$(need_bind_cap "$SUB_PORT" && echo 'capabilities="^cap_net_bind_service"')
+
+depend() {
+  want net
+  after net
+}
+
+start_pre() {
+  checkpath -d -m 0755 -o "\${command_user}" "$(dirname "$SUB_LOG")"
+  checkpath -f -m 0644 -o "\${command_user}" "${SUB_LOG}"
+}
+RC
+    chmod 755 "$SUB_RC"
+  else
+    {
+      echo "# 由 proxy-oneclick 生成。只提供订阅 HTTPS，不监听 80。"
+      echo "[Unit]"
+      echo "Description=proxy-oneclick subscription HTTPS"
+      echo "After=network-online.target"
+      echo "Wants=network-online.target"
+      echo
+      echo "[Service]"
+      echo "User=${user}"
+      echo "Group=${CERT_GROUP}"
+      echo "WorkingDirectory=${CERT_DIR}"
+      echo "NoNewPrivileges=true"
+      if need_bind_cap "$SUB_PORT"; then
+        echo "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+        echo "AmbientCapabilities=CAP_NET_BIND_SERVICE"
+      fi
+      echo "Environment=PYTHONUNBUFFERED=1"
+      echo "ExecStart=${py} ${SUB_PY} ${SUB_CONF}"
+      echo "Restart=on-failure"
+      echo "RestartSec=3"
+      echo
+      echo "[Install]"
+      echo "WantedBy=multi-user.target"
+    } >"$SUB_UNIT"
+    systemctl daemon-reload
+  fi
+}
+write_renew_job() {
+  local bin; bin=$(command -v certbot)
+  [[ -n $bin ]] || die "未找到 certbot，无法安排续期。"
+  if is_openrc; then
+    mkdir -p "$(dirname "$CERT_CRON")"
+    cat >"$CERT_CRON" <<EOF
+#!/bin/sh
+# 由 proxy-oneclick 生成。每天检查一次，临近到期才真正续期。
+exec ${bin} renew --quiet --cert-name ${CERT_NAME}
+EOF
+    chmod 755 "$CERT_CRON"
+    if have rc-update; then
+      rc-update add crond default >/dev/null 2>&1 || rc-update add cron default >/dev/null 2>&1 || true
+      rc-service crond start >/dev/null 2>&1 || rc-service cron start >/dev/null 2>&1 || true
+    fi
+    ok "证书续期已交给 OpenRC 的每日任务（${CERT_CRON}）。"
+  else
+    cat >"$CERT_RENEW_UNIT" <<EOF
+[Unit]
+Description=Renew proxy-oneclick certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${bin} renew --quiet --cert-name ${CERT_NAME}
+EOF
+    cat >"$CERT_TIMER_UNIT" <<EOF
+[Unit]
+Description=Daily proxy-oneclick certificate renewal check
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || warn "证书续期定时器未能启用，请稍后执行 systemctl enable --now proxy-oneclick-cert.timer。"
+    ok "证书续期已交给 systemd 定时器（每天检查，到期前约 30 天续期）。"
+  fi
+}
+
+cert_selfcheck() {
+  local got="" want tmp httpbody
+  want=$(openssl x509 -in "$CERT_FULLCHAIN" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)
+  got=$( { echo | openssl s_client -connect "127.0.0.1:${SUB_PORT}" -servername "$CERT_DOMAIN" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; } || true)
+  if [[ -z $got || $got != "$want" ]]; then
+    warn "订阅 HTTPS 自检未通过：TCP ${SUB_PORT} 上没有出示 ${CERT_DOMAIN} 的证书。可查看 proxy status。"
+    return 0
+  fi
+  tmp=$(mktemp)
+  if curl -fsS --insecure --resolve "${CERT_DOMAIN}:${SUB_PORT}:127.0.0.1" --max-time 10 -o "$tmp" "$(sub_url_raw)"; then
+    if cmp -s "$tmp" "$SUB_BODY"; then ok "订阅 HTTPS 自检通过（${CERT_DOMAIN}:${SUB_PORT}）。"
+    else warn "订阅 HTTPS 已连通，但内容和当前节点列表不一致。"; fi
+  else
+    warn "订阅 HTTPS 握手正常，但拉取订阅失败。"
+  fi
+  httpbody=$(mktemp)
+  if curl -fsS --max-time 3 -o "$httpbody" "http://127.0.0.1:${SUB_PORT}/sub/${SUB_TOKEN}" 2>/dev/null \
+      && cmp -s "$httpbody" "$SUB_BODY"; then
+    rm -f "$tmp" "$httpbody"
+    die "订阅端口以明文 HTTP 返回了订阅内容，已中止。"
+  fi
+  rm -f "$tmp" "$httpbody"
+  return 0
+}
+cert_start_sub() {
+  tls_present_real || return 0
+  cert_grant_readers
+  write_cert_helpers
+  cert_write_sub_conf
+  cert_write_bodies
+  write_sub_service
+  if cert_renew_unattended; then write_renew_job
+  else
+    cert_drop_renew_job
+    warn "没有保存 Cloudflare DNS 令牌，定时任务没法自己添加 TXT。到期前请运行 proxy cert 再添加一次，或重新申请时加上 --cf-dns-token。"
+  fi
+  sd_reload
+  svc_enable proxy-oneclick-sub
+  svc_restart proxy-oneclick-sub || true
+  sleep 1
+  if ! svc_active proxy-oneclick-sub; then
+    svc_logs proxy-oneclick-sub 30 >&2 || true
+    die "订阅 HTTPS 服务启动失败。REALITY 没有改动。"
+  fi
+  ok "订阅 HTTPS 已监听 TCP ${SUB_PORT}（只接受 TLS；明文 HTTP 不提供订阅）。"
+  cert_selfcheck
+}
+
+cert_kind_id() {
+  case ${CERT_CA:-letsencrypt}:${CERT_SCOPE:-single} in
+    letsencrypt:single) printf 'le' ;;
+    letsencrypt:wildcard) printf 'wildcard' ;;
+    letsencrypt:multi) printf 'multi' ;;
+    zerossl:single) printf 'zerossl' ;;
+    zerossl:wildcard) printf 'zerossl-wildcard' ;;
+    zerossl:multi) printf 'zerossl-multi' ;;
+    cloudflare:*) printf 'cf-origin' ;;
+    *) printf 'le' ;;
+  esac
+}
+cert_kind_label_of() {
+  case $1 in
+    le) printf "Let's Encrypt 单域名" ;;
+    wildcard) printf "Let's Encrypt 通配符" ;;
+    multi) printf "Let's Encrypt 多域名" ;;
+    zerossl) printf "ZeroSSL 单域名" ;;
+    zerossl-wildcard) printf "ZeroSSL 通配符" ;;
+    zerossl-multi) printf "ZeroSSL 多域名" ;;
+    cf-origin) printf "Cloudflare 源站证书" ;;
+    *) printf '证书' ;;
+  esac
+}
+cert_kind_label() { cert_kind_label_of "$(cert_kind_id)"; }
+cert_normalize_kind() {
+  local k=${1,,}
+  k=${k// /}
+  case $k in
+    le|letsencrypt|single|http|http-01|http01) printf 'le' ;;
+    wildcard|wild|dns|dns-01|dns01) printf 'wildcard' ;;
+    multi|san|names) printf 'multi' ;;
+    zerossl|zero|zerossl-single|zerossl-http) printf 'zerossl' ;;
+    zerossl-wildcard|zerossl-wild|zerossl-dns) printf 'zerossl-wildcard' ;;
+    zerossl-multi|zerossl-san) printf 'zerossl-multi' ;;
+    cf-origin|cf|cloudflare|origin|origin-ca|cf-origin-ca) printf 'cf-origin' ;;
+    *) return 1 ;;
+  esac
+}
+cert_kind_apply() {
+  case $1 in
+    le) CERT_CA=letsencrypt; CERT_SCOPE=single; CERT_PUBLIC=1; CERT_CHALLENGE=http ;;
+    wildcard) CERT_CA=letsencrypt; CERT_SCOPE=wildcard; CERT_PUBLIC=1; CERT_CHALLENGE=dns ;;
+    multi) CERT_CA=letsencrypt; CERT_SCOPE=multi; CERT_PUBLIC=1; CERT_CHALLENGE=http ;;
+    zerossl) CERT_CA=zerossl; CERT_SCOPE=single; CERT_PUBLIC=1; CERT_CHALLENGE=http ;;
+    zerossl-wildcard) CERT_CA=zerossl; CERT_SCOPE=wildcard; CERT_PUBLIC=1; CERT_CHALLENGE=dns ;;
+    zerossl-multi) CERT_CA=zerossl; CERT_SCOPE=multi; CERT_PUBLIC=1; CERT_CHALLENGE=http ;;
+    cf-origin)
+      CERT_CA=cloudflare; CERT_PUBLIC=0; CERT_CHALLENGE=none
+      if [[ ${PLAN_NAMES:-} == *'*'* ]]; then CERT_SCOPE=wildcard
+      elif [[ ${PLAN_NAMES:-} == *,* ]]; then CERT_SCOPE=multi
+      else CERT_SCOPE=single; fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+cert_renew_unattended() {
+  [[ ${CERT_CA:-letsencrypt} == cloudflare ]] && return 1
+  [[ ${CERT_CHALLENGE:-http} == http ]] && return 0
+  [[ ${CERT_CHALLENGE:-} == dns && -s ${CERT_DNS_TOKEN:-} ]]
+}
+cert_drop_renew_job() {
+  if [[ ${INIT_SYS:-} == systemd ]] && have systemctl; then
+    systemctl disable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || true
+  fi
+  rm -f "$CERT_TIMER_UNIT" "$CERT_RENEW_UNIT" "$CERT_CRON"
+  sd_reload
+}
+cert_name_syntax() {
+  local d=${1,,}
+  d=${d%.}
+  if [[ $d == \*.* ]]; then cert_domain_syntax "${d#\*.}"; return; fi
+  cert_domain_syntax "$d"
+}
+cert_norm_names() {
+  local raw=$1 n out=""
+  local -a arr=()
+  raw=${raw// /}
+  raw=${raw,,}
+  raw=${raw//，/,}
+  IFS=',' read -ra arr <<< "$raw"
+  for n in "${arr[@]}"; do
+    n=${n%.}
+    [[ -n $n ]] || continue
+    cert_name_syntax "$n" || return 1
+    [[ ",${out}," == *",${n},"* ]] && continue
+    out+="${out:+,}${n}"
+  done
+  [[ -n $out ]] || return 1
+  printf '%s' "$out"
+}
+cert_ensure_apex_for_wild() {
+  local names=$1 n parent out
+  local -a arr=()
+  out=$names
+  IFS=',' read -ra arr <<< "$names"
+  for n in "${arr[@]}"; do
+    [[ $n == \*.* ]] || continue
+    parent=${n#\*.}
+    [[ ",${out}," == *",${parent},"* ]] && continue
+    out="${out},${parent}"
+  done
+  printf '%s' "$out"
+}
+cert_link_covered_by_names() {
+  local link=$1 names=$2 n parent left
+  local -a arr=()
+  [[ -n $link && $link != \*.* ]] || return 1
+  IFS=',' read -ra arr <<< "$names"
+  for n in "${arr[@]}"; do
+    [[ $n == "$link" ]] && return 0
+    if [[ $n == \*.* ]]; then
+      parent=${n#\*.}
+      [[ $link == *".${parent}" ]] || continue
+      left=${link%".${parent}"}
+      [[ -n $left && $left != '*' && $left != *.* ]] && return 0
+    fi
+  done
+  return 1
+}
+cert_names_json() {
+  local n out=""
+  local -a arr=()
+  IFS=',' read -ra arr <<< "${CERT_NAMES:-}"
+  for n in "${arr[@]}"; do
+    [[ -n $n ]] || continue
+    out+="${out:+,}\"${n}\""
+  done
+  printf '[%s]' "$out"
+}
+cert_write_secret() {
+  local path=$1 body=$2 old
+  mkdir -p "$(dirname "$path")"
+  chmod 755 "$CERT_BASE" 2>/dev/null || true
+  old=$(umask)
+  umask 077
+  printf '%s\n' "$body" >"${path}.new"
+  umask "$old"
+  chmod 600 "${path}.new"
+  mv -f "${path}.new" "$path"
+}
+cert_load_eab() {
+  [[ -s $CERT_ZEROSSL_EAB ]] || return 1
+  ZEROSSL_KID=$(sed -n 's/^kid=//p' "$CERT_ZEROSSL_EAB" | head -n1)
+  ZEROSSL_HMAC=$(sed -n 's/^hmac=//p' "$CERT_ZEROSSL_EAB" | head -n1)
+  [[ -n $ZEROSSL_KID && -n $ZEROSSL_HMAC ]]
+}
+cert_explain() {
+  case $1 in
+    dns_not_here)
+      cat >&2 <<'EOF'
+域名没有全部指向这台机器，HTTP-01 不会成功。
+Let's Encrypt / ZeroSSL 会从公网访问本机的 80 端口。A 和 AAAA 里只要有一条不是本机，验证就会失败。
+若开着橙色云朵，访问会先到 Cloudflare，而不是这台机器。申请和续期时请改成灰色云朵（仅 DNS）。
+等解析生效后再试。不要把 REALITY 用来伪装的网站填到这里。REALITY 本身不用改。
+EOF
+      ;;
+    txt_timeout|txt_missing)
+      cat >&2 <<'EOF'
+DNS-01 没有完成。通配符不能用 HTTP-01，只能靠 TXT 证明你能改这个域名的 DNS。
+请检查 _acme-challenge 这条 TXT：
+1. 类型是 TXT，云朵必须是灰色。橙色云朵会让 1.1.1.1 和 8.8.8.8 看不到它。
+2. 在 Cloudflare 里名称只填 _acme-challenge，不要写成 _acme-challenge.example.com.example.com。
+3. 内容不要自己再加一层引号。
+4. 通配符会同时要 *.域名 和根域名，这是两条内容不同的 TXT，都要留下，不要互相覆盖。
+5. 刚改完可能要等一两分钟。没有 API 令牌时，到期前要再添加一次；想自动续期就重新申请并加上 --cf-dns-token。
+REALITY 没有改动。
+EOF
+      ;;
+    dns_token)
+      cat >&2 <<'EOF'
+Cloudflare 没有接受这个 DNS 令牌。
+通配符要用的是 API 令牌，不是源站证书的 Origin CA Key。两把钥匙不能混用。
+创建令牌时权限选：Zone → DNS → 编辑，以及 Zone → Zone → 读取。区域选你的域名，或所有区域。
+令牌复制错一位、过期、或只给了读取权限，都会在这里失败。到 Cloudflare 控制台重新建一把，用 --cf-dns-token 传入。
+脚本不会把令牌写进 state.env。REALITY 没有改动。
+EOF
+      ;;
+    dns_zone)
+      cat >&2 <<'EOF'
+这个令牌能登录 Cloudflare，但找不到域名所在的区域。
+请先把域名添加到这个 Cloudflare 账号，并确认令牌的区域范围包含它。
+域名还在别的注册商、或令牌属于另一个账号时，TXT 加不上去。REALITY 没有改动。
+EOF
+      ;;
+    eab)
+      cat >&2 <<'EOF'
+ZeroSSL 没有接受 EAB 凭据。
+打开 https://app.zerossl.com/developer ，生成一对 EAB KID 和 HMAC Key。必须是同一对，不能把两个填反，也不能少一位。
+用 --zerossl-kid 和 --zerossl-hmac 一起传入。HMAC 里的 + / = 要原样保留。
+这和 Let's Encrypt 不一样：ZeroSSL 的 ACME 注册必须有这对钥匙。凭据放在 /etc/proxy-oneclick/zerossl.eab（权限 600），不写入 state.env。
+REALITY 没有改动。
+EOF
+      ;;
+    rate_zero)
+      cat >&2 <<'EOF'
+ZeroSSL 拒绝签发：这个域名最近申请次数太多。
+等限制过去，或换一个还没申请过的名字。这不是 REALITY 的问题，REALITY 不使用这张证书。
+EOF
+      ;;
+    multi_fail)
+      cat >&2 <<'EOF'
+多域名证书没有签发。名单里只要有一个名字失败，整张证书都不会下来。
+请逐个检查：每个名字的 A/AAAA 都指向本机，并且是灰色云朵。橙色云朵期间，验证请求打到 Cloudflare，80 端口对不上。
+不能在这张 HTTP-01 证书里写 *.example.com。通配符请改用 wildcard 或 zerossl-wildcard。
+REALITY 没有改动。
+EOF
+      ;;
+    origin_auth)
+      cat >&2 <<'EOF'
+Cloudflare 没有接受这把源站证书钥匙。
+要用的是 Origin CA Key：打开 https://dash.cloudflare.com/profile/api-tokens ，拉到页面最下面，复制 Origin CA Key。
+这不是普通 API 令牌，也不是用来添加 TXT 的 DNS 令牌。把 DNS 令牌填到 --cf-origin-key 会在这里失败。
+用 --cf-origin-key 传入。钥匙只保存在 /etc/proxy-oneclick/cf-origin.key（权限 600）。REALITY 没有改动。
+EOF
+      ;;
+    origin_host)
+      cat >&2 <<'EOF'
+Cloudflare 没有给这些主机名签发源站证书。
+每个名字都必须属于这个 Origin CA Key 所在账号里的某个区域，例如 example.com 或 *.example.com。
+域名还没加到 Cloudflare、写错了别的账号的域名、或钥匙属于另一个账号，都会失败。
+源站证书只有 Cloudflare 信任。不要拿它给 Hysteria2、TUIC、AnyTLS 或订阅。REALITY 没有改动。
+EOF
+      ;;
+    *)
+      cdn_explain cert_fail
+      ;;
+  esac
+}
+cert_print_tutorial() {
+  echo
+  ui_bar '═' 62
+  ui_center "证书：$(cert_kind_label)" 62
+  ui_bar '─' 62
+  case $(cert_kind_id) in
+    le)
+      cat <<EOF
+这张是 Let's Encrypt 单域名证书，也是脚本的默认种类。只包含 ${CERT_DOMAIN}。
+适合：订阅 HTTPS，以及 Hysteria2、TUIC、AnyTLS。客户端按正常证书校验，链接改用这个域名，不再使用 insecure 或 pin。
+不适合：不能签发 *.${CERT_DOMAIN}。HTTP-01 证明不了通配符。要通配符请改用 wildcard。
+
+申请前：
+1. ${CERT_DOMAIN} 的全部 A/AAAA 指向本机。
+2. 关掉橙色云朵，改成灰色（仅 DNS）。橙云时验证会打到 Cloudflare，本机 80 收不到。
+3. 云安全组放行 TCP 80。80 只在申请和续期时短暂占用，不提供订阅，也不跑代理。
+4. 不要占用 REALITY 的端口。REALITY 继续借用伪装站点 ${SNI:-（安装时选的站点）}，配置里不写这张证书。
+
+签好之后：Hysteria2 / TUIC / AnyTLS 出示这张证书。REALITY、XHTTP+REALITY、Trojan 不变。
+若另外打开了 CDN 上的 XHTTP+TLS 或 WebSocket+TLS，那两条也用这张证书。
+这个名字一旦开了橙色云朵，Hysteria2、TUIC、AnyTLS 和订阅就不能再靠它连接（Cloudflare 不转发 UDP，也不转发订阅端口）。那几条请改用服务器 IP，或另做一个灰色云朵的名字。脚本不会因此改掉 REALITY。
+续期由系统定时任务完成，大约 90 天一轮，到期前约 30 天自动续。续期同样需要 80 能从公网访问。
+继续即表示同意 Let's Encrypt 服务条款：https://letsencrypt.org/repository/
+EOF
+      ;;
+    zerossl)
+      cat <<EOF
+这张是 ZeroSSL 单域名证书，公开信任，作用和 Let's Encrypt 单域名一样，只是换了一家 CA。只包含 ${CERT_DOMAIN}。
+适合：订阅 HTTPS，以及 Hysteria2、TUIC、AnyTLS。不适合：不能签发通配符。
+
+和 Let's Encrypt 的差别：必须有一对 EAB 凭据。打开 https://app.zerossl.com/developer 生成 EAB KID 和 HMAC Key，用 --zerossl-kid 和 --zerossl-hmac 传入。KID 和 HMAC 必须是同一对。
+域名、灰色云朵、TCP 80 的要求和 Let's Encrypt 单域名相同。橙云期间不要申请。
+签好之后协议怎么变，也和 Let's Encrypt 单域名相同。REALITY 不变。
+建议加上 --cert-email。不填则不登记邮箱；若 ZeroSSL 拒绝注册，补上邮箱再试。
+EOF
+      ;;
+    wildcard|zerossl-wildcard)
+      cat <<EOF
+这张是通配符证书，名字是 ${CERT_NAMES}。
+星号只覆盖一级子域名，不覆盖 a.b.根域名。根域名会单独写上，所以根域名本身也能用。
+链接里的主机名是 ${CERT_DOMAIN}。
+
+为什么用 DNS-01：HTTP-01 不能证明你拥有星号开头的名字。不占用 80 端口。
+不适合拿来代替 REALITY。REALITY 仍然借用伪装站点，不读这张证书。
+
+DNS 要做的事：
+1. 域名放在 Cloudflare。
+2. 添加 TXT，名称是 _acme-challenge，云朵必须是灰色。橙色云朵会让公共 DNS 看不到 TXT。
+3. 通配符和根域名是两条内容不同的 TXT，都要留下，不要互相覆盖。名称不要写成带两层域名的样子。
+4. 有 API 令牌时，脚本自己添加。令牌权限：Zone → DNS → 编辑，以及 Zone → Zone → 读取。这不是 Origin CA Key。用 --cf-dns-token 传入。令牌只放在权限 600 的文件里，不进 state.env，但会出现在进程列表里。
+5. 没有令牌时，脚本把要添加的内容打在屏幕上，并等待 1.1.1.1 和 8.8.8.8 能查到。这种方式不能自动续期。
+
+签好之后：这是公开证书。Hysteria2 / TUIC / AnyTLS 改用它，订阅走 HTTPS。REALITY 不变。
+若 ${CERT_DOMAIN} 要开橙色云朵给 CDN，直连的 Hysteria2、TUIC、AnyTLS 和订阅不要再用这个名字，请改用服务器 IP，或用 --cert-link 指定一个仍是灰色云朵、且被这张通配符覆盖的子域名。
+EOF
+      if [[ $(cert_kind_id) == zerossl-wildcard ]]; then
+        echo "签发机构是 ZeroSSL，还需要 https://app.zerossl.com/developer 的 EAB KID 和 HMAC。公开信任，客户端不用改校验方式。"
+      else
+        echo "签发机构是 Let's Encrypt。继续即表示同意其服务条款：https://letsencrypt.org/repository/"
+      fi
+      ;;
+    multi|zerossl-multi)
+      cat <<EOF
+这张证书上有多个名字：${CERT_NAMES}。链接和订阅使用 ${CERT_DOMAIN}。
+适合：几个主机名共用一张公开证书，给订阅 HTTPS 以及 Hysteria2、TUIC、AnyTLS。
+不适合：不能写 *.域名。通配符请改用 wildcard。REALITY 不用这张证书。
+
+每个名字都要满足：
+1. A/AAAA 全部指向本机。有一个不对，整张证书都失败。
+2. 申请时是灰色云朵。橙色云朵会把验证请求带到 Cloudflare。
+3. 云安全组放行 TCP 80。不改 REALITY 的端口。
+
+签好之后协议变化与单域名公开证书相同。续期同样走 HTTP-01。
+EOF
+      if [[ $(cert_kind_id) == zerossl-multi ]]; then
+        echo "签发机构是 ZeroSSL，需要成对的 EAB KID 和 HMAC（https://app.zerossl.com/developer）。"
+      else
+        echo "签发机构是 Let's Encrypt。继续即表示同意其服务条款：https://letsencrypt.org/repository/"
+      fi
+      ;;
+    cf-origin)
+      cat <<EOF
+这是 Cloudflare 源站证书，名字是 ${CERT_NAMES}。CDN 链接使用 ${CERT_DOMAIN}。
+只有 Cloudflare 信任它。浏览器直接打开会报不安全。Hysteria2、TUIC、AnyTLS 的客户端会拒绝。订阅 HTTPS 也不能用它。
+只适合两条 CDN 线路：XHTTP+TLS 和 WebSocket+TLS，并且域名开着橙色云朵，加密模式选「完全（严格）」。
+不要用于 Hysteria2、TUIC、AnyTLS、订阅，也不要用于 REALITY。脚本不会把这张证书装进那三个协议，也不会打开订阅。它们继续用自签证书或服务器 IP。
+
+申请步骤：
+1. 域名已经在这个 Cloudflare 账号里。
+2. 打开 https://dash.cloudflare.com/profile/api-tokens ，拉到最下面，复制 Origin CA Key。
+3. 这不是普通 API 令牌，也不是添加 TXT 用的 DNS 令牌。用 --cf-origin-key 传入。
+4. 不需要开放 80，也不走 certbot。有效期大约 15 年，不会自动续期。要换种类，先关掉这张再申请另一种。
+5. 主机名必须属于你的区域。写了 *.根域名 时，脚本会把根域名一并放进证书。*.根域名 不覆盖二级名字，例如 a.b.根域名。
+
+签好之后：REALITY 的端口、密钥和伪装站点都不变。
+若 CDN 线路已经打开，会改用这张证书。还没打开的话，到协议开关里打开 XHTTP+TLS 或 WebSocket+TLS。不要把 REALITY 放进橙色云朵后面。
+EOF
+      ;;
+  esac
+  ui_bar '═' 62
+  echo
+}
+cert_need_domain_die() {
+  case ${PLAN_KIND:-le} in
+    wildcard|zerossl-wildcard)
+      die "通配符证书需要根域名。例如：--cert-kind ${PLAN_KIND} --cert-domain example.com（会申请 *.example.com 和 example.com）。HTTP-01 做不到通配符。REALITY 未改动。" ;;
+    multi|zerossl-multi)
+      die "多域名证书需要 --cert-names a.example.com,b.example.com。每个名字都要解析到本机。REALITY 未改动。" ;;
+    cf-origin)
+      die "Cloudflare 源站证书需要 --cert-domain 或 --cert-names，以及 --cf-origin-key。例如 --cert-kind cf-origin --cf-origin-key <钥匙> --cert-domain cdn.example.com。REALITY 未改动。" ;;
+    *)
+      die "申请证书需要 --cert-domain <域名>。REALITY 未改动。" ;;
+  esac
+}
+cert_require_eab() {
+  local kid="" hmac=""
+  if [[ -n ${OPT_ZEROSSL_KID:-} || -n ${OPT_ZEROSSL_HMAC:-} ]]; then
+    if [[ -z ${OPT_ZEROSSL_KID:-} || -z ${OPT_ZEROSSL_HMAC:-} ]]; then
+      cert_explain eab
+      die "ZeroSSL 的 EAB 要成对提供。REALITY 未改动。"
+    fi
+    cert_write_secret "$CERT_ZEROSSL_EAB" "kid=${OPT_ZEROSSL_KID}"$'\n'"hmac=${OPT_ZEROSSL_HMAC}"
+    return 0
+  fi
+  cert_load_eab && return 0
+  if (( OPT_AUTO )); then
+    cert_explain eab
+    die "自动申请 ZeroSSL 需要 --zerossl-kid 和 --zerossl-hmac。REALITY 未改动。"
+  fi
+  cert_explain eab
+  ask kid "ZeroSSL EAB KID" ""
+  ask hmac "ZeroSSL EAB HMAC Key" ""
+  if [[ -z $kid || -z $hmac ]]; then die "没有 EAB 凭据，已取消。REALITY 未改动。"; fi
+  cert_write_secret "$CERT_ZEROSSL_EAB" "kid=${kid}"$'\n'"hmac=${hmac}"
+}
+cert_require_dns_token() {
+  local tok=""
+  if [[ -n ${OPT_CF_DNS_TOKEN:-} ]]; then
+    cert_write_secret "$CERT_DNS_TOKEN" "$OPT_CF_DNS_TOKEN"
+    return 0
+  fi
+  if [[ -s $CERT_DNS_TOKEN ]]; then return 0; fi
+  if (( OPT_AUTO )); then
+    cert_explain dns_token
+    die "自动申请通配符需要 --cf-dns-token。没有令牌时无法自己添加 TXT。REALITY 未改动。"
+  fi
+  if confirm "是否已有 Cloudflare API 令牌，让脚本自动添加 TXT？选否会把记录内容打在屏幕上，等你手工添加。" y; then
+    ask tok "Cloudflare API 令牌（Zone.DNS 编辑 + Zone 读取，不是 Origin CA Key）" ""
+    if [[ -z $tok ]]; then die "没有令牌，已取消。REALITY 未改动。"; fi
+    cert_write_secret "$CERT_DNS_TOKEN" "$tok"
+  else
+    info "改为手工 TXT。记录必须是灰色云朵。这次不保存令牌，以后不能自动续期。"
+  fi
+}
+cert_require_origin_key() {
+  local k=""
+  if [[ -n ${OPT_CF_ORIGIN_KEY:-} ]]; then
+    cert_write_secret "$CERT_ORIGIN_KEY" "$OPT_CF_ORIGIN_KEY"
+    return 0
+  fi
+  if [[ -s $CERT_ORIGIN_KEY ]]; then return 0; fi
+  if (( OPT_AUTO )); then
+    cert_explain origin_auth
+    die "自动申请源站证书需要 --cf-origin-key。这是 Origin CA Key，不是 DNS 令牌。REALITY 未改动。"
+  fi
+  cert_explain origin_auth
+  ask k "Cloudflare Origin CA Key" ""
+  if [[ -z $k ]]; then die "没有 Origin CA Key，已取消。REALITY 未改动。"; fi
+  cert_write_secret "$CERT_ORIGIN_KEY" "$k"
+}
+cert_plan_single() {
+  local d=${OPT_CERT_DOMAIN:-} def=""
+  if [[ -z $d && -n ${OPT_CERT_NAMES:-} && ${OPT_CERT_NAMES} != *,* && ${OPT_CERT_NAMES} != \*.* ]]; then d=$OPT_CERT_NAMES; fi
+  if [[ -z $d && -n ${CERT_DOMAIN:-} ]]; then def=$CERT_DOMAIN; fi
+  while :; do
+    if [[ -z $d ]]; then
+      (( OPT_AUTO )) && cert_need_domain_die
+      ask d "域名（已解析到本机，例如 example.com）" "$def"
+      d=${d,,}; d=${d%.}; d=${d// /}
+    fi
+    if ! cert_domain_syntax "$d"; then
+      warn "域名无效: ${d:-空}。需要像 example.com 这样的域名，不能是 IP。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_DOMAIN:-} ]]; } && die "域名无效，已取消申请证书。REALITY 未改动。"
+      d=""; OPT_CERT_DOMAIN=""; continue
+    fi
+    [[ -n ${PUBLIC_IP4:-} || -n ${PUBLIC_IP6:-} ]] || detect_ip
+    if cert_domain_points_here "$d"; then break; fi
+    cert_explain dns_not_here
+    { (( OPT_AUTO )) || [[ -n ${OPT_CERT_DOMAIN:-} ]]; } && die "域名 ${d} 没有全部解析到本机，已取消申请证书。REALITY 未改动。"
+    confirm "重新填写域名？" y || die "已取消申请证书。REALITY 未改动。"
+    d=""; OPT_CERT_DOMAIN=""
+  done
+  PLAN_DOMAIN=$d
+  PLAN_NAMES=$d
+}
+cert_plan_wildcard() {
+  local apex=${OPT_CERT_DOMAIN:-} link=${OPT_CERT_LINK:-} def=""
+  if [[ -z $apex && -n ${CERT_DOMAIN:-} && ${CERT_DOMAIN} != \*.* ]]; then def=$CERT_DOMAIN; fi
+  while :; do
+    if [[ -z $apex ]]; then
+      (( OPT_AUTO )) && cert_need_domain_die
+      ask apex "根域名（例如 example.com，将申请 *.example.com 和 example.com）" "$def"
+      apex=${apex,,}; apex=${apex%.}; apex=${apex// /}
+      apex=${apex#\*.}
+    fi
+    if ! cert_domain_syntax "$apex"; then
+      warn "根域名无效: ${apex:-空}。请写 example.com，不要写成 *.example.com。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_DOMAIN:-} ]]; } && die "根域名无效。REALITY 未改动。"
+      apex=""; OPT_CERT_DOMAIN=""; continue
+    fi
+    break
+  done
+  PLAN_NAMES="*.${apex},${apex}"
+  if [[ -z $link ]]; then link=$apex; else link=${link,,}; link=${link%.}; fi
+  if ! cert_link_covered_by_names "$link" "$PLAN_NAMES"; then
+    die "链接用的名字 ${link} 不在这张通配符证书里。*.${apex} 只覆盖一级子域名。根域名已经包含在内。请改 --cert-link，或留空用 ${apex}。REALITY 未改动。"
+  fi
+  PLAN_DOMAIN=$link
+  info "通配符证书包含 ${PLAN_NAMES}。客户端链接使用 ${PLAN_DOMAIN}。DNS-01 不要求 A 记录已经指向本机，也不占用 80。"
+}
+cert_plan_multi() {
+  local raw=${OPT_CERT_NAMES:-} names="" n link="" failed=0
+  local -a arr=()
+  while :; do
+    if [[ -z $raw ]]; then
+      (( OPT_AUTO )) && cert_need_domain_die
+      ask raw "多个域名，逗号分隔（每个都必须解析到本机）" "${CERT_NAMES:-}"
+    fi
+    if ! names=$(cert_norm_names "$raw"); then
+      warn "域名列表无效。例如 a.example.com,b.example.com。不能写 IP，也不能写 *.example.com。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_NAMES:-} ]]; } && die "多域名列表无效。REALITY 未改动。"
+      raw=""; OPT_CERT_NAMES=""; continue
+    fi
+    if [[ $names == *'*'* ]]; then
+      die "多域名的 HTTP-01 不能包含通配符。请改用 --cert-kind wildcard。REALITY 未改动。"
+    fi
+    if [[ $names != *,* ]]; then
+      warn "多域名至少要两个名字。只有一个时用单域名即可。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_NAMES:-} ]]; } && die "多域名至少两个名字。REALITY 未改动。"
+      raw=""; OPT_CERT_NAMES=""; continue
+    fi
+    break
+  done
+  [[ -n ${PUBLIC_IP4:-} || -n ${PUBLIC_IP6:-} ]] || detect_ip
+  IFS=',' read -ra arr <<< "$names"
+  for n in "${arr[@]}"; do
+    cert_domain_points_here "$n" || failed=1
+  done
+  if (( failed )); then
+    cert_explain dns_not_here
+    die "上面有域名没有全部解析到本机，多域名证书没有申请。REALITY 未改动。"
+  fi
+  link=${OPT_CERT_LINK:-}
+  [[ -n $link ]] || link=${OPT_CERT_DOMAIN:-}
+  [[ -n $link ]] || link=${names%%,*}
+  link=${link,,}; link=${link%.}
+  if [[ ",${names}," != *",${link},"* ]]; then
+    die "链接主机名 ${link} 不在名单里。它必须是证书上的其中一个名字。REALITY 未改动。"
+  fi
+  PLAN_NAMES=$names
+  PLAN_DOMAIN=$link
+}
+cert_plan_origin() {
+  local raw=${OPT_CERT_NAMES:-} names="" link="" n
+  local -a arr=()
+  if [[ -z $raw && -n ${OPT_CERT_DOMAIN:-} ]]; then raw=$OPT_CERT_DOMAIN; fi
+  while :; do
+    if [[ -z $raw ]]; then
+      (( OPT_AUTO )) && cert_need_domain_die
+      ask raw "源站证书上的名字（cdn.example.com，或 *.example.com,example.com）" "${CERT_NAMES:-${CERT_DOMAIN:-}}"
+    fi
+    if ! names=$(cert_norm_names "$raw"); then
+      warn "名字无效。可以写 cdn.example.com，或 *.example.com。"
+      { (( OPT_AUTO )) || [[ -n ${OPT_CERT_NAMES:-} || -n ${OPT_CERT_DOMAIN:-} ]]; } && die "源站证书的域名无效。REALITY 未改动。"
+      raw=""; continue
+    fi
+    break
+  done
+  names=$(cert_ensure_apex_for_wild "$names")
+  link=${OPT_CERT_LINK:-}
+  if [[ -z $link && -n ${OPT_CERT_DOMAIN:-} && ${OPT_CERT_DOMAIN} != \*.* ]]; then link=$OPT_CERT_DOMAIN; fi
+  if [[ -z $link ]]; then
+    IFS=',' read -ra arr <<< "$names"
+    for n in "${arr[@]}"; do
+      [[ $n == \*.* ]] && continue
+      link=$n
+      break
+    done
+  fi
+  link=${link,,}; link=${link%.}
+  if [[ -z $link || $link == \*.* ]]; then
+    die "源站证书需要一个具体主机名给 CDN 链接使用。加上 --cert-link cdn.example.com，或把根域名也写上。REALITY 未改动。"
+  fi
+  if ! cert_link_covered_by_names "$link" "$names"; then
+    die "链接主机名 ${link} 不在源站证书的名字里。REALITY 未改动。"
+  fi
+  PLAN_NAMES=$names
+  PLAN_DOMAIN=$link
+  info "源站证书只给 CDN。Hysteria2 / TUIC / AnyTLS / 订阅不会使用它。不检查这个名字是否解析到本机（橙色云朵时解析到的是 Cloudflare）。"
+}
+cert_plan_existing() {
+  # 重装或再次进入申请、但没有指定新种类时，沿用已经保存的种类和名字。
+  local kind n failed=0
+  local -a arr=()
+  kind=$(cert_kind_id)
+  PLAN_KIND=$kind
+  PLAN_DOMAIN=$CERT_DOMAIN
+  if [[ -n ${CERT_NAMES:-} ]]; then PLAN_NAMES=$CERT_NAMES
+  elif [[ ${CERT_SCOPE:-single} == wildcard ]]; then PLAN_NAMES="*.${CERT_DOMAIN},${CERT_DOMAIN}"
+  else PLAN_NAMES=$CERT_DOMAIN; fi
+  if cert_current_ok; then return 0; fi
+  case $kind in
+    le|zerossl|multi|zerossl-multi)
+      [[ -n ${PUBLIC_IP4:-} || -n ${PUBLIC_IP6:-} ]] || detect_ip
+      IFS=',' read -ra arr <<< "$PLAN_NAMES"
+      for n in "${arr[@]}"; do cert_domain_points_here "$n" || failed=1; done
+      if (( failed )); then
+        cert_explain dns_not_here
+        die "原来的证书需要重新申请，但有域名没有全部解析到本机。REALITY 未改动。"
+      fi
+      ;;
+  esac
+  case $kind in
+    zerossl|zerossl-wildcard|zerossl-multi) cert_require_eab ;;
+  esac
+  case $kind in
+    wildcard|zerossl-wildcard) cert_require_dns_token ;;
+  esac
+  if [[ $kind == cf-origin ]]; then cert_require_origin_key; fi
+}
+cert_plan_request() {
+  local kind=""
+  PLAN_KIND="" PLAN_DOMAIN="" PLAN_NAMES=""
+  if [[ -n ${OPT_CF_ORIGIN_KEY:-} && -z ${OPT_CERT_KIND:-} ]]; then OPT_CERT_KIND=cf-origin; fi
+  if [[ -n ${OPT_ZEROSSL_KID:-}${OPT_ZEROSSL_HMAC:-} && -z ${OPT_CERT_KIND:-} ]]; then OPT_CERT_KIND=zerossl; fi
+  if [[ -z ${OPT_CERT_KIND:-} && -z ${OPT_CERT_DOMAIN:-} && -z ${OPT_CERT_NAMES:-} && -z ${OPT_CERT_LINK:-} ]] \
+     && (( ${CERT_ON:-0} == 1 )) && [[ -n ${CERT_DOMAIN:-} ]]; then
+    cert_plan_existing
+    return 0
+  fi
+  if [[ -n ${OPT_CERT_KIND:-} ]]; then
+    kind=$(cert_normalize_kind "$OPT_CERT_KIND") || die "不认识的证书种类: ${OPT_CERT_KIND}。可选 le、wildcard、multi、zerossl、zerossl-wildcard、zerossl-multi、cf-origin。"
+  elif [[ ${OPT_CERT_NAMES:-} == *,* ]]; then kind=multi
+  else kind=le; fi
+  PLAN_KIND=$kind
+  if [[ -n ${OPT_CERT_EMAIL:-} ]]; then CERT_EMAIL=$OPT_CERT_EMAIL; fi
+  if [[ -n ${CERT_EMAIL:-} ]] && ! cert_email_syntax "$CERT_EMAIL"; then
+    die "邮箱格式无效: ${CERT_EMAIL}"
+  fi
+  case $kind in
+    le|zerossl) cert_plan_single ;;
+    wildcard|zerossl-wildcard) cert_plan_wildcard ;;
+    multi|zerossl-multi) cert_plan_multi ;;
+    cf-origin) cert_plan_origin ;;
+  esac
+  case $kind in
+    zerossl|zerossl-wildcard|zerossl-multi) cert_require_eab ;;
+  esac
+  case $kind in
+    wildcard|zerossl-wildcard) cert_require_dns_token ;;
+  esac
+  if [[ $kind == cf-origin ]]; then cert_require_origin_key; fi
+}
+cert_switch_needed() {
+  (( ${CERT_ON:-0} == 1 )) || return 1
+  [[ -s $CERT_FULLCHAIN || -d /etc/letsencrypt/live/${CERT_NAME} ]] || return 1
+  [[ $(cert_kind_id) != "$PLAN_KIND" ]]
+}
+cert_retire_for_switch() {
+  info "正在关闭当前证书，随后申请另一种。REALITY 的端口、密钥和伪装站点都不变。"
+  svc_disable_stop proxy-oneclick-sub || true
+  cert_drop_renew_job
+  if have certbot; then certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true; fi
+  rm -f "$CERT_FULLCHAIN" "$CERT_PRIVKEY" "$SUB_CONF" "$SUB_BODY" "$SUB_CLASH" "$XRAY_CERT_FULL" "$XRAY_CERT_KEY"
+  CERT_ON=0
+  if (( HY2_ENABLED )) && [[ -x $HY_BIN ]]; then
+    gen_hy2_cert
+    write_hy2_config
+    restart_hy2
+  fi
+  if sb_needed && [[ -x $SB_BIN ]]; then
+    write_singbox_config
+    restart_singbox
+  fi
+  if cdn_wanted && [[ -x $XRAY_BIN ]] && xray_inbound_needed; then
+    write_xray_config
+    restart_xray
+  fi
+  if (( ! NAT_MODE && ${FW_ENABLED:-0} == 1 )); then apply_firewall; fi
+  save_state
+  ok "旧证书已关闭。CDN 线路的开关还留着，但在新证书签下来之前不会监听。REALITY 仍在原来的端口上。"
+}
+cert_ensure_dig() {
+  have dig && return 0
+  if [[ ${PKG:-} == apk ]]; then pkg_try bind-tools
+  elif [[ ${PKG:-} == apt ]]; then
+    pkg_try dnsutils
+    have dig || pkg_try bind9-dnsutils
+  else
+    pkg_try bind-utils
+  fi
+  have dig || die "需要 dig 来确认 TXT。Debian/Ubuntu 安装 dnsutils 或 bind9-dnsutils，RHEL 安装 bind-utils，Alpine 安装 bind-tools。装好后重试。REALITY 未改动。"
+}
+write_dns_hooks() {
+  mkdir -p "$CERT_LIB" "$CERT_TXT_DIR"
+  chmod 700 "$CERT_TXT_DIR" 2>/dev/null || true
+  cat >"$CERT_DNS_AUTH" <<'EOF'
+#!/bin/sh
+# 由 proxy-oneclick 生成。certbot DNS-01 时调用。不打印令牌。
+set -u
+token_file="__TOKEN__"
+txt_dir="__TXTDIR__"
+dom="${CERTBOT_DOMAIN:-}"
+val="${CERTBOT_VALIDATION:-}"
+say() { printf '%s\n' "$1" >&2; }
+if [ -z "$dom" ] || [ -z "$val" ]; then
+  say "acme-dns-auth-failed 缺少域名或校验值。"
+  exit 1
+fi
+name="_acme-challenge.${dom}"
+mkdir -p "$txt_dir"
+chmod 700 "$txt_dir" 2>/dev/null || true
+poll_txt() {
+  if ! command -v dig >/dev/null 2>&1; then
+    say "acme-txt-timeout 本机没有 dig，无法向 1.1.1.1 和 8.8.8.8 确认 TXT。请安装 dnsutils、bind9-dnsutils 或 bind-utils 后重试。"
+    exit 1
+  fi
+  i=0
+  while [ "$i" -lt 30 ]; do
+    got=$( { dig +short TXT "$name" @1.1.1.1; dig +short TXT "$name" @8.8.8.8; } 2>/dev/null || true)
+    if printf '%s\n' "$got" | grep -F -q -- "$val"; then sleep 15; return 0; fi
+    i=$((i + 1))
+    sleep 10
+  done
+  say "acme-txt-timeout"
+  say "公共 DNS 大约五分钟内没有看到 ${name} 的 TXT。请确认为灰色云朵，名称只填 _acme-challenge，内容不要额外加引号。通配符的两条 TXT 都要留下。"
+  say "$val"
+  return 1
+}
+if [ -s "$token_file" ]; then
+  command -v curl >/dev/null 2>&1 || { say "acme-dns-auth-failed 没有 curl。"; exit 1; }
+  command -v jq >/dev/null 2>&1 || { say "acme-dns-auth-failed 没有 jq。"; exit 1; }
+  token=$(cat "$token_file")
+  token=$(printf '%s' "$token" | tr -d '\r\n ')
+  host=$dom
+  zone=""
+  while :; do
+    resp=$(curl -sS -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" "https://api.cloudflare.com/client/v4/zones?name=${host}" || true)
+    ok=$(printf '%s' "$resp" | jq -r '.success // false' 2>/dev/null || echo false)
+    if [ "$ok" != "true" ]; then
+      say "acme-dns-auth-failed"
+      say "Cloudflare 拒绝了这个 API 令牌。请使用 Zone.DNS 编辑和 Zone 读取权限的令牌，不要使用 Origin CA Key。"
+      printf '%s' "$resp" | jq -r '.errors[]? | "\(.code) \(.message)"' >&2 || true
+      exit 1
+    fi
+    zone=$(printf '%s' "$resp" | jq -r '.result[0].id // empty')
+    if [ -n "$zone" ]; then break; fi
+    case "$host" in
+      *.*) host=${host#*.} ;;
+      *) break ;;
+    esac
+  done
+  if [ -z "$zone" ]; then
+    say "acme-dns-zone-missing"
+    say "找不到 ${dom} 所在的 Cloudflare 区域。请先把域名加到这个账号，并让令牌能看这个区域。"
+    exit 1
+  fi
+  body=$(jq -n --arg name "$name" --arg content "$val" '{type:"TXT",name:$name,content:$content,ttl:60}')
+  resp=$(curl -sS -X POST -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" --data "$body" "https://api.cloudflare.com/client/v4/zones/${zone}/dns_records" || true)
+  id=$(printf '%s' "$resp" | jq -r '.result.id // empty')
+  if [ -z "$id" ]; then
+    say "acme-dns-auth-failed"
+    say "TXT 没有添加成功。若是认证错误，就是令牌不对，或误用了 Origin CA Key。"
+    printf '%s' "$resp" | jq -r '.errors[]? | "\(.code) \(.message)"' >&2 || true
+    exit 1
+  fi
+  hash=$(printf '%s' "$val" | sha256sum | awk '{print $1}')
+  printf '%s\n' "$id" > "${txt_dir}/${hash}"
+  printf '%s\n' "$zone" > "${txt_dir}/${hash}.zone"
+  chmod 600 "${txt_dir}/${hash}" "${txt_dir}/${hash}.zone" 2>/dev/null || true
+  say "已添加 TXT：${name} 。等待公共 DNS。通配符的另一条会再添加一次，不要删掉这一条。"
+  poll_txt
+else
+  say "请手工添加 DNS TXT（灰色云朵，仅 DNS）："
+  say "  名称: _acme-challenge"
+  say "  完整名字: ${name}"
+  say "  内容: ${val}"
+  say "通配符会有两条不同内容，都要保留。添加后保持这个窗口，脚本会自己复查。"
+  poll_txt
+fi
+EOF
+  cat >"$CERT_DNS_CLEAN" <<'EOF'
+#!/bin/sh
+set -u
+token_file="__TOKEN__"
+txt_dir="__TXTDIR__"
+val="${CERTBOT_VALIDATION:-}"
+[ -n "$val" ] || exit 0
+hash=$(printf '%s' "$val" | sha256sum | awk '{print $1}')
+id=""
+zone=""
+[ -f "${txt_dir}/${hash}" ] && id=$(cat "${txt_dir}/${hash}")
+[ -f "${txt_dir}/${hash}.zone" ] && zone=$(cat "${txt_dir}/${hash}.zone")
+if [ -n "$id" ] && [ -n "$zone" ] && [ -s "$token_file" ] && command -v curl >/dev/null 2>&1; then
+  token=$(cat "$token_file")
+  token=$(printf '%s' "$token" | tr -d '\r\n ')
+  curl -sS -X DELETE -H "Authorization: Bearer ${token}" "https://api.cloudflare.com/client/v4/zones/${zone}/dns_records/${id}" >/dev/null 2>&1 || true
+fi
+rm -f "${txt_dir}/${hash}" "${txt_dir}/${hash}.zone"
+exit 0
+EOF
+  sed -i "s|__TOKEN__|${CERT_DNS_TOKEN}|g; s|__TXTDIR__|${CERT_TXT_DIR}|g" "$CERT_DNS_AUTH" "$CERT_DNS_CLEAN"
+  chmod 755 "$CERT_DNS_AUTH" "$CERT_DNS_CLEAN"
+}
+cert_origin_root_pem() {
+  cat <<'PEM'
+-----BEGIN CERTIFICATE-----
+MIICiTCCAi6gAwIBAgIUXZP3MWb8MKwBE1Qbawsp1sfA/Y4wCgYIKoZIzj0EAwIw
+gY8xCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1T
+YW4gRnJhbmNpc2NvMRkwFwYDVQQKExBDbG91ZEZsYXJlLCBJbmMuMTgwNgYDVQQL
+Ey9DbG91ZEZsYXJlIE9yaWdpbiBTU0wgRUNDIENlcnRpZmljYXRlIEF1dGhvcml0
+eTAeFw0xOTA4MjMyMTA4MDBaFw0yOTA4MTUxNzAwMDBaMIGPMQswCQYDVQQGEwJV
+UzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZyYW5jaXNjbzEZ
+MBcGA1UEChMQQ2xvdWRGbGFyZSwgSW5jLjE4MDYGA1UECxMvQ2xvdWRGbGFyZSBP
+cmlnaW4gU1NMIEVDQyBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAASR+sGALuaGshnUbcxKry+0LEXZ4NY6JUAtSeA6g87K3jaA
+xpIg9G50PokpfWkhbarLfpcZu0UAoYy2su0EhN7wo2YwZDAOBgNVHQ8BAf8EBAMC
+AQYwEgYDVR0TAQH/BAgwBgEB/wIBAjAdBgNVHQ4EFgQUhTBdOypw1O3VkmcH/es5
+tBoOOKcwHwYDVR0jBBgwFoAUhTBdOypw1O3VkmcH/es5tBoOOKcwCgYIKoZIzj0E
+AwIDSQAwRgIhAKilfntP2ILGZjwajktkBtXE1pB4Y/fjAfLkIRUzrI15AiEA5UCL
+XYZZ9m2c3fKwIenMMojL1eqydsgqj/wK4p5kagQ=
+-----END CERTIFICATE-----
+PEM
+}
+cert_issue_origin() {
+  local key csr body resp ok cert san n okey elow
+  local -a arr=()
+  mktmp
+  key="${TMP_DIR}/origin.key"
+  csr="${TMP_DIR}/origin.csr"
+  san=""
+  IFS=',' read -ra arr <<< "$CERT_NAMES"
+  for n in "${arr[@]}"; do
+    [[ -n $n ]] || continue
+    san+="${san:+,}DNS:${n}"
+  done
+  if ! openssl ecparam -name prime256v1 -genkey -noout -out "$key" 2>"${TMP_DIR}/origin.err"; then
+    die "没能在本机生成源站证书的私钥。REALITY 未改动。"
+  fi
+  if ! openssl req -new -key "$key" -subj "/CN=${CERT_DOMAIN}" -addext "subjectAltName=${san}" -out "$csr" 2>>"${TMP_DIR}/origin.err"; then
+    die "没能生成证书请求。REALITY 未改动。"
+  fi
+  have curl || die "需要 curl 才能向 Cloudflare 申请源站证书。REALITY 未改动。"
+  have jq || die "需要 jq 才能读取 Cloudflare 的返回。REALITY 未改动。"
+  okey=$(<"$CERT_ORIGIN_KEY")
+  okey=${okey//$'\r'/}
+  okey=${okey//$'\n'/}
+  okey=${okey// /}
+  body=$(jq -n --rawfile csr "$csr" --argjson hosts "$(cert_names_json)" \
+    '{hostnames:$hosts, requested_validity:5475, request_type:"origin-ecc", csr:$csr}')
+  resp=$(curl -sS -X POST "$CF_ORIGIN_API" \
+    -H "Content-Type: application/json" \
+    -H "X-Auth-User-Service-Key: ${okey}" \
+    --data "$body" 2>"${TMP_DIR}/origin.err" || true)
+  printf '%s\n' "$resp" >"${TMP_DIR}/origin.json"
+  ok=$(jq -r '.success // false' <<<"$resp" 2>/dev/null || echo false)
+  if [[ $ok != true ]]; then
+    jq -r '.errors[]? | "\(.code) \(.message)"' <<<"$resp" >&2 || true
+    elow=$(tr '[:upper:]' '[:lower:]' <<<"$resp" 2>/dev/null || true)
+    if [[ $elow == *authentication* || $elow == *'10000'* || $elow == *unauthorized* || $elow == *'invalid request headers'* || $elow == *'9109'* || -z $resp ]]; then
+      printf '\ncf-origin-auth\n' >>"${TMP_DIR}/origin.json"
+      cert_explain origin_auth
+    else
+      printf '\ncf-origin-host\n' >>"${TMP_DIR}/origin.json"
+      cert_explain origin_host
+    fi
+    die "Cloudflare 没有签发源站证书。REALITY 未改动。"
+  fi
+  cert=$(jq -r '.result.certificate // empty' <<<"$resp")
+  if [[ $cert != *'BEGIN CERTIFICATE'* ]]; then
+    cert_explain origin_host
+    die "Cloudflare 的返回里没有证书。REALITY 未改动。"
+  fi
+  cert_grant_readers
+  mkdir -p "$CERT_DIR"
+  {
+    printf '%s\n' "$cert"
+    cert_origin_root_pem
+  } >"${CERT_FULLCHAIN}.new"
+  cp -f "$key" "${CERT_PRIVKEY}.new"
+  chown "root:${CERT_GROUP}" "${CERT_FULLCHAIN}.new" "${CERT_PRIVKEY}.new"
+  chmod 644 "${CERT_FULLCHAIN}.new"
+  chmod 640 "${CERT_PRIVKEY}.new"
+  mv -f "${CERT_FULLCHAIN}.new" "$CERT_FULLCHAIN"
+  mv -f "${CERT_PRIVKEY}.new" "$CERT_PRIVKEY"
+  chmod 755 "$CERT_BASE" 2>/dev/null || true
+  chmod 750 "$CERT_DIR"
+  chown "root:${CERT_GROUP}" "$CERT_DIR"
+  if ! cert_san_ok "$CERT_FULLCHAIN"; then
+    cert_explain origin_host
+    die "签下来的源站证书里没有 ${CERT_DOMAIN}。REALITY 未改动。"
+  fi
+  ok "Cloudflare 源站证书已保存。只有 Cloudflare 信任它。"
+}
+cert_issue_flow() {
+  step "申请证书"
+  local old_label switching=0
+  local keep_ca keep_scope keep_pub keep_ch keep_names keep_dom
+  old_label=$(cert_kind_label)
+  cert_plan_request
+  cert_switch_needed && switching=1
+  cert_kind_apply "$PLAN_KIND"
+  CERT_NAMES=$PLAN_NAMES
+  CERT_DOMAIN=$PLAN_DOMAIN
+  cert_normalize_domain
+  keep_ca=$CERT_CA
+  keep_scope=$CERT_SCOPE
+  keep_pub=$CERT_PUBLIC
+  keep_ch=$CERT_CHALLENGE
+  keep_names=$CERT_NAMES
+  keep_dom=$CERT_DOMAIN
+  if (( ! switching )) && cert_current_ok; then
+    info "证书仍有效（${CERT_DOMAIN}，到期 $(cert_expiry_text)），跳过重新申请。"
+    if [[ $CERT_CA != cloudflare && -n ${OPT_SUB_PORT:-} ]]; then choose_sub_port; fi
+  else
+    cert_print_tutorial
+    if (( ! OPT_AUTO )); then
+      if (( switching )); then
+        confirm "将关闭现在的${old_label}，再申请$(cert_kind_label)。Hysteria2 / TUIC / AnyTLS 会先改回自签。已经打开的 CDN 线路会先停掉监听，新证书签好后再挂上，开关本身保留。请先按上面的说明准备好。REALITY 不变。输入 y 继续。" n \
+          || die "已取消。原来的证书还在。REALITY 未改动。"
+      else
+        confirm "请先按上面的说明准备好，再继续申请。选 n 取消。REALITY 不变。" y \
+          || die "已取消。REALITY 未改动。"
+      fi
+    elif (( switching )); then
+      info "证书种类从 ${old_label} 换成 $(cert_kind_label)。先关闭旧证书再申请。REALITY 不变。"
+    fi
+    if (( switching )); then cert_retire_for_switch; fi
+    CERT_CA=$keep_ca
+    CERT_SCOPE=$keep_scope
+    CERT_PUBLIC=$keep_pub
+    CERT_CHALLENGE=$keep_ch
+    CERT_NAMES=$keep_names
+    CERT_DOMAIN=$keep_dom
+    if [[ $CERT_CA != cloudflare ]]; then
+      choose_sub_port
+      [[ -n $SUB_TOKEN ]] || SUB_TOKEN=$(rand_hex 16)
+    fi
+    if [[ $CERT_CA == cloudflare ]]; then
+      cert_issue_origin
+    else
+      install_certbot_pkg
+      write_cert_helpers
+      if [[ $CERT_CHALLENGE == http ]]; then
+        cert_allow_80_now
+        if port_in_use tcp 80; then
+          cdn_explain port80 "$(port_owner tcp 80)"
+          die "80 端口被占用，证书没有申请。REALITY 的端口没有改。"
+        fi
+      else
+        cert_ensure_dig
+        write_dns_hooks
+      fi
+      certbot_issue
+    fi
+  fi
+  cert_install_material
+  CERT_ON=1
+  if [[ $CERT_CA == cloudflare ]]; then
+    svc_disable_stop proxy-oneclick-sub || true
+    cert_drop_renew_job
+    if ! cdn_wanted; then
+      info "源站证书还不会被任何协议使用。请到协议开关打开 XHTTP+TLS 或 WebSocket+TLS。不要把它用于 Hysteria2、TUIC、AnyTLS 或订阅。"
+    fi
+  else
+    cert_write_sub_conf
+    cert_write_bodies
+  fi
+  save_state
+  ok "证书已就绪：$(cert_kind_label) ${CERT_DOMAIN}"
+}
+cert_refresh_cdn() {
+  cdn_wanted || return 0
+  tls_for_cdn || return 0
+  cdn_install_xray_certs || warn "证书已就绪，但没能交给 Xray。REALITY 没有改用这张证书。"
+  cdn_sync_flag
+  if [[ -d $CERT_LIB || -f $CERT_HOOK ]]; then write_cert_hook; fi
+  if [[ -x $XRAY_BIN ]] && xray_inbound_needed; then
+    write_xray_config
+    restart_xray
+  fi
+}
+cert_after_issue() {
+  cert_rewire_protocols
+  if (( FW_ENABLED )); then apply_firewall; fi
+  cert_start_sub
+  cert_refresh_cdn
+  save_state
+  if (( INSTALLED )); then save_info || true; show_info; fi
+}
+
+cert_rewire_protocols() {
+  # 只改能出示这张证书的协议。不调用 write_xray_config，REALITY 继续借用伪装站点。
+  if (( HY2_ENABLED )) && [[ -x $HY_BIN ]]; then
+    write_hy2_config
+    restart_hy2
+  fi
+  if sb_needed && [[ -x $SB_BIN ]]; then
+    write_singbox_config
+    restart_singbox
+  fi
+}
+cert_turn_off() {
+  local quiet=${1-} had_cdn=0
+  if cdn_wanted; then
+    had_cdn=1
+    XHTTP_TLS_ENABLED=0
+    WS_ENABLED=0
+  fi
+  rm -f "$CDN_FLAG" "$XRAY_CERT_FULL" "$XRAY_CERT_KEY"
+  CERT_ON=0
+  CERT_CA=letsencrypt
+  CERT_SCOPE=single
+  CERT_NAMES=""
+  CERT_PUBLIC=1
+  CERT_CHALLENGE=http
+  svc_disable_stop proxy-oneclick-sub || true
+  if [[ ${INIT_SYS:-} == systemd ]] && have systemctl; then
+    systemctl disable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || true
+  fi
+  rm -f "$SUB_UNIT" "$SUB_RC" "$CERT_TIMER_UNIT" "$CERT_RENEW_UNIT" "$CERT_CRON"
+  sd_reload
+  if have certbot; then certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true; fi
+  rm -rf "$CERT_DIR" "$CERT_LIB"
+  if (( HY2_ENABLED )) && [[ -x $HY_BIN ]]; then
+    gen_hy2_cert
+    write_hy2_config
+    restart_hy2
+  fi
+  if sb_needed && [[ -x $SB_BIN ]]; then
+    write_singbox_config
+    restart_singbox
+  fi
+  if (( had_cdn )) && [[ -x $XRAY_BIN ]]; then
+    if xray_inbound_needed; then write_xray_config; restart_xray
+    else svc_disable_stop xray; fi
+  fi
+  if (( ! NAT_MODE && ${FW_ENABLED:-0} == 1 )); then apply_firewall; fi
+  save_state
+  if (( INSTALLED )); then save_info || true; fi
+  if [[ $quiet != quiet ]]; then
+    if (( had_cdn )); then
+      ok "已关闭证书。CDN 上的 XHTTP / WebSocket 已停止（不能改用自签证书）。Hysteria2 / TUIC / AnyTLS 改回自签。REALITY 未改动。"
+    else
+      ok "已关闭证书。Hysteria2 / TUIC / AnyTLS 改回自签证书。订阅已停止。REALITY 未改动。"
+    fi
+  fi
+}
+cert_remove_files() {
+  local had=0
+  [[ -d $CERT_DIR || -d $CERT_LIB || -f $SUB_UNIT || -f $SUB_RC || -f $CERT_TIMER_UNIT || -d /etc/letsencrypt/live/${CERT_NAME} ]] && had=1
+  svc_disable_stop proxy-oneclick-sub || true
+  if have systemctl; then systemctl disable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || true; fi
+  rm -f "$SUB_UNIT" "$SUB_RC" "$CERT_TIMER_UNIT" "$CERT_RENEW_UNIT" "$CERT_CRON"
+  sd_reload
+  if have certbot; then certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true; fi
+  rm -f "$CDN_FLAG" "$XRAY_CERT_FULL" "$XRAY_CERT_KEY"
+  rm -f "$CERT_DNS_TOKEN" "$CERT_ZEROSSL_EAB" "$CERT_ORIGIN_KEY"
+  rm -rf "$CERT_DIR" "$CERT_LIB" "$CERT_TXT_DIR" /var/log/proxy-oneclick
+  if id "$SUB_USER" >/dev/null 2>&1; then userdel "$SUB_USER" >/dev/null 2>&1 || deluser "$SUB_USER" >/dev/null 2>&1 || true; fi
+  if getent group "$CERT_GROUP" >/dev/null 2>&1; then groupdel "$CERT_GROUP" >/dev/null 2>&1 || delgroup "$CERT_GROUP" >/dev/null 2>&1 || true; fi
+  CERT_ON=0
+  CERT_CA=letsencrypt
+  CERT_SCOPE=single
+  CERT_NAMES=""
+  CERT_PUBLIC=1
+  CERT_CHALLENGE=http
+  (( had )) && ok "证书与订阅 HTTPS 已移除。"
+  return 0
+}
+
+setup_cert() {
+  (( LAND_MODE )) && return 0
+  if (( NAT_MODE )); then
+    if (( CERT_ON == 1 )) || cdn_wanted; then
+      warn "NAT 模式无法在公网 80 上续期，也不能开 CDN 线路。证书已关闭，CDN 上的 XHTTP / WebSocket 已停止。REALITY 未改用该证书。"
+      cert_turn_off quiet
+    fi
+    return 0
+  fi
+  if cdn_wanted && [[ $OPT_CERT == 0 ]]; then
+    cdn_explain cert_required
+    die "CDN 线路需要证书，不能和 --no-cert 一起使用。公开证书或 Cloudflare 源站证书都可以。REALITY 未改动。"
+  fi
+  if [[ $OPT_CERT == 0 ]]; then
+    if (( CERT_ON == 1 )); then cert_turn_off; fi
+    return 0
+  fi
+  local want=0
+  if [[ -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; then want=1
+  elif cdn_wanted; then
+    if (( CERT_ON != 1 )) || [[ -z $CERT_DOMAIN ]]; then
+      info "CDN 上的 XHTTP / WebSocket 需要证书。默认是 Let's Encrypt 单域名；只给 CDN 用时可以选 Cloudflare 源站证书。REALITY 仍然借用伪装站点。"
+    fi
+    want=1
+  elif (( CERT_ON == 1 )) && [[ -n $CERT_DOMAIN ]]; then want=1
+  elif (( OPT_AUTO )); then return 0
+  elif confirm "是否申请公开可信证书（Let's Encrypt）？需要自有域名已解析到本机。用于订阅 HTTPS，以及 Hysteria2 / TUIC / AnyTLS（链接改用该域名，不再使用 insecure）。REALITY 仍借用伪装站点。默认不申请。" n; then
+    info "继续申请即表示同意 Let’s Encrypt 服务条款（https://letsencrypt.org/repository/）。"
+    want=1
+  fi
+  (( want )) || return 0
+  cert_issue_flow
+}
+
+cert_menu_pick_kind() {
+  echo
+  echo "默认是 Let's Encrypt 单域名。其它种类是可选项，签好之前 REALITY 不变。"
+  ui_columns "oneclick proxy" "返回" \
+    "Let's Encrypt 单域名（默认，HTTP-01）" \
+    "Let's Encrypt 通配符（DNS-01）" \
+    "Let's Encrypt 多域名（HTTP-01）" \
+    "ZeroSSL 单域名（HTTP-01）" \
+    "ZeroSSL 通配符（DNS-01）" \
+    "ZeroSSL 多域名（HTTP-01）" \
+    "Cloudflare 源站证书（只给 CDN）"
+  local c
+  ask c "请选择" "0"
+  case $c in
+    1) OPT_CERT_KIND=le ;;
+    2) OPT_CERT_KIND=wildcard ;;
+    3) OPT_CERT_KIND=multi ;;
+    4) OPT_CERT_KIND=zerossl ;;
+    5) OPT_CERT_KIND=zerossl-wildcard ;;
+    6) OPT_CERT_KIND=zerossl-multi ;;
+    7) OPT_CERT_KIND=cf-origin ;;
+    *) return 1 ;;
+  esac
+}
+cert_menu_issue() {
+  cert_menu_pick_kind || return 0
+  OPT_CERT_DOMAIN=""
+  OPT_CERT_NAMES=""
+  OPT_CERT_LINK=""
+  cert_issue_flow
+  OPT_CERT_KIND=""
+  cert_after_issue
+}
+cert_menu_renew() {
+  tls_for_cdn || { warn "尚未申请证书。"; return 0; }
+  if [[ ${CERT_CA:-letsencrypt} == cloudflare ]]; then
+    cat <<EOF
+这是 Cloudflare 源站证书，不是 Let's Encrypt，不会自动续期。
+有效期大约 15 年（到 $(cert_expiry_text)）。只有 Cloudflare 信任它。
+要换成别的种类，请重新选择种类：脚本会先关掉这一张，再签新的。REALITY 不动。
+不要把这张证书用于 Hysteria2、TUIC、AnyTLS 或订阅。
+EOF
+    return 0
+  fi
+  if [[ ${CERT_CHALLENGE:-http} == dns ]]; then
+    cert_ensure_dig
+    write_dns_hooks
+    if [[ ! -s $CERT_DNS_TOKEN ]]; then
+      cat <<'EOF'
+上次没有保存 Cloudflare DNS 令牌。
+续期还是要在 _acme-challenge 上添加 TXT，而且必须是灰色云朵。
+脚本会打印要添加的内容，并等待公共 DNS 能查到。这次不需要开放 80 端口。
+如果希望以后自动续期，请重新申请并加上 --cf-dns-token。
+EOF
+    else
+      info "将用已保存的 Cloudflare DNS 令牌续期，不占用 80 端口。"
+    fi
+  else
+    local owner=""
+    if port_in_use tcp 80; then
+      owner=$(port_owner tcp 80)
+      cdn_explain port80 "${owner:-未知}"
+      return 0
+    fi
+    cert_allow_80_now
+  fi
+  local renew_args=(renew --cert-name "$CERT_NAME")
+  if openssl x509 -checkend 2592000 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+    info "证书尚未进入续期窗口（到期前 30 天才续）。当前到期 $(cert_expiry_text)。"
+    confirm "仍然向 $(cert_kind_label) 强制续期？" n || return 0
+    renew_args+=(--force-renewal)
+  fi
+  if certbot "${renew_args[@]}"; then
+    cert_install_material
+    cert_rewire_protocols
+    cert_refresh_cdn
+    cert_start_sub
+    ok "续期检查完成。到期 $(cert_expiry_text)。"
+  else
+    if [[ ${CERT_CHALLENGE:-http} == dns ]]; then cert_explain txt_missing
+    elif [[ ${CERT_SCOPE:-} == multi ]]; then cert_explain multi_fail
+    else cdn_explain cert_fail; fi
+    warn "续期失败。REALITY 未改动。"
+  fi
+}
+menu_cert() {
+  need_node
+  [[ -n $OS_ID ]] || detect_os
+  if (( NAT_MODE )); then
+    die "NAT 模式不能申请证书，也不能使用 Cloudflare 源站证书：公网访问不到这台机器，CDN 也无法回源。不申请时 REALITY 和自签证书保持原样。"
+  fi
+  while :; do
+    echo
+    if tls_for_cdn; then
+      printf '证书  %s\n' "$(cert_kind_label)"
+      printf '名字  %s\n' "${CERT_NAMES:-$CERT_DOMAIN}"
+      printf '链接  %s\n' "$CERT_DOMAIN"
+      printf '到期  %s\n' "$(cert_expiry_text)"
+      if cert_is_public; then
+        printf '订阅  HTTPS %s:%s（完整链接在查看里，明文 HTTP 不提供）\n' "$CERT_DOMAIN" "$SUB_PORT"
+      else
+        echo "订阅  未开启。这张只有 Cloudflare 信任，不能给浏览器、Hysteria2、TUIC、AnyTLS。"
+      fi
+    else
+      echo "当前未申请证书。不申请时 REALITY 与自签的 Hysteria2 / TUIC / AnyTLS 保持原样。"
+    fi
+    ui_columns "oneclick proxy" "返回" \
+      "选择证书种类并申请" \
+      "立即续期" \
+      "查看链接" \
+      "关闭证书"
+    local c
+    ask c "请选择" "0"
+    case $c in
+      1) cert_menu_issue ;;
+      2) cert_menu_renew ;;
+      3) if tls_for_cdn; then show_info; else warn "尚未申请证书。"; fi ;;
+      4) if ! tls_for_cdn; then info "当前没有证书。"; continue; fi
+         if cert_is_public; then
+           confirm "关闭证书后，Hysteria2 / TUIC / AnyTLS 改回自签，订阅 HTTPS 停止。开着的 CDN 线路也会关掉。REALITY 不变。确认？" n || continue
+         else
+           confirm "关闭 Cloudflare 源站证书后，CDN 上的 XHTTP+TLS / WebSocket+TLS 会停。Hysteria2 / TUIC / AnyTLS 本来就是自签，订阅本来就没开。REALITY 不变。确认？" n || continue
+         fi
+         cert_turn_off ;;
+      *) return 0 ;;
+    esac
+  done
+}
+do_cert() {
+  load_state
+  [[ -n $INIT_SYS ]] || detect_init
+  [[ -n $OS_ID ]] || detect_os
+  if [[ $OPT_CERT == 0 ]]; then
+    (( INSTALLED )) || die "尚未安装。"
+    if (( CERT_ON != 1 )); then info "当前没有证书。"; return 0; fi
+    cert_turn_off
+    return 0
+  fi
+  need_node
+  if (( NAT_MODE )); then
+    die "NAT 模式不能申请证书，也不能使用 Cloudflare 源站证书：公网访问不到这台机器，CDN 也无法回源。不申请时 REALITY 和自签证书保持原样。"
+  fi
+  if cert_cli_requested; then
+    cert_issue_flow
+    cert_after_issue
+    return 0
+  fi
+  if [[ ! -t 0 && ! -r /dev/tty ]]; then die "非交互环境请使用 --cert-domain 或 --cert-kind。"; fi
+  menu_cert
+}
+
+print_sub_block() {
+  tls_present_real || return 0
+  [[ -n $SUB_TOKEN ]] || return 0
+  local paint=${1:-0} W=62
+  echo
+  ui_bar '═' "$W" "$paint"
+  ui_center "订阅（仅 HTTPS）" "$W" "$paint"
+  ui_bar '─' "$W" "$paint"
+  printf '域名  %s\n' "$CERT_DOMAIN"
+  printf '端口  %s  TCP\n' "$SUB_PORT"
+  node_link_note "$paint" "明文 HTTP 不提供订阅。Hysteria2 / TUIC / AnyTLS 使用这张证书。"
+  node_link_note "$paint" "REALITY 仍借用伪装站点 ${SNI}，不使用这张证书。"
+  echo "v2rayN / v2rayNG / Shadowrocket"
+  sub_url
+  echo "mihomo"
+  sub_clash_url
+  if (( paint )); then echo; print_qr "$(sub_url_raw)"; fi
+  ui_bar '═' "$W" "$paint"
+}
+
+# ============================================================
+#     可选：VLESS + XHTTP + TLS / VLESS + WebSocket + TLS（CDN）
+# ============================================================
+# 默认关闭，也不替换 REALITY、XHTTP+REALITY、Hysteria2、Trojan、TUIC、AnyTLS。
+# 两条都不是 REALITY：客户端连自己的域名，CDN 再回源到本机的独立端口。
+# 本机用已申请的公开证书终止 TLS。REALITY 继续占用自己的端口，配置里不写这张证书。
+# 默认端口 2083 / 2087，是 Cloudflare 允许代理的 HTTPS 端口，避开 443。
+
+cdn_wanted() { (( ${XHTTP_TLS_ENABLED:-0} == 1 || ${WS_ENABLED:-0} == 1 )); }
+cdn_cli_requested() { [[ ${OPT_XHTTP_TLS:-} == 1 || ${OPT_WS:-} == 1 ]]; }
+cdn_cf_port() { case $1 in 443|2053|2083|2087|2096|8443) return 0 ;; *) return 1 ;; esac; }
+
+cdn_explain() { # $1 情形。$2 占用者或端口或路径；$3 在 port_busy 时是端口
+  local tag=$1 who=${2:-未知} port=${3:-${2:-}} path=${2:-}
+  case $tag in
+    dns)
+      cat >&2 <<'EOF'
+域名没有解析到这台机器。
+Let's Encrypt 和 CDN 回源都要顺着这个域名找到本机的公网地址。现在查到的地址里有不是本机的，或者根本没查到。
+常见原因：A/AAAA 还没填、填成了别的服务器、只改了一边、或者刚改完还没生效。
+请到域名服务商把记录改成这台机器的公网 IP，等几分钟后再试。不要填 REALITY 用来伪装的那个网站。
+EOF
+      ;;
+    port80)
+      cat >&2 <<EOF
+80 端口被占用（${who}），证书申请停住了。
+申请或续期 HTTP-01（Let's Encrypt 或 ZeroSSL 的单域名、多域名）时，要暂时独占 80 做验证，验证完就放开。通配符走 DNS-01，不占用 80。80 上不提供订阅，也不跑代理。
+常见占用是 Nginx、Caddy、Apache 或另一个网站。先执行 ss -Htlnp 'sport = :80' 看是谁，停掉它再申请。
+REALITY 的端口没有改。不要把 REALITY 挪到 80，也不要把 REALITY 放进 CDN。
+EOF
+      ;;
+    port443)
+      cat >&2 <<'EOF'
+不能占用 REALITY 正在听的端口（默认就是 443）。
+REALITY 必须由客户端直连本机，不能套在 Cloudflare 这类 CDN 后面。CDN 会拆掉 TLS，伪装站点对不上，客户端握手会失败。
+CDN 线路请改用 Cloudflare 允许回源的其它 HTTPS 端口：2083、2087、2096、2053、8443。8443 如果已经被 XHTTP+REALITY 占用，就不要用。
+客户端连接「域名:这个端口」，Cloudflare 再连回本机的同一个端口。443 继续留给 REALITY 直连。
+EOF
+      ;;
+    port_busy)
+      cat >&2 <<EOF
+端口 ${port} 已经被「${who}」占用，这条 CDN 线路不能听在这里。
+Cloudflare 要连到本机这个端口。端口上是别的程序时，Xray 起不来，CDN 会显示 521（连不上）或 522（超时）。
+请换一个空着的端口：2083、2087、2096、2053、8443。可以执行 ss -Htlnp 'sport = :${port}' 看是谁。不要停掉 REALITY 来腾出 443，也不要把 REALITY 放进 CDN。
+EOF
+      ;;
+    port_cf)
+      cat >&2 <<EOF
+端口 ${port} 不能当作这条 CDN 线路的回源端口。
+Cloudflare 免费代理只把 HTTPS 转到这几个端口：443、2053、2083、2087、2096、8443。其它端口橙色云朵不会帮你转发，表现就是连不上，或者 521/522。
+请改成上面其中一个空闲端口。不要占用 REALITY 正在听的端口，也不要把 REALITY 放进 CDN。
+EOF
+      ;;
+    port_taken)
+      cat >&2 <<EOF
+端口和已有的「${who}」撞车了。
+这条 CDN 线路要单独听一个 TCP 端口，不能和 REALITY、XHTTP+REALITY、Trojan、AnyTLS、另一条 CDN 线路或订阅共用。
+请换一个 Cloudflare 允许的 HTTPS 端口。原来的协议保持不动。
+EOF
+      ;;
+    cert_required)
+      cat >&2 <<'EOF'
+这条线路需要你自己的域名，以及一张证书。
+它走的是普通 TLS，不是 REALITY。默认用公开证书（Let's Encrypt 单域名）。只给这两条 CDN 线路、并且域名开着橙色云朵时，也可以改用 Cloudflare 源站证书。源站证书只有 Cloudflare 信任，不能给 Hysteria2、TUIC、AnyTLS 或订阅。
+自签证书会被当成证书不匹配。请先申请证书（--cert-domain，或菜单「申请证书」）。REALITY、XHTTP+REALITY、Hysteria2 不会被关掉，REALITY 也不会改用这张证书。
+EOF
+      ;;
+    cert_fail)
+      cat >&2 <<'EOF'
+证书没有签发成功，CDN 线路还不能开。
+常见原因：域名没有解析到本机；80 端口被别的网站占用；云安全组没放行 80，Let's Encrypt 从公网访问不到；同一域名签发太频繁，触发了速率限制。
+请按日志里的具体原因处理。REALITY 的端口没有改，也没有改用这张证书。
+EOF
+      ;;
+    cert_rate)
+      cat >&2 <<'EOF'
+Let's Encrypt 拒绝签发：这个域名最近申请次数太多（速率限制）。
+同一张域名一周内能成功签发的次数有限。等限制过去，或换一个还没申请过的子域名再试。
+这不是 REALITY 坏了。REALITY 不使用这张证书。
+EOF
+      ;;
+    cert_unreachable)
+      cat >&2 <<'EOF'
+Let's Encrypt 没能从公网访问到本机的 80 端口，验证失败。
+域名要解析到这台机器，云安全组要放行 TCP 80，本机 80 上不能有别的程序抢着回答。验证只在申请那一会儿占用 80。
+请放行 80 后重试。不要改 REALITY 的监听端口。
+EOF
+      ;;
+    nat)
+      cat >&2 <<'EOF'
+NAT 模式不能开这两条 CDN 线路。
+Cloudflare 要能直接连到本机的回源端口，证书的 HTTP-01 也要能从公网访问 80。NAT 小鸡通常没有这些映射。
+不带 --xhttp-tls / --ws-tls 时，安装方式和原来一样。REALITY 仍然直连，不要把 REALITY 放进 CDN。
+EOF
+      ;;
+    land)
+      cat >&2 <<'EOF'
+落地机只跑 Shadowsocks 2022，没有给客户端直连的 CDN 入站。
+请在中转机（装了 REALITY 的那台）上打开这两条线路。落地机不用改。
+EOF
+      ;;
+    521)
+      cat >&2 <<'EOF'
+Cloudflare 返回 521：它连不上源站。
+橙色云朵已经生效，但 Cloudflare 访问本机这个端口失败。常见原因：
+1. 源站上的 Xray 没在听这个端口。
+2. 本机防火墙或云安全组没放行这个 TCP 端口。
+3. DNS 指到了错误的 IP。
+4. 回源端口不是 Cloudflare 支持的 443、2053、2083、2087、2096、8443。
+请在本机用 ss 确认端口正在监听，并在云控制台放行。不要把 REALITY 的 443 指到 Cloudflare 后面来凑这个端口。
+EOF
+      ;;
+    522)
+      cat >&2 <<'EOF'
+Cloudflare 返回 522：连接源站超时。
+请求到了 Cloudflare，但它一直等不到本机应答。常见是云安全组把这个端口丢了，或本机防火墙默认拒绝且没放行。
+到云控制台放行对应的 TCP 端口。证书续期还需要 TCP 80。源站用 ss 看这个端口是否在听。
+EOF
+      ;;
+    526)
+      cat >&2 <<'EOF'
+回源证书和域名对不上。Cloudflare 上这通常显示为 526，或提示 origin certificate 无效。
+加密模式请用「完全（严格）」。源站必须出示这张证书，名字就是这个域名。公开证书和 Cloudflare 源站证书都可以过「完全（严格）」。源站证书不能拿去给浏览器、Hysteria2、TUIC、AnyTLS 或订阅。
+自签证书、证书写成别的域名、或把 REALITY 的伪装站证书拿来回源，都会失败。
+不要改成「灵活」。灵活会让 Cloudflare 用明文连源站，这条 TLS 线路对不上。
+EOF
+      ;;
+    path)
+      cat >&2 <<EOF
+路径不一致。
+客户端、Cloudflare 和源站三处的路径必须逐字相同，当前源站路径是 ${path}。
+多一个或少一个斜杠、用了另一条 XHTTP+REALITY 的路径、或在 Cloudflare 规则里改写了路径，都会 404，节点连不上。
+请把链接里的 path 原样填进客户端，不要手改。缓存规则里把这个路径设为绕过缓存。
+EOF
+      ;;
+    ws)
+      cat >&2 <<'EOF'
+WebSocket 升级被拒绝。
+连接没有变成 WebSocket。常见原因：
+1. Cloudflare「网络 → WebSockets」没打开。
+2. 路径不对，升级请求打到了别的地址。
+3. 中间的反代丢掉了 Connection 和 Upgrade 头。
+4. 客户端误用了 REALITY 或 XHTTP 的链接，类型不是 ws。
+请打开 WebSockets，确认链接里是 type=ws、security=tls，path 和这里一致。不要填 pbk、sid、flow，也不要开 insecure。
+EOF
+      ;;
+    origin_down)
+      cat >&2 <<EOF
+本机端口 ${port} 没有在听。
+CDN 回源连过来时，Cloudflare 会显示 521（连不上）或 522（超时）。
+请确认 Xray 已启动，并且防火墙和云安全组放行了这个 TCP 端口。不要改用 REALITY 的端口来顶替。
+EOF
+      ;;
+    xray_config)
+      cat >&2 <<'EOF'
+Xray 没有接受这份配置，新配置没有写进去。
+若日志提到证书或 private key：CDN 这两条入站要读已签发的证书，运行 Xray 的 nobody 必须能读私钥。REALITY 那几条入站不使用这张证书。
+请先确认证书已申请成功，再重试。原来的 REALITY 配置不会被换成这张证书。
+EOF
+      ;;
+  esac
+}
+
+cert_fail_explain() { # $1 日志
+  local log=$1 low
+  low=$(tr '[:upper:]' '[:lower:]' <"$log" 2>/dev/null || true)
+  if [[ $low == *'acme-txt-timeout'* ]]; then cert_explain txt_timeout; return 0; fi
+  if [[ $low == *'acme-dns-auth-failed'* || $low == *'invalid api token'* || $low == *'authentication error'* ]]; then
+    cert_explain dns_token; return 0
+  fi
+  if [[ $low == *'acme-dns-zone-missing'* ]]; then cert_explain dns_zone; return 0; fi
+  if [[ $low == *'cf-origin-auth'* ]]; then cert_explain origin_auth; return 0; fi
+  if [[ $low == *'cf-origin-host'* ]]; then cert_explain origin_host; return 0; fi
+  if [[ $low == *'address already in use'* || $low == *'eaddrinuse'* ]]; then
+    cdn_explain port80 "$(port_owner tcp 80)"; return 0
+  fi
+  if [[ $low == *'too many certificates'* || $low == *'rate limit'* || $low == *'ratelimited'* ]]; then
+    if [[ ${CERT_CA:-letsencrypt} == zerossl ]]; then cert_explain rate_zero; else cdn_explain cert_rate; fi
+    return 0
+  fi
+  if [[ ${CERT_CA:-} == zerossl && ( $low == *'external account'* || $low == *'eab credential'* || $low == *'invalid eab'* ) ]]; then
+    cert_explain eab; return 0
+  fi
+  if [[ ${CERT_CHALLENGE:-} == dns ]]; then cert_explain txt_missing; return 0; fi
+  if [[ ${CERT_SCOPE:-} == multi ]]; then cert_explain multi_fail; return 0; fi
+  if [[ $low == *'nxdomain'* || $low == *'dns problem'* || $low == *'no valid a'* || $low == *'servfail'* ]]; then
+    cert_explain dns_not_here; return 0
+  fi
+  if [[ $low == *'timeout'* || $low == *'timed out'* || $low == *'connection refused'* || $low == *'firewall'* || $low == *'unauthorized'* ]]; then
+    cdn_explain cert_unreachable; return 0
+  fi
+  cdn_explain cert_fail
+}
+
+cdn_ensure_paths() {
+  if (( ${XHTTP_TLS_ENABLED:-0} == 1 )); then
+    [[ $XHTTP_TLS_PATH =~ ^/xhttp-[A-Za-z0-9]+$ ]] || XHTTP_TLS_PATH="/xhttp-$(rand_hex 8)"
+  fi
+  if (( ${WS_ENABLED:-0} == 1 )); then
+    [[ $WS_PATH =~ ^/ws-[A-Za-z0-9]+$ ]] || WS_PATH="/ws-$(rand_hex 8)"
+  fi
+}
+cdn_port_ok() { # $1 端口 $2 正在设置的变量名（跳过自己）。不合适时已经打印原因
+  local p=$1 self=${2:-}
+  if [[ $p == 80 ]]; then cdn_explain port80 "$(port_owner tcp 80)"; return 1; fi
+  if (( ${REALITY_ENABLED:-0} == 1 )) && [[ $p == "$XRAY_PORT" ]]; then cdn_explain port443; return 1; fi
+  if (( ${XHTTP_ENABLED:-0} == 1 )) && [[ $p == "$XHTTP_PORT" ]]; then cdn_explain port_taken "XHTTP + REALITY" "$p"; return 1; fi
+  if (( ${TROJAN_ENABLED:-0} == 1 )) && [[ $p == "$TROJAN_PORT" ]]; then cdn_explain port_taken "Trojan" "$p"; return 1; fi
+  if (( ${ANYTLS_ENABLED:-0} == 1 )) && [[ $p == "$ANYTLS_PORT" ]]; then cdn_explain port_taken "AnyTLS" "$p"; return 1; fi
+  if [[ $self != XHTTP_TLS_PORT ]] && (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && [[ -n $XHTTP_TLS_PORT && $p == "$XHTTP_TLS_PORT" ]]; then
+    cdn_explain port_taken "XHTTP + TLS" "$p"; return 1
+  fi
+  if [[ $self != WS_PORT ]] && (( ${WS_ENABLED:-0} == 1 )) && [[ -n $WS_PORT && $p == "$WS_PORT" ]]; then
+    cdn_explain port_taken "WebSocket + TLS" "$p"; return 1
+  fi
+  if cert_is_public && [[ $p == "$SUB_PORT" ]]; then cdn_explain port_taken "订阅 HTTPS" "$p"; return 1; fi
+  if ! cdn_cf_port "$p"; then cdn_explain port_cf "$p"; return 1; fi
+  return 0
+}
+cdn_mark_siblings() { # $1 正在改的变量名，避免把自己标成占用
+  local skip=$1
+  (( ${REALITY_ENABLED:-0} == 1 )) && [[ $skip != XRAY_PORT ]] && local_mark_used tcp "$XRAY_PORT"
+  (( ${XHTTP_ENABLED:-0} == 1 )) && [[ $skip != XHTTP_PORT ]] && local_mark_used tcp "$XHTTP_PORT"
+  (( ${TROJAN_ENABLED:-0} == 1 )) && [[ $skip != TROJAN_PORT ]] && local_mark_used tcp "$TROJAN_PORT"
+  (( ${ANYTLS_ENABLED:-0} == 1 )) && [[ $skip != ANYTLS_PORT ]] && local_mark_used tcp "$ANYTLS_PORT"
+  (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && [[ $skip != XHTTP_TLS_PORT ]] && local_mark_used tcp "$XHTTP_TLS_PORT"
+  (( ${WS_ENABLED:-0} == 1 )) && [[ $skip != WS_PORT ]] && local_mark_used tcp "$WS_PORT"
+  cert_is_public && [[ -n $SUB_PORT ]] && local_mark_used tcp "$SUB_PORT"
+  local_mark_used tcp 80
+}
+cdn_choose_port() { # $1 变量名 $2 命令行端口 $3 名称 $4 默认端口
+  local var=$1 opt=$2 label=$3 def=$4 p cur
+  cdn_mark_siblings "$var"
+  cur=${!var:-$def}
+  LOCAL_USED_TCP=${LOCAL_USED_TCP// $cur /}
+  p=${opt:-$cur}
+  while :; do
+    if [[ -z $opt ]] && (( ! OPT_AUTO )); then
+      ask p "${label} 的 TCP 端口（Cloudflare 用 2083、2087、2096、2053 或 8443，不要占 REALITY）" "$p"
+      p=${p// /}
+    fi
+    if ! is_port "$p"; then
+      cdn_explain port_cf "${p:-空}"
+      { [[ -n $opt ]] || (( OPT_AUTO )); } && return 1
+      p=$def
+      continue
+    fi
+    if ! cdn_port_ok "$p" "$var"; then
+      { [[ -n $opt ]] || (( OPT_AUTO )); } && return 1
+      p=$def
+      continue
+    fi
+    if local_used_hit tcp "$p"; then
+      cdn_explain port_taken "其它协议" "$p"
+      { [[ -n $opt ]] || (( OPT_AUTO )); } && return 1
+      p=$def
+      continue
+    fi
+    if ! check_port_free tcp "$p" 'xray'; then
+      if [[ $p == 80 ]]; then cdn_explain port80 "$(port_owner tcp 80)"
+      elif (( ${REALITY_ENABLED:-0} == 1 )) && [[ $p == "$XRAY_PORT" || $p == 443 ]]; then cdn_explain port443
+      else cdn_explain port_busy "$(port_owner tcp "$p")" "$p"; fi
+      { [[ -n $opt ]] || (( OPT_AUTO )); } && return 1
+      p=$def
+      continue
+    fi
+    printf -v "$var" '%s' "$p"
+    local_mark_used tcp "$p"
+    return 0
+  done
+}
+
+cdn_install_xray_certs() {
+  tls_for_cdn || { cdn_explain cert_required; return 1; }
+  local grp
+  grp=$(id -gn nobody 2>/dev/null || echo nogroup)
+  mkdir -p "$XRAY_CERT_DIR"
+  chmod 755 "$(dirname "$XRAY_CERT_DIR")" 2>/dev/null || true
+  cp -f "$CERT_FULLCHAIN" "${XRAY_CERT_FULL}.new"
+  cp -f "$CERT_PRIVKEY" "${XRAY_CERT_KEY}.new"
+  chown "root:${grp}" "${XRAY_CERT_FULL}.new" "${XRAY_CERT_KEY}.new"
+  chmod 644 "${XRAY_CERT_FULL}.new"
+  chmod 640 "${XRAY_CERT_KEY}.new"
+  mv -f "${XRAY_CERT_FULL}.new" "$XRAY_CERT_FULL"
+  mv -f "${XRAY_CERT_KEY}.new" "$XRAY_CERT_KEY"
+  chown "root:${grp}" "$XRAY_CERT_DIR"
+  chmod 750 "$XRAY_CERT_DIR"
+  selinux_fix "$XRAY_CERT_DIR"
+}
+cdn_sync_flag() {
+  if cdn_wanted && tls_for_cdn; then
+    mkdir -p "$(dirname "$CDN_FLAG")"
+    printf '1\n' >"$CDN_FLAG"
+    chmod 644 "$CDN_FLAG"
+  else
+    rm -f "$CDN_FLAG"
+  fi
+}
+cdn_xhttp_inbound_json() {
+  jq -n --argjson clients "$1" --argjson port "$XHTTP_TLS_PORT" \
+    --arg path "$XHTTP_TLS_PATH" --arg host "$CERT_DOMAIN" \
+    --arg crt "$XRAY_CERT_FULL" --arg key "$XRAY_CERT_KEY" '{
+      tag: "vless-xhttp-tls",
+      port: $port,
+      protocol: "vless",
+      settings: {clients: $clients, decryption: "none"},
+      streamSettings: {
+        network: "xhttp",
+        security: "tls",
+        tlsSettings: {certificates: [{certificateFile: $crt, keyFile: $key}]},
+        xhttpSettings: {path: $path, host: $host, mode: "packet-up"}
+      },
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+    }'
+}
+cdn_ws_inbound_json() {
+  jq -n --argjson clients "$1" --argjson port "$WS_PORT" \
+    --arg path "$WS_PATH" --arg host "$CERT_DOMAIN" \
+    --arg crt "$XRAY_CERT_FULL" --arg key "$XRAY_CERT_KEY" '{
+      tag: "vless-ws-tls",
+      port: $port,
+      protocol: "vless",
+      settings: {clients: $clients, decryption: "none"},
+      streamSettings: {
+        network: "ws",
+        security: "tls",
+        tlsSettings: {certificates: [{certificateFile: $crt, keyFile: $key}]},
+        wsSettings: {path: $path, host: $host}
+      },
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+    }'
+}
+cdn_attach_inbounds() { # $1 配置文件 $2 无 flow 的客户端 JSON
+  local f=$1 clients=$2 ib
+  [[ -n $clients ]] || clients='[]'
+  if cdn_wanted && ! tls_for_cdn; then
+    info "CDN 线路要等证书就绪后再写入。这一步先保持 REALITY 原样，不会把证书写进 REALITY。"
+    return 0
+  fi
+  if (( ${XHTTP_TLS_ENABLED:-0} == 1 )); then
+    cdn_install_xray_certs || return 1
+    ib=$(cdn_xhttp_inbound_json "$clients") || return 1
+    jq --argjson ib "$ib" '.inbounds += [$ib]' "$f" >"${f}.cdn" && mv -f "${f}.cdn" "$f"
+  fi
+  if (( ${WS_ENABLED:-0} == 1 )); then
+    cdn_install_xray_certs || return 1
+    ib=$(cdn_ws_inbound_json "$clients") || return 1
+    jq --argjson ib "$ib" '.inbounds += [$ib]' "$f" >"${f}.cdn" && mv -f "${f}.cdn" "$f"
+  fi
+}
+
+cdn_xhttp_link() { # $1 uuid $2 名称
+  local addr q
+  addr=$(host_fmt "$CERT_DOMAIN")
+  q="encryption=none&security=tls&sni=${CERT_DOMAIN}&fp=chrome&type=xhttp&path=$(urlencode "$XHTTP_TLS_PATH")&host=${CERT_DOMAIN}&mode=packet-up"
+  printf 'vless://%s@%s:%s?%s#%s' "$1" "$addr" "$XHTTP_TLS_PORT" "$q" "$(urlencode "$2")"
+}
+cdn_ws_link() { # $1 uuid $2 名称
+  local addr q
+  addr=$(host_fmt "$CERT_DOMAIN")
+  q="encryption=none&security=tls&sni=${CERT_DOMAIN}&fp=chrome&type=ws&path=$(urlencode "$WS_PATH")&host=${CERT_DOMAIN}"
+  printf 'vless://%s@%s:%s?%s#%s' "$1" "$addr" "$WS_PORT" "$q" "$(urlencode "$2")"
+}
+cdn_render_links() {
+  local u r
+  if (( XHTTP_TLS_ENABLED )) && tls_for_cdn; then
+    printf '%s\n' "$(cdn_xhttp_link "$UUID" "${NODE_NAME}-XHTTP-TLS")"
+    if [[ -s $USERS_FILE ]]; then
+      while IFS=$'\t' read -r u r; do
+        [[ -n $u ]] || continue
+        printf '%s\n' "$(cdn_xhttp_link "$u" "${NODE_NAME}-XHTTP-TLS-${r}")"
+      done <"$USERS_FILE"
+    fi
+  fi
+  if (( WS_ENABLED )) && tls_for_cdn; then
+    printf '%s\n' "$(cdn_ws_link "$UUID" "${NODE_NAME}-WS-TLS")"
+    if [[ -s $USERS_FILE ]]; then
+      while IFS=$'\t' read -r u r; do
+        [[ -n $u ]] || continue
+        printf '%s\n' "$(cdn_ws_link "$u" "${NODE_NAME}-WS-TLS-${r}")"
+      done <"$USERS_FILE"
+    fi
+  fi
+}
+cdn_mihomo() {
+  tls_for_cdn || return 0
+  if (( XHTTP_TLS_ENABLED )); then
+    cat <<Y
+  - name: "${NODE_NAME}-XHTTP-TLS"
+    type: vless
+    server: ${CERT_DOMAIN}
+    port: ${XHTTP_TLS_PORT}
+    uuid: ${UUID}
+    network: xhttp
+    tls: true
+    udp: true
+    servername: ${CERT_DOMAIN}
+    client-fingerprint: chrome
+    xhttp-opts:
+      path: ${XHTTP_TLS_PATH}
+      mode: packet-up
+      host: ${CERT_DOMAIN}
+Y
+  fi
+  if (( WS_ENABLED )); then
+    cat <<Y
+  - name: "${NODE_NAME}-WS-TLS"
+    type: vless
+    server: ${CERT_DOMAIN}
+    port: ${WS_PORT}
+    uuid: ${UUID}
+    network: ws
+    tls: true
+    udp: true
+    servername: ${CERT_DOMAIN}
+    client-fingerprint: chrome
+    ws-opts:
+      path: ${WS_PATH}
+      headers:
+        Host: ${CERT_DOMAIN}
+Y
+  fi
+}
+cdn_print_links() { # $1=1 着色
+  local paint=${1:-0} u r qr
+  if (( XHTTP_TLS_ENABLED )) && tls_for_cdn; then
+    node_link_head "$paint" "VLESS + XHTTP + TLS（CDN）" "${NODE_NAME}-XHTTP-TLS" "$CERT_DOMAIN" "${XHTTP_TLS_PORT}  TCP"
+    node_link_note "$paint" "不是 REALITY。path ${XHTTP_TLS_PATH}，mode=packet-up。不要套到 REALITY 上。"
+    qr=$(cdn_xhttp_link "$UUID" "${NODE_NAME}-XHTTP-TLS")
+    node_link_uri "$qr"
+    (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
+    if [[ -s $USERS_FILE ]]; then
+      while IFS=$'\t' read -r u r; do
+        [[ -n $u ]] || continue
+        node_link_head "$paint" "额外用户 ${r} · XHTTP+TLS" "${NODE_NAME}-XHTTP-TLS-${r}" "$CERT_DOMAIN" "${XHTTP_TLS_PORT}  TCP"
+        qr=$(cdn_xhttp_link "$u" "${NODE_NAME}-XHTTP-TLS-${r}")
+        node_link_uri "$qr"
+        (( paint )) && { echo; print_qr "$qr"; }
+        node_link_end "$paint"
+      done <"$USERS_FILE"
+    fi
+  fi
+  if (( WS_ENABLED )) && tls_for_cdn; then
+    node_link_head "$paint" "VLESS + WebSocket + TLS（CDN）" "${NODE_NAME}-WS-TLS" "$CERT_DOMAIN" "${WS_PORT}  TCP"
+    node_link_note "$paint" "不是 REALITY。path ${WS_PATH}。Cloudflare 要打开 WebSockets。"
+    qr=$(cdn_ws_link "$UUID" "${NODE_NAME}-WS-TLS")
+    node_link_uri "$qr"
+    (( paint )) && { echo; print_qr "$qr"; }
+    node_link_end "$paint"
+    if [[ -s $USERS_FILE ]]; then
+      while IFS=$'\t' read -r u r; do
+        [[ -n $u ]] || continue
+        node_link_head "$paint" "额外用户 ${r} · WebSocket+TLS" "${NODE_NAME}-WS-TLS-${r}" "$CERT_DOMAIN" "${WS_PORT}  TCP"
+        qr=$(cdn_ws_link "$u" "${NODE_NAME}-WS-TLS-${r}")
+        node_link_uri "$qr"
+        (( paint )) && { echo; print_qr "$qr"; }
+        node_link_end "$paint"
+      done <"$USERS_FILE"
+    fi
+  fi
+}
+
+cdn_print_tutorial() { # 可选 $1 = xhttp|ws，空则打印已开启的
+  local which=${1:-} show_x=0 show_w=0
+  case $which in
+    xhttp) show_x=1 ;;
+    ws) show_w=1 ;;
+    *)
+      (( XHTTP_TLS_ENABLED )) && show_x=1
+      (( WS_ENABLED )) && show_w=1
+      ;;
+  esac
+  (( show_x || show_w )) || return 0
+  local cert_line
+  if [[ ${CERT_CA:-letsencrypt} == cloudflare ]]; then
+    cert_line="证书：Cloudflare 源站证书。只有 Cloudflare 信任它。浏览器、Hysteria2、TUIC、AnyTLS 和订阅都会拒绝。回源加密用「完全（严格）」，不要用「灵活」。"
+  else
+    cert_line="证书：已经签好的公开证书。回源加密用「完全（严格）」，不要用「灵活」，也不要改成自签。"
+  fi
+  echo
+  ui_bar '═' 62
+  ui_center "CDN 线路怎么接" 62
+  ui_bar '─' 62
+  cat <<EOF
+这两条是普通 TLS，不是 REALITY。客户端先连 Cloudflare，Cloudflare 再连回本机。
+不要把 REALITY、XHTTP+REALITY、Trojan 放进 CDN。它们要直连本机 IP，SNI 仍是伪装网站 ${SNI:-（安装时选的站点）}。
+不要把 REALITY 的链接改成这个域名，也不要给 REALITY 开橙色云朵。
+
+域名：${CERT_DOMAIN}
+${cert_line}
+
+DNS（Cloudflare 或同类的 HTTPS 反向代理）：
+1. 添加 A 记录。域名是 example.com 时名称填 @；域名是 cdn.example.com 时名称填 cdn。不要把整段 ${CERT_DOMAIN} 再接到自己后面。内容填本机公网 IPv4。代理状态打开（橙色云朵）。
+2. 有公网 IPv6 再加 AAAA，同样打开代理。
+3. 这个名字一旦开了橙色云朵，Hysteria2、TUIC、AnyTLS 和订阅不能再靠它连接：Cloudflare 不转发 UDP，也不转发 ${SUB_PORT}。那几条请继续用服务器 IP，或另做一个灰色云朵的名字。脚本不会关掉它们。
+4. SSL/TLS 加密模式选「完全（严格）」（Full strict）。不要选「灵活」：灵活会让 Cloudflare 用明文连源站，这条 TLS 线路对不上。
+5. 源站端口填下面写的 TCP 端口。Cloudflare 连本机的同一个端口，云安全组要放行。不要把源站改成 443 来占用 REALITY。
+6. 缓存：给下面的路径加一条绕过缓存。不要用规则改写路径。
+EOF
+  if (( show_x )); then
+    cat <<EOF
+
+—— VLESS + XHTTP + TLS ——
+源站端口：TCP ${XHTTP_TLS_PORT}（Cloudflare 会连这个端口，请在云安全组放行）
+路径：${XHTTP_TLS_PATH}
+不需要打开 gRPC。mode 用 packet-up，不要用 stream-one（那是直连 REALITY 的 XHTTP）。
+客户端链接里要有：地址 ${CERT_DOMAIN}，端口 ${XHTTP_TLS_PORT}，security=tls，sni=${CERT_DOMAIN}，type=xhttp，path=${XHTTP_TLS_PATH}，host=${CERT_DOMAIN}，mode=packet-up。
+链接里不要有：flow、security=reality、pbk、sid、pqv、insecure。不要把地址改成 IP。
+$(cdn_xhttp_link "$UUID" "${NODE_NAME}-XHTTP-TLS")
+EOF
+  fi
+  if (( show_w )); then
+    cat <<EOF
+
+—— VLESS + WebSocket + TLS ——
+源站端口：TCP ${WS_PORT}（云安全组放行这个 TCP）
+路径：${WS_PATH}
+Cloudflare「网络」里打开 WebSockets。
+客户端链接里要有：地址 ${CERT_DOMAIN}，端口 ${WS_PORT}，security=tls，sni=${CERT_DOMAIN}，type=ws，path=${WS_PATH}，host=${CERT_DOMAIN}。
+链接里不要有：flow、security=reality、pbk、sid、pqv、insecure。不要把地址改成 IP。
+$(cdn_ws_link "$UUID" "${NODE_NAME}-WS-TLS")
+EOF
+  fi
+  cat <<'EOF'
+
+做完可以再运行 proxy cdn，会按本机和公网各查一次。
+对不上号时常见的是：域名没指到这里、80/443 被占、证书没签下来、Cloudflare 521/522、回源证书不匹配、路径不一致、WebSocket 升级被拒绝。脚本会用中文说明该先改哪里。
+EOF
+  ui_bar '═' 62
+}
+
+cdn_judge_response() { # $1 HTTP 码 $2 头 $3 正文。输出 521|522|526|ok|ws|path|down|other
+  local code=$1 headers=$2 body=$3 blob low
+  blob="${headers}"$'\n'"${body}"
+  low=$(printf '%s' "$blob" | tr '[:upper:]' '[:lower:]')
+  if [[ $code == 521 || $low == *'error code: 521'* || $low == *'error 521'* ]]; then printf '521'; return 0; fi
+  if [[ $code == 522 || $low == *'error code: 522'* || $low == *'error 522'* ]]; then printf '522'; return 0; fi
+  if [[ $code == 526 || $low == *'error code: 526'* || $low == *'invalid ssl certificate'* || $low == *'origin certificate'* ]]; then printf '526'; return 0; fi
+  if [[ $code == 101 || $low == *'101 switching'* ]]; then printf 'ok'; return 0; fi
+  if [[ $low == *cloudflare* && ( $code == 400 || $code == 403 || $code == 426 ) ]]; then printf 'ws'; return 0; fi
+  if [[ $code == 404 ]]; then printf 'path'; return 0; fi
+  if [[ $code == 000 || $code == 0 || -z $code ]]; then
+    if [[ $low == *'timed out'* || $low == *'timeout'* ]]; then printf '522'; return 0; fi
+    if [[ $low == *'certificate'* || $low == *'ssl'* ]]; then printf '526'; return 0; fi
+    if [[ $low == *'connection refused'* || $low == *'failed to connect'* || $low == *'could not connect'* || $low == *"couldn't connect"* ]]; then printf '521'; return 0; fi
+    printf 'down'; return 0
+  fi
+  printf 'other'
+}
+cdn_curl_exchange() { # $1 port $2 path $3 ws|get $4 local|public。结果放 CDN_CODE/HDR/BODY
+  local port=$1 path=$2 mode=$3 where=$4 hdr body err code
+  hdr=$(mktemp)
+  body=$(mktemp)
+  err=$(mktemp)
+  local -a args=(-sS --http1.1 --max-time 12 -D "$hdr" -o "$body" -w '%{http_code}' -H "Host: ${CERT_DOMAIN}")
+  if [[ $where == local ]]; then
+    args+=(-k --resolve "${CERT_DOMAIN}:${port}:127.0.0.1")
+  fi
+  if [[ $mode == ws ]]; then
+    args+=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==')
+  fi
+  code=$(curl "${args[@]}" "https://${CERT_DOMAIN}:${port}${path}" 2>"$err" || true)
+  CDN_CODE=${code:-000}
+  CDN_HDR=$(cat "$hdr" 2>/dev/null || true)
+  CDN_BODY=$(cat "$body" "$err" 2>/dev/null || true)
+  rm -f "$hdr" "$body" "$err"
+  # curl 有时把 101 记成 000，状态行里仍有 Switching Protocols
+  if [[ $CDN_CODE == 000 || $CDN_CODE == 0 ]]; then
+    if [[ $CDN_HDR == *' 101 '* || $CDN_HDR == *'101 Switching'* ]]; then CDN_CODE=101; fi
+  fi
+}
+cdn_origin_cert_ok() { # $1 端口
+  local port=$1 pem rc=1
+  pem=$(mktemp)
+  echo | openssl s_client -connect "127.0.0.1:${port}" -servername "$CERT_DOMAIN" 2>/dev/null | openssl x509 -out "$pem" >/dev/null 2>&1 || true
+  if [[ -s $pem ]] && cert_san_ok "$pem"; then rc=0; fi
+  rm -f "$pem"
+  return "$rc"
+}
+cdn_probe_public() { # $1 端口 $2 路径 $3 ws|get
+  local port=$1 path=$2 mode=$3 tag low
+  have curl || { info "本机没有 curl，跳过公网复查。"; return 0; }
+  cdn_curl_exchange "$port" "$path" "$mode" public
+  tag=$(cdn_judge_response "$CDN_CODE" "$CDN_HDR" "$CDN_BODY")
+  low=$(printf '%s\n%s' "$CDN_HDR" "$CDN_BODY" | tr '[:upper:]' '[:lower:]')
+  if [[ $low != *cf-ray* && $low != *cloudflare* ]]; then
+    case $tag in
+      521|522|526) cdn_explain "$tag" ;;
+      *)
+        info "从这里访问 ${CERT_DOMAIN}:${port} 还没有看到 Cloudflare（没有 cf-ray）。"
+        info "橙色云朵还没开，或 DNS 还没生效时，这是正常的。源站检查做完就可以按教程去开代理，然后再运行 proxy cdn。"
+        info "不要为了走 CDN 把 REALITY 的端口也指到橙色云朵后面。"
+        ;;
+    esac
+    return 0
+  fi
+  case $tag in
+    521|522|526) cdn_explain "$tag" ;;
+    path) cdn_explain path "$path" ;;
+    ws) cdn_explain ws ;;
+    ok) ok "经 Cloudflare 访问 ${CERT_DOMAIN}:${port}${path} 已有响应。" ;;
+    down) cdn_explain 522 ;;
+    *)
+      if [[ $mode == ws && $CDN_CODE != 101 ]]; then cdn_explain ws
+      else info "Cloudflare 已在代理 ${CERT_DOMAIN}（有 cf-ray），HTTP 状态 ${CDN_CODE}。若客户端不通，对照路径和「完全（严格）」。"; fi
+      ;;
+  esac
+  return 0
+}
+cdn_check_xhttp() {
+  local wrong="/not-the-xhttp-path" right bad
+  tls_for_cdn || { cdn_explain cert_required; return 1; }
+  if ! port_in_use tcp "$XHTTP_TLS_PORT"; then cdn_explain origin_down "$XHTTP_TLS_PORT"; return 1; fi
+  if ! cdn_origin_cert_ok "$XHTTP_TLS_PORT"; then cdn_explain 526; return 1; fi
+  have curl || { warn "没有 curl，跳过路径探测。"; cdn_probe_public "$XHTTP_TLS_PORT" "$XHTTP_TLS_PATH" get; return 0; }
+  cdn_curl_exchange "$XHTTP_TLS_PORT" "$XHTTP_TLS_PATH" get local
+  right=$CDN_CODE
+  cdn_curl_exchange "$XHTTP_TLS_PORT" "$wrong" get local
+  bad=$CDN_CODE
+  if [[ $right == 404 && $bad != 404 ]]; then
+    cdn_explain path "$XHTTP_TLS_PATH"
+    return 1
+  fi
+  if [[ $right == 404 && $bad == 404 ]]; then
+    info "本机访问正确路径和错误路径目前都是 404。XHTTP 的 packet-up 不靠普通网页确认路径。"
+    info "客户端若也是 404，就是路径不一致，必须使用 ${XHTTP_TLS_PATH}，不要用 REALITY 那条 XHTTP 的路径。"
+  elif [[ $right != "$bad" && $bad == 404 ]]; then
+    ok "XHTTP 源站能区分路径 ${XHTTP_TLS_PATH}。"
+  else
+    info "普通网页请求分不出这条 XHTTP 路径（packet-up 本来就不是网页）。客户端必须原样使用 ${XHTTP_TLS_PATH}。"
+    info "路径不一致时客户端是 404。不要改成 REALITY 那条 XHTTP 的路径，也不要改成 stream-one。"
+  fi
+  cdn_probe_public "$XHTTP_TLS_PORT" "$XHTTP_TLS_PATH" get
+  return 0
+}
+cdn_check_ws() {
+  local wrong tag
+  wrong="/not-${WS_PATH#/}"
+  tls_for_cdn || { cdn_explain cert_required; return 1; }
+  if ! port_in_use tcp "$WS_PORT"; then cdn_explain origin_down "$WS_PORT"; return 1; fi
+  if ! cdn_origin_cert_ok "$WS_PORT"; then cdn_explain 526; return 1; fi
+  have curl || { warn "没有 curl，跳过 WebSocket 探测。"; return 0; }
+  cdn_curl_exchange "$WS_PORT" "$WS_PATH" ws local
+  tag=$(cdn_judge_response "$CDN_CODE" "$CDN_HDR" "$CDN_BODY")
+  if [[ $tag == ok ]]; then
+    ok "WebSocket 路径 ${WS_PATH} 在本机可以升级。"
+  elif [[ $tag == path || $CDN_CODE == 404 ]]; then
+    cdn_explain path "$WS_PATH"
+    return 1
+  else
+    cdn_explain ws
+    return 1
+  fi
+  cdn_curl_exchange "$WS_PORT" "$wrong" ws local
+  tag=$(cdn_judge_response "$CDN_CODE" "$CDN_HDR" "$CDN_BODY")
+  if [[ $tag == ok ]]; then
+    cdn_explain path "$WS_PATH"
+    return 1
+  fi
+  cdn_probe_public "$WS_PORT" "$WS_PATH" ws
+  return 0
+}
+cdn_run_checks() { # 可选 $1 = xhttp|ws
+  local which=${1:-} rc=0
+  cdn_wanted || return 0
+  if [[ $which == xhttp ]] || { [[ -z $which ]] && (( XHTTP_TLS_ENABLED == 1 )); }; then
+    cdn_check_xhttp || rc=1
+  fi
+  if [[ $which == ws ]] || { [[ -z $which ]] && (( WS_ENABLED == 1 )); }; then
+    cdn_check_ws || rc=1
+  fi
+  return "$rc"
+}
+
+cdn_ensure_cert() {
+  tls_for_cdn && return 0
+  cdn_explain cert_required
+  if [[ $OPT_CERT == 0 ]]; then
+    die "CDN 线路需要证书，不能和 --no-cert 一起使用。公开证书或 Cloudflare 源站证书都可以。REALITY 未改动。"
+  fi
+  if (( OPT_AUTO )) && [[ -z $OPT_CERT_DOMAIN && -z $OPT_CERT_NAMES && -z $OPT_CERT_KIND && -z $OPT_CF_ORIGIN_KEY ]]; then
+    die "请加上 --cert-domain <你的域名>。只给 CDN 用源站证书时再加上 --cert-kind cf-origin --cf-origin-key。REALITY 未改动。"
+  fi
+  if (( ! OPT_AUTO )) && [[ -z ${OPT_CERT_KIND:-} || ${OPT_CERT_KIND} == le ]]; then
+    confirm "现在申请 Let's Encrypt 单域名证书？域名需要已经解析到本机。只想给 CDN 用源站证书时，请改走 proxy cert。" y || return 1
+    info "继续申请即表示同意 Let’s Encrypt 服务条款（https://letsencrypt.org/repository/）。"
+  fi
+  cert_issue_flow
+  cert_rewire_protocols
+  if (( FW_ENABLED )); then apply_firewall; fi
+  cert_start_sub
+  save_state
+  tls_for_cdn
+}
+cdn_prepare_enable() { # $1 xhttp|ws。失败返回 1，调用方保持关闭
+  local kind=$1
+  if (( LAND_MODE )); then cdn_explain land; return 1; fi
+  if (( NAT_MODE )); then cdn_explain nat; return 1; fi
+  cdn_ensure_cert || return 1
+  cdn_ensure_paths
+  local_seed_used
+  if [[ $kind == xhttp ]]; then
+    cdn_choose_port XHTTP_TLS_PORT "$OPT_XHTTP_TLS_PORT" "VLESS + XHTTP + TLS（CDN）" "${XHTTP_TLS_PORT:-2083}" || return 1
+  else
+    cdn_choose_port WS_PORT "$OPT_WS_PORT" "VLESS + WebSocket + TLS（CDN）" "${WS_PORT:-2087}" || return 1
+  fi
+  cdn_install_xray_certs || return 1
+  cdn_sync_flag
+  if [[ -f $CERT_HOOK || -d $CERT_LIB ]]; then write_cert_hook; fi
+  return 0
+}
+cdn_after_cert() {
+  cdn_wanted || return 0
+  if (( NAT_MODE )); then
+    cdn_explain nat
+    die "NAT 模式下没有写入 CDN 线路。"
+  fi
+  if ! tls_for_cdn; then
+    cdn_explain cert_required
+    die "没有可用证书，CDN 线路没有开启。公开证书或 Cloudflare 源站证书都可以。REALITY 未改动。"
+  fi
+  cdn_ensure_paths
+  cdn_install_xray_certs
+  cdn_sync_flag
+  write_cert_hook
+  if xray_inbound_needed; then
+    write_xray_config
+    restart_xray
+  fi
+  cdn_print_tutorial
+  cdn_run_checks || warn "CDN 线路的检查没有全部通过。REALITY、XHTTP+REALITY、Hysteria2、Trojan、TUIC、AnyTLS 不受影响。按上面的说明改完后执行 proxy cdn。"
+}
+do_cdn() {
+  need_node
+  if ! cdn_wanted; then
+    info "还没有打开 CDN 线路。在协议开关里打开「VLESS + XHTTP + TLS（CDN）」或「VLESS + WebSocket + TLS（CDN）」，或安装时加 --xhttp-tls / --ws-tls，并带上 --cert-domain。"
+    return 0
+  fi
+  cdn_print_tutorial
+  cdn_run_checks || true
+}
+
+
+# ============================================================
 #                        链接 / 二维码 / 客户端配置
 # ============================================================
 server_addr() {
@@ -3529,9 +6471,11 @@ vless_link() { # $1 uuid $2 名称 $3 是否包含 pqv(1/0)
 }
 
 hy2_link() {
-  local addr q
-  addr=$(host_fmt "$(server_addr)")
-  q="sni=${SNI}&insecure=1&pinSHA256=${HY2_PIN}"
+  local addr q sni
+  addr=$(host_fmt "$(tls_link_host)")
+  sni=$(tls_link_sni)
+  if tls_present_real; then q="sni=${sni}"
+  else q="sni=${sni}&insecure=1&pinSHA256=${HY2_PIN}"; fi
   [[ -n $(pub_hop) ]] && q+="&mport=$(pub_hop)"
   printf 'hysteria2://%s@%s:%s/?%s#%s' "$(urlencode "$HY2_PASS")" "$addr" "$(pub_hy2_port)" "$q" "$(urlencode "${NODE_NAME}-Hy2")"
 }
@@ -3552,15 +6496,19 @@ trojan_link() {
   printf 'trojan://%s@%s:%s?%s#%s' "$(urlencode "$TROJAN_PASS")" "$addr" "$(pub_trojan_port)" "$q" "$(urlencode "${NODE_NAME}-Trojan")"
 }
 tuic_link() {
-  local addr q
-  addr=$(host_fmt "$(server_addr)")
-  q="congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${SNI}&allow_insecure=1&insecure=1"
+  local addr q sni
+  addr=$(host_fmt "$(tls_link_host)")
+  sni=$(tls_link_sni)
+  if tls_present_real; then q="congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}"
+  else q="congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${sni}&allow_insecure=1&insecure=1"; fi
   printf 'tuic://%s:%s@%s:%s?%s#%s' "$(urlencode "$UUID")" "$(urlencode "$TUIC_PASS")" "$addr" "$(pub_tuic_port)" "$q" "$(urlencode "${NODE_NAME}-TUIC")"
 }
 anytls_link() {
-  local addr q
-  addr=$(host_fmt "$(server_addr)")
-  q="security=tls&type=tcp&sni=${SNI}&fp=chrome&insecure=1&allowInsecure=1"
+  local addr q sni
+  addr=$(host_fmt "$(tls_link_host)")
+  sni=$(tls_link_sni)
+  if tls_present_real; then q="security=tls&type=tcp&sni=${sni}&fp=chrome"
+  else q="security=tls&type=tcp&sni=${sni}&fp=chrome&insecure=1&allowInsecure=1"; fi
   printf 'anytls://%s@%s:%s?%s#%s' "$(urlencode "$ANYTLS_PASS")" "$addr" "$(pub_anytls_port)" "$q" "$(urlencode "${NODE_NAME}-AnyTLS")"
 }
 
@@ -3610,23 +6558,35 @@ Y
   fi
   fi
   if (( HY2_ENABLED )); then
+    local hy_host hy_sni
+    hy_host=$(tls_link_host)
+    hy_sni=$(tls_link_sni)
     cat <<Y
   - name: "${NODE_NAME}-Hy2"
     type: hysteria2
-    server: ${addr}
+    server: ${hy_host}
     port: $(pub_hy2_port)
 Y
     if [[ -n $(pub_hop) ]]; then
       if [[ $(pub_hop) == *,* ]]; then printf '    ports: "%s"\n    hop-interval: 30\n' "$(pub_hop)"
       else printf '    ports: %s\n    hop-interval: 30\n' "$(pub_hop)"; fi
     fi
-    cat <<Y
+    if tls_present_real; then
+      cat <<Y
     password: "${HY2_PASS}"
-    sni: ${SNI}
+    sni: ${hy_sni}
+    alpn:
+      - h3
+Y
+    else
+      cat <<Y
+    password: "${HY2_PASS}"
+    sni: ${hy_sni}
     fingerprint: ${pin_hex}
     alpn:
       - h3
 Y
+    fi
   fi
   if (( XHTTP_ENABLED )); then
     cat <<Y
@@ -3665,34 +6625,41 @@ Y
 Y
   fi
   if (( TUIC_ENABLED )); then
+    local tu_host tu_sni
+    tu_host=$(tls_link_host)
+    tu_sni=$(tls_link_sni)
     cat <<Y
   - name: "${NODE_NAME}-TUIC"
     type: tuic
-    server: ${addr}
+    server: ${tu_host}
     port: $(pub_tuic_port)
     uuid: ${UUID}
     password: "${TUIC_PASS}"
-    sni: ${SNI}
+    sni: ${tu_sni}
     alpn: [h3]
     congestion-controller: bbr
     udp-relay-mode: native
-    skip-cert-verify: true
-    udp: true
 Y
+    if tls_present_real; then printf '    udp: true\n'
+    else printf '    skip-cert-verify: true\n    udp: true\n'; fi
   fi
   if (( ANYTLS_ENABLED )); then
+    local at_host at_sni
+    at_host=$(tls_link_host)
+    at_sni=$(tls_link_sni)
     cat <<Y
   - name: "${NODE_NAME}-AnyTLS"
     type: anytls
-    server: ${addr}
+    server: ${at_host}
     port: $(pub_anytls_port)
     password: "${ANYTLS_PASS}"
-    sni: ${SNI}
+    sni: ${at_sni}
     client-fingerprint: chrome
-    skip-cert-verify: true
-    udp: true
 Y
+    if tls_present_real; then printf '    udp: true\n'
+    else printf '    skip-cert-verify: true\n    udp: true\n'; fi
   fi
+  cdn_mihomo
 }
 
 print_qr() { # $1 链接
@@ -3756,7 +6723,8 @@ print_node_links() { # $1=1 屏幕着色并附二维码；$1=0 纯文本
   fi
   if (( HY2_ENABLED )); then
     hp=$(pub_hop)
-    node_link_head "$paint" "Hysteria2" "${NODE_NAME}-Hy2" "$(server_addr)" "$(pub_hy2_port)  UDP${hp:+  跳跃 ${hp}}"
+    node_link_head "$paint" "Hysteria2" "${NODE_NAME}-Hy2" "$(tls_link_host)" "$(pub_hy2_port)  UDP${hp:+  跳跃 ${hp}}"
+    if tls_present_real; then node_link_note "$paint" "证书 ${CERT_DOMAIN}，按正常校验，不要开 insecure"; fi
     qr=$(hy2_link)
     node_link_uri "$qr"
     if [[ -n $hp ]]; then
@@ -3774,16 +6742,18 @@ print_node_links() { # $1=1 屏幕着色并附二维码；$1=0 纯文本
     node_link_end "$paint"
   fi
   if (( TUIC_ENABLED )); then
-    node_link_head "$paint" "TUIC v5" "${NODE_NAME}-TUIC" "$(server_addr)" "$(pub_tuic_port)  UDP"
+    node_link_head "$paint" "TUIC v5" "${NODE_NAME}-TUIC" "$(tls_link_host)" "$(pub_tuic_port)  UDP"
     node_link_note "$paint" "v2rayNG 不能导入，请用 v2rayN / sing-box / mihomo"
+    if tls_present_real; then node_link_note "$paint" "证书 ${CERT_DOMAIN}，按正常校验，不要开 insecure"; fi
     qr=$(tuic_link)
     node_link_uri "$qr"
     (( paint )) && { echo; print_qr "$qr"; }
     node_link_end "$paint"
   fi
   if (( ANYTLS_ENABLED )); then
-    node_link_head "$paint" "AnyTLS" "${NODE_NAME}-AnyTLS" "$(server_addr)" "$(pub_anytls_port)  TCP"
+    node_link_head "$paint" "AnyTLS" "${NODE_NAME}-AnyTLS" "$(tls_link_host)" "$(pub_anytls_port)  TCP"
     node_link_note "$paint" "v2rayNG 不能导入，请用 v2rayN / sing-box / mihomo"
+    if tls_present_real; then node_link_note "$paint" "证书 ${CERT_DOMAIN}，按正常校验，不要开 insecure"; fi
     qr=$(anytls_link)
     node_link_uri "$qr"
     (( paint )) && { echo; print_qr "$qr"; }
@@ -3809,6 +6779,8 @@ print_node_links() { # $1=1 屏幕着色并附二维码；$1=0 纯文本
       fi
     done <"$USERS_FILE"
   fi
+  cdn_print_links "$paint"
+  print_sub_block "$paint"
 }
 
 build_info() { # 输出完整信息（无颜色），用于保存文件
@@ -3831,6 +6803,7 @@ build_info() { # 输出完整信息（无颜色），用于保存文件
 save_info() {
   if (( LAND_MODE )); then land_build_info >"${INFO_FILE}.tmp"; else build_info >"${INFO_FILE}.tmp"; fi
   chmod 600 "${INFO_FILE}.tmp"; mv -f "${INFO_FILE}.tmp" "$INFO_FILE"
+  if tls_present_real; then cert_write_bodies || warn "订阅文件写入失败。"; fi
 }
 
 show_info() {
@@ -3884,10 +6857,11 @@ default_node_name() {
 # ============================================================
 # XHTTP 采用 Xray 官方「VLESS + XHTTP + REALITY」：与 Vision 共用同一把 Reality 密钥和 SNI，
 # 单独 TCP 端口，不需要自己的域名。mode 固定 stream-one（REALITY 直连；避免客户端 auto 握手失败）。
-# TUIC v5 / AnyTLS 由 sing-box 提供，自签证书（CN = 所选 SNI），不要求自有域名。
+# TUIC v5 / AnyTLS 由 sing-box 提供。默认自签证书（CN = 所选 SNI），不要求自有域名。
+# 申请了公开证书时，这两个协议和 Hysteria2 改用那张证书，链接里的地址和 SNI 换成自有域名。
 # Trojan 走 Xray + REALITY。Shadowsocks 2022 只存在于落地机，这里不加直连入站。
 xray_inbound_needed() {
-  (( ${REALITY_ENABLED:-0} || ${XHTTP_ENABLED:-0} || ${TROJAN_ENABLED:-0} )) && return 0
+  (( ${REALITY_ENABLED:-0} || ${XHTTP_ENABLED:-0} || ${TROJAN_ENABLED:-0} || ${XHTTP_TLS_ENABLED:-0} || ${WS_ENABLED:-0} )) && return 0
   relay_active && (( ${HY2_ENABLED:-0} )) && return 0
   return 1
 }
@@ -3895,16 +6869,10 @@ proto_xray_brief() {
   local s=""
   (( REALITY_ENABLED )) && s+="REALITY TCP ${XRAY_PORT}"
   (( XHTTP_ENABLED )) && s+="${s:+ / }XHTTP TCP ${XHTTP_PORT}"
+  (( XHTTP_TLS_ENABLED )) && s+="${s:+ / }XHTTP+TLS TCP ${XHTTP_TLS_PORT}"
+  (( WS_ENABLED )) && s+="${s:+ / }WS+TLS TCP ${WS_PORT}"
   (( TROJAN_ENABLED )) && s+="${s:+ / }Trojan TCP ${TROJAN_PORT}"
   [[ -n $s ]] || s="无入站"
-  printf '%s' "$s"
-}
-proto_fw_extra() {
-  local s=""
-  (( XHTTP_ENABLED )) && s+="；TCP ${XHTTP_PORT}（XHTTP）"
-  (( TROJAN_ENABLED )) && s+="；TCP ${TROJAN_PORT}（Trojan）"
-  (( ANYTLS_ENABLED )) && s+="；TCP ${ANYTLS_PORT}（AnyTLS）"
-  (( TUIC_ENABLED )) && s+="；UDP ${TUIC_PORT}（TUIC）"
   printf '%s' "$s"
 }
 ensure_proto_secrets() {
@@ -3912,6 +6880,7 @@ ensure_proto_secrets() {
   [[ -n $TROJAN_PASS ]] || TROJAN_PASS=$(rand_pass)
   [[ -n $TUIC_PASS ]] || TUIC_PASS=$(rand_pass)
   [[ -n $ANYTLS_PASS ]] || ANYTLS_PASS=$(rand_pass)
+  cdn_ensure_paths
 }
 resolve_install_protos() {
   if [[ -n $OPT_REALITY ]]; then REALITY_ENABLED=$OPT_REALITY; fi
@@ -3921,6 +6890,8 @@ resolve_install_protos() {
   if [[ -n $OPT_TROJAN ]]; then TROJAN_ENABLED=$OPT_TROJAN; fi
   if [[ -n $OPT_TUIC ]]; then TUIC_ENABLED=$OPT_TUIC; fi
   if [[ -n $OPT_ANYTLS ]]; then ANYTLS_ENABLED=$OPT_ANYTLS; fi
+  if [[ -n $OPT_XHTTP_TLS ]]; then XHTTP_TLS_ENABLED=$OPT_XHTTP_TLS; fi
+  if [[ -n $OPT_WS ]]; then WS_ENABLED=$OPT_WS; fi
   return 0
 }
 confirm_xhttp() {
@@ -3932,7 +6903,7 @@ confirm_xhttp() {
     XHTTP_ENABLED=0
   fi
 }
-proto_any_enabled() { (( REALITY_ENABLED || XHTTP_ENABLED || HY2_ENABLED || TROJAN_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )); }
+proto_any_enabled() { (( REALITY_ENABLED || XHTTP_ENABLED || HY2_ENABLED || TROJAN_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED || XHTTP_TLS_ENABLED || WS_ENABLED )); }
 
 NAT_USED_TCP="" NAT_USED_UDP=""
 LOCAL_USED_TCP="" LOCAL_USED_UDP=""
@@ -4028,6 +6999,12 @@ choose_extra_local() {
   if (( TROJAN_ENABLED )); then local_pick tcp TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" "${TROJAN_PORT:-8444}"; fi
   if (( ANYTLS_ENABLED )); then local_pick tcp ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" "${ANYTLS_PORT:-8445}"; fi
   if (( TUIC_ENABLED )); then local_pick udp TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" "${TUIC_PORT:-8446}"; fi
+  if (( XHTTP_TLS_ENABLED )); then
+    cdn_choose_port XHTTP_TLS_PORT "$OPT_XHTTP_TLS_PORT" "VLESS + XHTTP + TLS（CDN）" "${XHTTP_TLS_PORT:-2083}" || die "XHTTP+TLS 的端口不可用，见上方说明。REALITY 没有改动。"
+  fi
+  if (( WS_ENABLED )); then
+    cdn_choose_port WS_PORT "$OPT_WS_PORT" "VLESS + WebSocket + TLS（CDN）" "${WS_PORT:-2087}" || die "WebSocket+TLS 的端口不可用，见上方说明。REALITY 没有改动。"
+  fi
   proto_any_enabled || die "至少需要启用一个协议（Reality / XHTTP / Hysteria2 / Trojan / TUIC / AnyTLS）。"
 }
 choose_extra_nat() {
@@ -4183,6 +7160,10 @@ install_singbox() {
 }
 sb_copy_cert() {
   mkdir -p "$HY_DIR" "$SB_DIR"
+  if tls_present_real; then
+    cert_grant_readers
+    return 0
+  fi
   [[ -f $HY_CRT && -f $HY_KEY ]] || gen_hy2_cert
   if ! openssl x509 -noout -subject -in "$HY_CRT" 2>/dev/null | grep -q "CN *= *${SNI}\$"; then gen_hy2_cert; fi
   cp -f "$HY_CRT" "$SB_CRT"
@@ -4197,12 +7178,13 @@ write_singbox_config() {
   [[ -x $SB_BIN ]] || die "未找到 sing-box，无法写入 TUIC / AnyTLS 配置。"
   ensure_proto_secrets
   sb_copy_cert
-  local tmp="${SB_CONF}.tmp"
+  local tmp="${SB_CONF}.tmp" crt=$SB_CRT key=$SB_KEY
+  if tls_present_real; then crt=$CERT_FULLCHAIN; key=$CERT_PRIVKEY; fi
   jq -n \
     --argjson tuic "${TUIC_ENABLED:-0}" --argjson any "${ANYTLS_ENABLED:-0}" \
     --argjson tport "${TUIC_PORT:-0}" --argjson aport "${ANYTLS_PORT:-0}" \
     --arg uuid "$UUID" --arg tpw "$TUIC_PASS" --arg apw "$ANYTLS_PASS" \
-    --arg crt "$SB_CRT" --arg key "$SB_KEY" --argjson nets "$PRIV_NETS_JSON" '
+    --arg crt "$crt" --arg key "$key" --argjson nets "$PRIV_NETS_JSON" '
     {
       log: {level: "warn"},
       inbounds: (
@@ -4299,6 +7281,7 @@ apply_proto_services() { # 按开关写配置并启停。不删除已有密钥�
   else
     svc_disable_stop sing-box
   fi
+  cdn_sync_flag
   apply_firewall
   save_state
   save_info
@@ -4826,12 +7809,26 @@ resolve_mode() {
 
 do_install() {
   load_state
+  if cert_cli_requested && { [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; }; then
+    die "落地机只运行 Shadowsocks 2022，不能申请证书，也不提供订阅。"
+  fi
+  if cdn_cli_requested && { [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; }; then
+    cdn_explain land
+    die "落地机不能打开 CDN 线路。"
+  fi
   # 落地机：--land，或已安装为落地机且未指定 --no-land
   if [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; then do_install_land; return; fi
   local was_land=$LAND_MODE
   LAND_MODE=0
   preflight      # decide_nat_mode：命令行 / 菜单设置 / Alpine / 已安装 / 自动检测，端口设置前确定 NAT_MODE
   resolve_mode
+  if (( NAT_MODE )) && cdn_cli_requested; then
+    cdn_explain nat
+    die "请去掉 --xhttp-tls / --ws-tls。不带这两个参数时，安装方式和现在相同。"
+  fi
+  if (( NAT_MODE )) && cert_cli_requested; then
+    die "NAT 模式不能申请证书（含通配符、ZeroSSL 和 Cloudflare 源站证书）：公网访问不到这台机器，CDN 也无法回源。请去掉证书参数。不带这些参数时，安装方式与现在相同。"
+  fi
   take_lock
     if (( was_land )); then
     info "由落地机改装为 Reality / XHTTP / Hysteria2 节点：移除落地机白名单规则，停止 Shadowsocks，重新生成节点配置。"
@@ -4930,26 +7927,31 @@ do_install() {
     svc_disable_stop xray
   fi
 
-  if (( HY2_ENABLED )); then
-    install_hysteria
-    write_hy2_config
-    save_state
-    restart_hy2
+  if (( HY2_ENABLED )); then install_hysteria
   elif [[ -x $HY_BIN || -f $HY_UNIT || -f $HY_RC ]]; then
     info "已关闭 Hysteria2，移除相关组件 ..."
     remove_hysteria
   fi
-  if sb_needed; then
-    install_singbox
-    write_singbox_config
-    save_state
-    restart_singbox
+  if sb_needed; then install_singbox
   elif [[ -x $SB_BIN || -f $SB_UNIT || -f $SB_RC ]]; then
     info "已关闭 TUIC / AnyTLS，停止 sing-box（密码保留）。"
     svc_disable_stop sing-box
   fi
+  setup_cert
+  if (( HY2_ENABLED )); then
+    write_hy2_config
+    save_state
+    restart_hy2
+  fi
+  if sb_needed; then
+    write_singbox_config
+    save_state
+    restart_singbox
+  fi
 
   apply_firewall
+  if tls_present_real; then cert_start_sub; fi
+  cdn_after_cert
   (( NAT_MODE )) || setup_fail2ban
   INSTALLED=1
   save_state
@@ -5773,22 +8775,28 @@ menu_change_sni() {
   mldsa_decide
   apply_all
   ( trap - ERR; set +e; reality_selftest ) || true
-  ok "SNI 已由 ${old} 更换为 ${SNI}。客户端需要更新链接（Hysteria2 证书指纹也已变化）。"
+  if tls_present_real; then
+    ok "SNI 已由 ${old} 更换为 ${SNI}。REALITY / XHTTP / Trojan 需要更新链接。Hysteria2 / TUIC / AnyTLS 仍使用 ${CERT_DOMAIN} 的证书。"
+  else
+    ok "SNI 已由 ${old} 更换为 ${SNI}。客户端需要更新链接（Hysteria2 证书指纹也已变化）。"
+  fi
   show_info
 }
 
 menu_regen_keys() {
   need_installed
   if (( LAND_MODE )); then land_menu_key; return; fi
-  warn "将重新生成 UUID、x25519 密钥、ShortId、ML-DSA-65 密钥、XHTTP 路径，以及 Hysteria2 / Trojan / TUIC / AnyTLS 密码。所有旧客户端将失效。已关闭的协议也会换新密钥，但不会被重新打开。"
+  warn "将重新生成 UUID、x25519 密钥、ShortId、ML-DSA-65 密钥、XHTTP 路径、CDN 路径，以及 Hysteria2 / Trojan / TUIC / AnyTLS 密码。所有旧客户端将失效。已关闭的协议也会换新密钥，但不会被重新打开。"
   (( OPT_AUTO )) || confirm "确认重新生成？" n || return 0
   gen_xray_keys
   HY2_PASS=$(rand_pass)
   XHTTP_PATH="/$(rand_hex 8)"
+  XHTTP_TLS_PATH="/xhttp-$(rand_hex 8)"
+  WS_PATH="/ws-$(rand_hex 8)"
   TROJAN_PASS=$(rand_pass)
   TUIC_PASS=$(rand_pass)
   ANYTLS_PASS=$(rand_pass)
-  if (( HY2_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )); then gen_hy2_cert; fi
+  if (( HY2_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )) && ! tls_present_real; then gen_hy2_cert; fi
   apply_all
   ok "已重新生成全部密钥。"
   show_info
@@ -5869,6 +8877,16 @@ menu_users() {
           node_link_head 1 "额外用户 ${remark} · XHTTP" "${NODE_NAME}-XHTTP-${remark}" "$(server_addr)" "$(pub_xhttp_port)  TCP"
           node_link_uri "$(vless_xhttp_link "$nu" "${NODE_NAME}-XHTTP-${remark}" 0)"
           echo; print_qr "$(vless_xhttp_link "$nu" "${NODE_NAME}-XHTTP-${remark}" 0)"
+        fi
+        if (( XHTTP_TLS_ENABLED )) && tls_for_cdn; then
+          node_link_head 1 "额外用户 ${remark} · XHTTP+TLS" "${NODE_NAME}-XHTTP-TLS-${remark}" "$CERT_DOMAIN" "${XHTTP_TLS_PORT}  TCP"
+          node_link_uri "$(cdn_xhttp_link "$nu" "${NODE_NAME}-XHTTP-TLS-${remark}")"
+          echo; print_qr "$(cdn_xhttp_link "$nu" "${NODE_NAME}-XHTTP-TLS-${remark}")"
+        fi
+        if (( WS_ENABLED )) && tls_for_cdn; then
+          node_link_head 1 "额外用户 ${remark} · WebSocket+TLS" "${NODE_NAME}-WS-TLS-${remark}" "$CERT_DOMAIN" "${WS_PORT}  TCP"
+          node_link_uri "$(cdn_ws_link "$nu" "${NODE_NAME}-WS-TLS-${remark}")"
+          echo; print_qr "$(cdn_ws_link "$nu" "${NODE_NAME}-WS-TLS-${remark}")"
         fi ;;
       2)
         (( i > 0 )) || { warn "没有可删除的用户。"; continue; }
@@ -5883,8 +8901,19 @@ menu_users() {
         local n; ask n "输入序号" "1"
         if ! [[ $n =~ ^[0-9]+$ ]] || (( n < 1 || n > i )); then warn "序号无效。"; continue; fi
         IFS=$'\t' read -r u r < <(sed -n "${n}p" "$USERS_FILE")
-        vless_link "$u" "${NODE_NAME}-${r}" 1; echo; echo
-        print_qr "$(vless_link "$u" "${NODE_NAME}-${r}" 0)" ;;
+        if (( REALITY_ENABLED )); then
+          vless_link "$u" "${NODE_NAME}-${r}" 1; echo; echo
+          print_qr "$(vless_link "$u" "${NODE_NAME}-${r}" 0)"
+        fi
+        if (( XHTTP_ENABLED )); then
+          echo; vless_xhttp_link "$u" "${NODE_NAME}-XHTTP-${r}" 0; echo
+        fi
+        if (( XHTTP_TLS_ENABLED )) && tls_for_cdn; then
+          echo; cdn_xhttp_link "$u" "${NODE_NAME}-XHTTP-TLS-${r}"; echo
+        fi
+        if (( WS_ENABLED )) && tls_for_cdn; then
+          echo; cdn_ws_link "$u" "${NODE_NAME}-WS-TLS-${r}"; echo
+        fi ;;
       *) return 0 ;;
     esac
   done
@@ -5939,6 +8968,7 @@ menu_status() {
   local s svcs="xray hysteria-server sing-box proxy-oneclick-fw fail2ban"
   if (( NAT_MODE )); then svcs="xray hysteria-server sing-box"; [[ -n $HOP_RANGE ]] && svcs+=" proxy-oneclick-hop"; fi
   if (( LAND_MODE )); then svcs="xray"; [[ -f $LAND_FW_UNIT || -f $LAND_FW_RC ]] && svcs+=" proxy-oneclick-land-fw"; fi
+  cert_is_public && svcs+=" proxy-oneclick-sub"
   for s in $svcs; do
     local st; st=$(svc_state "$s")
     [[ -z $st ]] && st="unknown"
@@ -5960,6 +8990,8 @@ menu_status() {
     ui_proto_line "$TROJAN_ENABLED" "Trojan + REALITY" "TCP $(pub_trojan_port)"
     ui_proto_line "$TUIC_ENABLED" "TUIC v5" "UDP $(pub_tuic_port)"
     ui_proto_line "$ANYTLS_ENABLED" "AnyTLS" "TCP $(pub_anytls_port)"
+    ui_proto_line "$XHTTP_TLS_ENABLED" "VLESS + XHTTP + TLS（CDN）" "TCP ${XHTTP_TLS_PORT}"
+    ui_proto_line "$WS_ENABLED" "VLESS + WebSocket + TLS（CDN）" "TCP ${WS_PORT}"
   fi
   if (( LAND_MODE )); then
     printf '  落地机:         Shadowsocks 2022 %s，端口 %s (TCP+UDP)%s\n' "$LAND_METHOD" "$(pub_xray_port)" "$( ((NAT_MODE)) && echo " → 本机 ${XRAY_PORT}")"
@@ -5973,7 +9005,17 @@ menu_status() {
   elif [[ -f $SYSCTL_FILE ]]; then printf '  网络调优:       v1.1.x 默认（BBR + fq）\n'
   else printf '  网络调优:       未应用（proxy tune）\n'; fi
   printf '  时间同步:       %s\n' "$(time_sync_status)"
-  echo; _cyan "  监听端口："
+  if (( ${CERT_ON:-0} == 1 )) || svc_exists proxy-oneclick-sub; then
+    printf '  证书:           %s  %s  到期 %s\n' "$(cert_kind_label)" "${CERT_DOMAIN:-未设置}" "$(cert_expiry_text)"
+    if [[ ${CERT_CA:-letsencrypt} == cloudflare || ${CERT_PUBLIC:-1} != 1 ]]; then
+      printf '  订阅 HTTPS:     未开启。源站证书只有 Cloudflare 信任，不能给浏览器和直连客户端。\n'
+    elif svc_active proxy-oneclick-sub; then printf '  订阅 HTTPS:     运行中（TCP %s，明文 HTTP 不提供）\n' "$SUB_PORT"
+    else printf '  订阅 HTTPS:     未运行（TCP %s）\n' "$SUB_PORT"; fi
+  fi
+  echo
+  fw_print_allows
+  echo
+  _cyan "  监听端口："
   local lx lh
   lx=$(ss -Htlnp 2>/dev/null | awk '/xray/{print "   TCP "$4"  xray"}') || true
   lh=$(ss -Hulnp 2>/dev/null | awk '/hysteria/{print "   UDP "$4"  hysteria"}') || true
@@ -5998,7 +9040,7 @@ menu_status() {
   elif (( NAT_MODE )); then
     echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看端口跳跃规则   4) 实时跟踪 Xray 日志   0) 返回"
   else
-    echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看防火墙规则   4) 实时跟踪 Xray 日志   0) 返回"
+    echo "  1) 查看 Xray 日志   2) 查看 Hysteria2 日志   3) 查看 nftables 原文   4) 实时跟踪 Xray 日志   0) 返回"
   fi
   local c; ask c "请选择" "0"
   case $c in
@@ -6007,6 +9049,7 @@ menu_status() {
     3) if (( NAT_MODE )); then if [[ -n $HOP_RANGE ]]; then show_hop_rules; fi
        elif (( LAND_MODE )); then nft list table inet "$LAND_NFT_TABLE" 2>/dev/null || warn "未启用 nftables 白名单。"
        else
+         echo "下面是 nftables 原文。哪一端口属于哪个协议，看上面的中文列表。"
          nft list table inet "$NFT_TABLE" 2>/dev/null || warn "未找到本脚本的防火墙表。"
          nft list table ip "${NFT_TABLE}_nat" 2>/dev/null || true
        fi ;;
@@ -6109,7 +9152,7 @@ menu_speed() {
 
   提示：
    · 在本地电脑上测试到 VPS 的延迟：tcping $(server_addr) $(pub_xray_port)（ICMP ping 可能被运营商限速，仅供参考）
-   · 查看回程路由：在 VPS 上运行 nexttrace（https://github.com/nxtrace/NTrace-core）
+   · 回程 / 国际线路 / 国际互联：proxy route（只检测，不改配置、不重启）
    · 晚高峰丢包严重时优先使用 Hysteria2；TCP 稳定时 REALITY 延迟更低
    · SNI 目标延迟过高（> 100ms）时，可在菜单中「更换 SNI」重新优选
 TIP
@@ -6120,8 +9163,8 @@ menu_firewall() {
   if (( LAND_MODE )); then land_menu_allow; return; fi
   if (( NAT_MODE )); then warn "NAT 模式不管理防火墙（入站由服务商端口映射控制）。"; menu_nat; return; fi
   echo; hr; _green "  防火墙管理"; hr
-  echo "  当前状态: $( ((FW_ENABLED)) && echo 由本脚本管理 || echo 未启用)   SSH 端口: ${SSH_PORTS:-未检测}"
-  echo "  额外放行: TCP [${EXTRA_TCP}]  UDP [${EXTRA_UDP}]"
+  fw_print_allows
+  hr
   echo "  1) 放行额外 TCP 端口  2) 放行额外 UDP 端口  3) 取消额外放行  4) 重新检测 SSH 端口并重载  5) 停用本脚本防火墙  6) 启用本脚本防火墙  0) 返回"
   local c p; ask c "请选择" "0"
   case $c in
@@ -6160,6 +9203,7 @@ do_uninstall() {
   ok "Xray 已移除"
   remove_hysteria purge; ok "Hysteria2 已移除"
   remove_singbox; ok "sing-box 已移除"
+  cert_remove_files
   remove_nat_hop
   remove_firewall; land_fw_remove; ok "防火墙 / 端口跳跃 / 落地机白名单规则已移除"
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; ok "fail2ban 规则已移除（fail2ban 软件包保留）"; fi
@@ -6190,6 +9234,2194 @@ do_uninstall() {
 }
 
 # ============================================================
+# 线路检测（proxy route）
+# 只读：不改代理配置，不重启服务，不测流媒体。
+# 三项分开计分，禁止合成一个总分：回国回程 | 国际线路 | 国际互联。
+# 回国只测 VPS → 大陆的回程。去程命令打印给用户在自己电脑上跑。
+# 国际线路 = 上游 / Tier1 / IX。国际互联 = 到目标的路径和时延。
+# 权重（写进报告）：上游 30、Tier1 40、IX 30。
+# IPv4 与 IPv6 各出一份完整报告。
+# ============================================================
+
+declare -gA ROUTE_ASN_CACHE=()
+ROUTE_LAT="" ROUTE_LON="" ROUTE_CONT=""
+ROUTE_ORIGIN="" ROUTE_HOLDER="" ROUTE_PREFIX=""
+ROUTE_UPSTREAMS="" ROUTE_UP_OK=0 ROUTE_IX=-1 ROUTE_IX_OK=0 ROUTE_FAC=-1
+ROUTE_NEIGH_N=-1 ROUTE_PDB_NAME=""
+ROUTE_HOP_IPS="" ROUTE_PATH_ASNS="" ROUTE_STAR_HOPS=0 ROUTE_HOP_N=0
+ROUTE_RTT=-1 ROUTE_REACHED=0 ROUTE_LOSS=-1 ROUTE_MTR=0
+ROUTE_LOSS_STRONG=0 ROUTE_PING=0 ROUTE_PATH_PEERS="" ROUTE_LG_UP_N=-1
+ROUTE_DEST_ASNS=""
+ROUTE_HOLD=0 ROUTE_INTL_BODY=""
+ROUTE_BEST_HOPS="" ROUTE_BEST_STARS=0 ROUTE_BEST_N=0
+ROUTE_BEST_RTT=-1 ROUTE_BEST_REACHED=0 ROUTE_BEST_LOSS=-1
+ROUTE_BEST_MTR=0 ROUTE_BEST_STRONG=0 ROUTE_BEST_PING=0
+ROUTE_CHINA_SCORE="" ROUTE_LINE_SCORE="" ROUTE_INTL_SCORE=""
+OPT_ROUTE_FAM=""
+
+route_grade_name() {
+  local s=$1
+  [[ $s =~ ^[0-9]+$ ]] || { printf '无法评分'; return 0; }
+  if (( s >= 90 )); then printf '顶级'
+  elif (( s >= 80 )); then printf '优秀'
+  elif (( s >= 65 )); then printf '良好'
+  elif (( s >= 45 )); then printf '一般'
+  else printf '很差'; fi
+}
+route_grade_text() { # 名称 分数或 na
+  local label=$1 score=$2
+  if [[ $score == na || ! $score =~ ^[0-9]+$ ]]; then printf '%s无法打分' "$label"
+  else printf '%s %s/100（%s）' "$label" "$score" "$(route_grade_name "$score")"; fi
+}
+route_summary_text() { # 回程 线路 互联。只打这三行，没有第四个合成总分
+  printf '%s\n' "这三项分开计，不合成一个总分。国际线路好，只说明上游和交换中心这些条件摆在那里；不代表去常用服务的路径也好。回程好，也不代表国际好，反过来一样。"
+  printf '%s\n' "$(route_grade_text "回国回程" "$1")"
+  printf '%s\n' "$(route_grade_text "国际线路" "$2")"
+  printf '%s\n' "$(route_grade_text "国际互联" "$3")"
+}
+route_avg() {
+  local s=0 n=0 x
+  for x in "$@"; do
+    [[ $x =~ ^[0-9]+$ ]] || continue
+    s=$((s + x)); n=$((n + 1))
+  done
+  if (( n == 0 )); then printf 'na'; else printf '%s' $(( (s + n / 2) / n )); fi
+}
+route_is_tier1() {
+  case $1 in
+    174|701|1239|1299|2914|3257|3320|3356|3491|5511|6453|6461|6762|7018) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_asn_name() {
+  case $1 in
+    174) printf 'Cogent' ;;
+    701) printf 'Verizon' ;;
+    1239) printf 'Sprint' ;;
+    1299) printf 'Arelion' ;;
+    2914) printf 'NTT' ;;
+    3257) printf 'GTT' ;;
+    3320) printf 'DTAG' ;;
+    3356) printf 'Lumen' ;;
+    3491) printf 'PCCW' ;;
+    5511) printf 'Orange' ;;
+    6453) printf 'Tata' ;;
+    6461) printf 'Zayo' ;;
+    6762) printf 'TI Sparkle' ;;
+    7018) printf 'AT&T' ;;
+    6939) printf 'Hurricane Electric' ;;
+    9002) printf 'RETN' ;;
+    4809) printf 'CN2' ;;
+    4134) printf '电信163' ;;
+    23764) printf 'CTG' ;;
+    9929) printf 'CUII' ;;
+    10099) printf 'CUG' ;;
+    4837) printf '联通4837' ;;
+    58807) printf 'CMIN2' ;;
+    58453) printf 'CMI' ;;
+    9808) printf '移动CMNET' ;;
+    *) printf '' ;;
+  esac
+}
+route_fmt_asns() {
+  local x nm out=""
+  for x in "$@"; do
+    x=${x#AS}; x=${x#as}; x=${x#As}
+    [[ $x =~ ^[0-9]+$ ]] || continue
+    nm=$(route_asn_name "$x")
+    if [[ -n $nm ]]; then out+="${nm}（AS${x}）、"; else out+="AS${x}、"; fi
+  done
+  printf '%s' "${out%、}"
+}
+route_count_tier1() {
+  local n=0 x
+  for x in "$@"; do route_is_tier1 "$x" && n=$((n + 1)); done
+  printf '%s' "$n"
+}
+route_count_words() {
+  local n=0 x
+  for x in "$@"; do [[ -n $x ]] && n=$((n + 1)); done
+  printf '%s' "$n"
+}
+route_uniq_words() {
+  local x
+  printf '%s\n' "$@" | awk 'NF && !seen[$0]++ {printf "%s ", $0}'
+}
+route_has() {
+  local n=$1 x
+  shift
+  for x in "$@"; do [[ $x == "$n" ]] && return 0; done
+  return 1
+}
+route_order_before() { # A 出现在某个 B 之前
+  local a=$1 b=$2 seen=0 x
+  shift 2
+  for x in "$@"; do
+    [[ $x == "$a" ]] && seen=1
+    [[ $x == "$b" && $seen == 1 ]] && return 0
+  done
+  return 1
+}
+route_is_ct_provincial() {
+  case $1 in
+    4811|4812|4813|4816|4847|58466) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_is_cu_ordinary() {
+  case $1 in
+    4837|4808|17816|17621|17622|17623) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_is_cm_ordinary() {
+  case $1 in
+    9808|56040|56041|56042|56044|56046|56047|56048) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_any_fn() { # 函数名 后续参数
+  local fn=$1 x
+  shift
+  for x in "$@"; do "$fn" "$x" && return 0; done
+  return 1
+}
+route_china_classify_telecom() {
+  local seen_5943=$1 seen_20297=$2
+  shift 2
+  local -a asns=("$@")
+  local has4134=0 has4809=0
+  if route_has 4134 "${asns[@]}"; then has4134=1; fi
+  if route_has 4809 "${asns[@]}"; then has4809=1; fi
+  if (( has4809 && seen_5943 && !seen_20297 && !has4134 )); then printf 'gia'; return 0; fi
+  if route_order_before 23764 4809 "${asns[@]}"; then printf 'ctg_cn2'; return 0; fi
+  if (( has4809 && (has4134 || seen_20297) )); then printf 'cn2_gt'; return 0; fi
+  if (( has4809 )); then printf 'cn2_unknown'; return 0; fi
+  if route_order_before 23764 4134 "${asns[@]}" || { route_has 23764 "${asns[@]}" && (( has4134 )); }; then
+    printf 'ctg_163'; return 0
+  fi
+  if (( has4134 || seen_20297 )); then printf '163'; return 0; fi
+  if route_any_fn route_is_ct_provincial "${asns[@]}"; then printf '163'; return 0; fi
+  printf 'unknown'
+}
+route_china_classify_unicom() {
+  local -a asns=("$@")
+  if route_has 9929 "${asns[@]}"; then printf 'cuii'; return 0; fi
+  if route_has 10099 "${asns[@]}"; then printf 'cug'; return 0; fi
+  if route_any_fn route_is_cu_ordinary "${asns[@]}"; then printf '4837'; return 0; fi
+  printf 'unknown'
+}
+route_china_classify_mobile() {
+  local -a asns=("$@")
+  if route_has 58807 "${asns[@]}"; then printf 'cmin2'; return 0; fi
+  if route_has 58453 "${asns[@]}"; then printf 'cmi'; return 0; fi
+  if route_any_fn route_is_cm_ordinary "${asns[@]}"; then printf 'cmnet'; return 0; fi
+  printf 'unknown'
+}
+route_china_classify() { # 运营商 以及 ASN / IP 混排
+  local carrier=${1,,}
+  shift
+  local -a asns=()
+  local t seen_5943=0 seen_20297=0
+  for t in "$@"; do
+    t=${t%,}; t=${t#AS}; t=${t#as}; t=${t#As}
+    if [[ $t == *:* ]]; then continue
+    elif [[ $t =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      [[ $t == 59.43.* ]] && seen_5943=1
+      [[ $t == 202.97.* ]] && seen_20297=1
+    elif [[ $t == 59.43 ]]; then seen_5943=1
+    elif [[ $t == 202.97 ]]; then seen_20297=1
+    elif [[ $t =~ ^[0-9]+$ ]]; then asns+=("$t"); fi
+  done
+  case $carrier in
+    telecom|ct|电信) route_china_classify_telecom "$seen_5943" "$seen_20297" "${asns[@]}" ;;
+    unicom|cu|联通) route_china_classify_unicom "${asns[@]}" ;;
+    mobile|cm|移动) route_china_classify_mobile "${asns[@]}" ;;
+    *) printf 'unknown' ;;
+  esac
+}
+route_china_majority() { # 档次... 得票最多的一档；票数相同取更低的一档。未能识别不投票
+  local -A votes=()
+  local c n best="" best_n=0 known x
+  local -a order=(163 4837 cmnet ctg_163 cn2_gt cn2_unknown cug cmi ctg_cn2 gia cuii cmin2)
+  for c in "$@"; do
+    [[ -z $c || $c == unknown ]] && continue
+    votes[$c]=$(( ${votes[$c]:-0} + 1 ))
+  done
+  for c in "${order[@]}"; do
+    n=${votes[$c]:-0}
+    if (( n == 0 )); then continue; fi
+    if (( best_n == 0 || n > best_n )); then
+      best=$c
+      best_n=$n
+    fi
+  done
+  for c in "${!votes[@]}"; do
+    known=0
+    for x in "${order[@]}"; do
+      [[ $x == "$c" ]] && known=1
+    done
+    if (( known )); then continue; fi
+    n=${votes[$c]:-0}
+    if [[ -z $best ]] || (( n > best_n )); then
+      best=$c
+      best_n=$n
+    fi
+  done
+  if [[ -z $best ]]; then printf unknown; else printf '%s' "$best"; fi
+  return 0
+}
+route_china_same_better() { # 候选到达 候选往返 当前到达 当前往返。同一档里先要到达，再要有往返
+  local cr=${1:-0} ct=${2:-} br=${3:-0} bt=${4:-}
+  [[ $cr =~ ^[0-9]+$ ]] || cr=0
+  [[ $br =~ ^[0-9]+$ ]] || br=0
+  if (( cr && ! br )); then printf 1; return 0; fi
+  if (( ! cr && br )); then printf 0; return 0; fi
+  if [[ $ct =~ ^[0-9]+$ && ! $bt =~ ^[0-9]+$ ]]; then printf 1; return 0; fi
+  printf 0
+  return 0
+}
+route_china_telecom_notes() { # 采用的档次；多行「标签|档次代码|vote或ref」
+  local best=$1 text=$2 lab code role names="" x found cls
+  local best_pts ref_pts ref_higher=0
+  local -a seen_vote=()
+  best_pts=$(route_china_line_points "$best")
+  while IFS='|' read -r lab code role; do
+    [[ -n $lab && -n $code ]] || continue
+    [[ $role == ref ]] || role=vote
+    cls=$(route_china_class_label "$code")
+    names+="${lab} 是 ${cls}，"
+    if [[ $role == ref ]]; then
+      ref_pts=$(route_china_line_points "$code")
+      if (( ref_pts > best_pts )); then ref_higher=1; fi
+    else
+      found=0
+      if ((${#seen_vote[@]})); then
+        for x in "${seen_vote[@]}"; do
+          [[ $x == "$code" ]] && found=1
+        done
+      fi
+      if (( ! found )); then seen_vote+=("$code"); fi
+    fi
+  done <<<"$text"
+  names=${names%，}
+  if [[ -n $names ]]; then
+    printf '电信各探测目标：%s。\n' "$names"
+  fi
+  if ((${#seen_vote[@]} > 1)); then
+    printf '电信普通地址的档次不一致。计分采用出现次数最多的一档；次数相同则采用更低的一档。CN2 段地址不参与定档。\n'
+  fi
+  if (( ref_higher )); then
+    printf 'CN2 段目标另见，不参与定档。\n'
+  fi
+  if [[ $best == 163 ]]; then
+    printf '探测到 163，与常见业务路径可能不同。\n'
+  fi
+  printf '回程探测目标可能与业务流量路径不同。商家说的业务回程，和这些探测地址看到的路径可以不是同一条。\n'
+}
+route_china_line_points() {
+  case $1 in
+    gia|cuii|cmin2) printf '60' ;;
+    ctg_cn2) printf '50' ;;
+    cn2_unknown) printf '45' ;;
+    cug) printf '45' ;;
+    cmi) printf '45' ;;
+    cn2_gt) printf '38' ;;
+    ctg_163) printf '22' ;;
+    4837) printf '15' ;;
+    cmnet) printf '15' ;;
+    163) printf '15' ;;
+    *) printf '0' ;;
+  esac
+}
+route_china_class_label() {
+  case $1 in
+    gia) printf 'CN2 GIA' ;;
+    ctg_cn2) printf 'CTG→CN2' ;;
+    cn2_gt) printf 'CN2 GT' ;;
+    cn2_unknown) printf 'CN2' ;;
+    ctg_163) printf 'CTG→163' ;;
+    163) printf '163' ;;
+    cuii) printf '9929/CUII' ;;
+    cug) printf '10099/CUG' ;;
+    4837) printf '4837' ;;
+    cmin2) printf 'CMIN2' ;;
+    cmi) printf 'CMI' ;;
+    cmnet) printf '普通CMNET' ;;
+    *) printf '未能识别' ;;
+  esac
+}
+route_latency_points() { # 往返毫秒 理论下限。下限空、0，或不到 40ms 时用绝对档。未知往返返回 -1
+  local rtt=$1 floor=${2:-}
+  [[ $rtt =~ ^[0-9]+$ ]] || { printf -- '-1'; return 0; }
+  # 近距离用比例会把四十毫秒压得很低（下限约 20ms 时 41ms 只有 8–14 分）。短途改按绝对毫秒。
+  if [[ $floor =~ ^[0-9]+$ ]] && (( floor >= 40 )); then
+    local ratio=$((rtt * 100 / floor))
+    if (( ratio <= 130 )); then printf '25'
+    elif (( ratio <= 180 )); then printf '20'
+    elif (( ratio <= 250 )); then printf '14'
+    elif (( ratio <= 400 )); then printf '8'
+    else printf '2'; fi
+  else
+    if (( rtt <= 50 )); then printf '25'
+    elif (( rtt <= 90 )); then printf '20'
+    elif (( rtt <= 150 )); then printf '14'
+    elif (( rtt <= 250 )); then printf '8'
+    else printf '3'; fi
+  fi
+}
+route_loss_points() { # 丢包百分比整数；空或负表示未知，返回 -1
+  local p=$1
+  [[ $p =~ ^[0-9]+$ ]] || { printf -- '-1'; return 0; }
+  if (( p <= 0 )); then printf '15'
+  elif (( p <= 2 )); then printf '12'
+  elif (( p <= 5 )); then printf '8'
+  elif (( p <= 15 )); then printf '4'
+  else printf '0'; fi
+}
+route_china_carrier_score() { # 线路分 延迟分 丢包分。延迟未测不按 0，也不折成 100
+  local line=$1 lat=$2 loss=$3 got=0 max=0 s
+  local lat_missing=0
+  [[ $line =~ ^[0-9]+$ ]] || line=0
+  [[ $lat =~ ^[0-9]+$ ]] || lat_missing=1
+  got=$line
+  max=60
+  if (( ! lat_missing )); then
+    got=$((got + lat))
+    max=$((max + 25))
+  fi
+  if [[ $loss =~ ^[0-9]+$ ]]; then
+    got=$((got + loss))
+    max=$((max + 15))
+  fi
+  if (( max <= 0 )); then printf '0'; return 0; fi
+  s=$(( (got * 100 + max / 2) / max ))
+  if (( s > 100 )); then s=100; fi
+  if (( lat_missing )); then
+    # 未测延迟封顶在 14 分（约 150ms 这一档），不把缺的 25 分当成满分。9929 只剩线路分时是 87，不是 100。
+    local g2 m2 cap
+    g2=$((line + 14))
+    m2=$((60 + 25))
+    if [[ $loss =~ ^[0-9]+$ ]]; then
+      g2=$((g2 + loss))
+      m2=$((m2 + 15))
+    fi
+    cap=$(( (g2 * 100 + m2 / 2) / m2 ))
+    if (( cap > 100 )); then cap=100; fi
+    if (( s > cap )); then s=$cap; fi
+  fi
+  printf '%s' "$s"
+  return 0
+}
+route_china_item_text() { # 运营商中文 线路名 总分 线路分 延迟分 丢包分
+  local name=$1 label=$2 score=$3 line=$4 lat=$5 loss=$6
+  local lat_s loss_s
+  if [[ $lat =~ ^[0-9]+$ ]]; then lat_s=$lat; else lat_s=未测; fi
+  if [[ $loss =~ ^[0-9]+$ ]]; then loss_s=$loss; else loss_s=未测; fi
+  printf '%s回程 %s/100（线路 %s %s、延迟 %s、丢包 %s）' "$name" "$score" "$label" "$line" "$lat_s" "$loss_s"
+}
+route_line_part_up() {
+  local n=$1
+  if (( n <= 0 )); then printf '0'
+  elif (( n == 1 )); then printf '10'
+  elif (( n == 2 )); then printf '18'
+  elif (( n == 3 )); then printf '24'
+  else printf '30'; fi
+}
+route_line_part_t1() {
+  local n=$1
+  if (( n <= 0 )); then printf '0'
+  elif (( n == 1 )); then printf '18'
+  elif (( n == 2 )); then printf '28'
+  elif (( n == 3 )); then printf '35'
+  else printf '40'; fi
+}
+route_line_part_ix() {
+  local n=$1
+  if (( n <= 0 )); then printf '0'
+  elif (( n == 1 )); then printf '8'
+  elif (( n <= 3 )); then printf '16'
+  elif (( n <= 7 )); then printf '24'
+  else printf '30'; fi
+}
+route_line_score() { # 上游家数 Tier1家数 IX个数；任一为 -1 则 na，不把查询失败当成 0 分
+  local u=$1 t=$2 i=$3
+  if [[ $u == -1 || $t == -1 || $i == -1 ]]; then printf 'na'; return 0; fi
+  [[ $u =~ ^[0-9]+$ && $t =~ ^[0-9]+$ && $i =~ ^[0-9]+$ ]] || { printf 'na'; return 0; }
+  local a b c
+  a=$(route_line_part_up "$u"); b=$(route_line_part_t1 "$t"); c=$(route_line_part_ix "$i")
+  printf '%s' $((a + b + c))
+}
+route_na_centric() { case $1 in 174|3356|6939|701|7018|6461|1239) return 0 ;; *) return 1 ;; esac; }
+route_eu_centric() { case $1 in 3320|5511|1299|6762) return 0 ;; *) return 1 ;; esac; }
+route_detour_anomaly() { # 本机洲 目标洲 是否北美骨干 是否欧洲骨干 → us / eu；同向则空
+  local vps=$1 dest=$2 na=$3 eu=$4
+  if [[ $vps == "$dest" ]]; then
+    if [[ $vps == apac && $na == 1 ]]; then printf 'us'; return 0; fi
+    if [[ $vps == apac && $eu == 1 ]]; then printf 'eu'; return 0; fi
+    if [[ $vps == na && $eu == 1 ]]; then printf 'eu'; return 0; fi
+    if [[ $vps == eu && $na == 1 ]]; then printf 'us'; return 0; fi
+    return 0
+  fi
+  if [[ $vps == apac && $dest == eu && $na == 1 ]]; then printf 'us'; return 0; fi
+  if [[ $vps == apac && $dest == na && $eu == 1 ]]; then printf 'eu'; return 0; fi
+  if [[ $vps == eu && $dest == apac && $na == 1 ]]; then printf 'us'; return 0; fi
+  if [[ $vps == na && $dest == apac && $eu == 1 ]]; then printf 'eu'; return 0; fi
+  return 0
+}
+route_detour_kind() { # 本机洲 目标洲 ASN... 往返 下限 → us / eu / slow / 空
+  local vps=$1 dest=$2 asn_csv=$3 rtt=$4 floor=$5
+  [[ $rtt =~ ^[0-9]+$ && $floor =~ ^[0-9]+$ ]] || return 0
+  (( floor > 0 )) || return 0
+  local extra=$((rtt - floor))
+  local x na=0 eu=0 kind=""
+  local -a asn_words=()
+  read -r -a asn_words <<<"$asn_csv"
+  for x in "${asn_words[@]}"; do
+    x=${x#AS}; x=${x#as}
+    if route_na_centric "$x"; then na=1; fi
+    if route_eu_centric "$x"; then eu=1; fi
+  done
+  kind=$(route_detour_anomaly "$vps" "$dest" "$na" "$eu")
+  if [[ -n $kind ]]; then
+    # 绕到不该出现的洲：仍要超过两倍下限，并且多出不少于 30ms，短途噪声不算。
+    (( rtt > floor * 2 && extra >= 30 )) || return 0
+    printf '%s' "$kind"
+    return 0
+  fi
+  # 同向长途（尤其亚太到欧洲）光缆经常接近两倍下限。没有绕洲时要超过 2.5 倍，并且多出不少于 40ms。
+  (( extra >= 40 )) || return 0
+  (( rtt * 2 > floor * 5 )) || return 0
+  printf 'slow'
+  return 0
+}
+route_detour_extra() {
+  local rtt=$1 floor=$2
+  [[ $rtt =~ ^[0-9]+$ && $floor =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  if (( rtt > floor )); then printf '%s' $((rtt - floor)); else printf '0'; fi
+}
+route_path_class_points() {
+  case $1 in
+    direct) printf '60' ;;
+    t1) printf '48' ;;
+    t23) printf '36' ;;
+    multi) printf '22' ;;
+    detour) printf '12' ;;
+    *) printf '0' ;;
+  esac
+}
+route_path_class_label() {
+  case $1 in
+    direct) printf '直连/对等' ;;
+    t1) printf 'Tier1 中转' ;;
+    t23) printf 'Tier2/3' ;;
+    multi) printf '多跳' ;;
+    detour) printf '绕路' ;;
+    unreach) printf '不可达' ;;
+    *) printf '不可达' ;;
+  esac
+}
+route_intl_lat_points() { # 往返 下限，满分 40。未知往返返回 -1，调用方不得把它当成 0 分
+  local rtt=$1 floor=${2:-}
+  [[ $rtt =~ ^[0-9]+$ ]] || { printf -- '-1'; return 0; }
+  if [[ $floor =~ ^[0-9]+$ ]] && (( floor > 0 )); then
+    local ratio=$((rtt * 100 / floor))
+    if (( ratio <= 125 )); then printf '40'
+    elif (( ratio <= 160 )); then printf '32'
+    elif (( ratio <= 220 )); then printf '22'
+    elif (( ratio <= 350 )); then printf '12'
+    else printf '4'; fi
+  else
+    if (( rtt <= 40 )); then printf '40'
+    elif (( rtt <= 80 )); then printf '32'
+    elif (( rtt <= 150 )); then printf '22'
+    elif (( rtt <= 250 )); then printf '12'
+    else printf '4'; fi
+  fi
+}
+route_asn_usable() { # 去掉 AS0、AS_TRANS、私有和保留 ASN。这些不是路径上的运营商
+  local a=$1
+  [[ $a =~ ^[0-9]+$ ]] || return 1
+  if (( a == 0 || a == 23456 || a == 65535 )); then return 1; fi
+  if (( a >= 64512 && a <= 65534 )); then return 1; fi
+  if (( a >= 4200000000 )); then return 1; fi
+  return 0
+}
+route_path_class() { # 本机洲 目标洲 ASN串 往返 下限 [源ASN] [目标ASN] [是否到达 0/1]
+  local vps=$1 dest=$2 asn_csv=$3 rtt=$4 floor=$5 origin=${6:-} dest_asn=${7:-} reached=${8:-0}
+  local -a arr=() asn_words=()
+  local x prev="" n=0 t1n=0 dest_in=0
+  origin=${origin#AS}; origin=${origin#as}; origin=${origin#As}
+  dest_asn=${dest_asn#AS}; dest_asn=${dest_asn#as}; dest_asn=${dest_asn#As}
+  [[ $origin =~ ^[0-9]+$ ]] || origin=""
+  [[ $dest_asn =~ ^[0-9]+$ ]] || dest_asn=""
+  [[ $reached =~ ^[0-9]+$ ]] || reached=0
+  read -r -a asn_words <<<"$asn_csv"
+  for x in "${asn_words[@]}"; do
+    x=${x#AS}; x=${x#as}; x=${x#As}
+    route_asn_usable "$x" || continue
+    [[ -n $origin && $x == "$origin" ]] && continue
+    [[ -n $prev && $x == "$prev" ]] && continue
+    arr+=("$x")
+    prev=$x
+    n=$((n + 1))
+    if route_is_tier1 "$x"; then t1n=$((t1n + 1)); fi
+    if [[ -n $dest_asn && $x == "$dest_asn" ]]; then dest_in=1; fi
+  done
+  if (( n == 0 )); then printf 'unreach'; return 0; fi
+  local det
+  det=$(route_detour_kind "$vps" "$dest" "${arr[*]}" "$rtt" "$floor")
+  if [[ -n $det ]]; then printf 'detour'; return 0; fi
+  if (( t1n >= 2 )); then printf 't1'; return 0; fi
+  # 直连只剩目标自己的 ASN。中间再有 Vodafone、RETN 或其他运营商就不是直连。
+  if (( dest_in && t1n == 0 && n == 1 && reached )); then printf 'direct'; return 0; fi
+  if (( t1n >= 1 && n <= 4 )); then printf 't1'; return 0; fi
+  if (( n >= 6 )); then printf 'multi'; return 0; fi
+  printf 't23'
+}
+route_intl_target_score() { # 路径档 延迟分。延迟分不是数字时，只把路径档从 60 分折算到 100，不记 0
+  local p lat=$2 s
+  p=$(route_path_class_points "$1")
+  if [[ ! $lat =~ ^[0-9]+$ ]]; then
+    printf '%s' $(( (p * 100 + 30) / 60 ))
+    return 0
+  fi
+  s=$((p + lat))
+  (( s > 100 )) && s=100
+  printf '%s' "$s"
+}
+route_cc_continent() {
+  case ${1^^} in
+    CN|HK|MO|TW|JP|KR|SG|MY|TH|VN|ID|PH|AU|NZ|IN|BD|LK|KH|LA|MM|BN|PK|NP|MN) printf 'apac' ;;
+    US|CA|MX) printf 'na' ;;
+    GB|UK|DE|FR|NL|IT|ES|SE|NO|FI|DK|PL|IE|PT|AT|CH|BE|CZ|HU|RO|GR|BG|HR|SK|SI|LT|LV|EE|LU|IS|UA) printf 'eu' ;;
+    *) printf 'other' ;;
+  esac
+}
+route_continent_weights() { # 输出「亚太 北美 欧洲」
+  case $1 in
+    apac) printf '50 25 25' ;;
+    na) printf '20 50 30' ;;
+    eu) printf '20 30 50' ;;
+    *) printf '34 33 33' ;;
+  esac
+}
+route_cont_zh() {
+  case $1 in
+    apac) printf '亚太' ;;
+    na) printf '北美' ;;
+    eu) printf '欧洲' ;;
+    *) printf '其他' ;;
+  esac
+}
+route_intl_combine() { # 分1 权1 分2 权2 分3 权3；非数字的分数丢掉并重分配权重
+  local s1=$1 w1=$2 s2=$3 w2=$4 s3=$5 w3=$6
+  local num=0 den=0
+  if [[ $s1 =~ ^[0-9]+$ && $w1 =~ ^[0-9]+$ ]]; then num=$((num + s1 * w1)); den=$((den + w1)); fi
+  if [[ $s2 =~ ^[0-9]+$ && $w2 =~ ^[0-9]+$ ]]; then num=$((num + s2 * w2)); den=$((den + w2)); fi
+  if [[ $s3 =~ ^[0-9]+$ && $w3 =~ ^[0-9]+$ ]]; then num=$((num + s3 * w3)); den=$((den + w3)); fi
+  if (( den == 0 )); then printf 'na'; else printf '%s' $(( (num + den / 2) / den )); fi
+}
+route_colo_latlon() {
+  case ${1^^} in
+    HKG) printf '22.31 114.17' ;;
+    NRT|HND|TYO) printf '35.68 139.76' ;;
+    KIX) printf '34.43 135.23' ;;
+    SIN) printf '1.35 103.99' ;;
+    LAX) printf '33.94 -118.41' ;;
+    SJC|SFO) printf '37.40 -122.08' ;;
+    SEA) printf '47.45 -122.31' ;;
+    IAD) printf '38.95 -77.46' ;;
+    EWR|JFK) printf '40.64 -73.78' ;;
+    ORD) printf '41.98 -87.90' ;;
+    CMH) printf '39.96 -82.99' ;;
+    DFW) printf '32.90 -97.04' ;;
+    MIA) printf '25.80 -80.29' ;;
+    ATL) printf '33.64 -84.43' ;;
+    DEN) printf '39.86 -104.67' ;;
+    FRA) printf '50.04 8.56' ;;
+    AMS) printf '52.31 4.76' ;;
+    LHR) printf '51.47 -0.46' ;;
+    CDG) printf '49.01 2.55' ;;
+    MAD) printf '40.47 -3.56' ;;
+    ARN) printf '59.65 17.93' ;;
+    WAW) printf '52.17 20.97' ;;
+    SYD) printf '-33.95 151.18' ;;
+    MEL) printf '-37.67 144.84' ;;
+    ICN) printf '37.46 126.44' ;;
+    TPE) printf '25.08 121.23' ;;
+    KUL) printf '2.75 101.71' ;;
+    BKK) printf '13.69 100.75' ;;
+    DEL) printf '28.56 77.10' ;;
+    BOM) printf '19.09 72.87' ;;
+    *) printf '' ;;
+  esac
+}
+route_cc_latlon() {
+  case ${1^^} in
+    HK) printf '22.30 114.17' ;;
+    MO) printf '22.20 113.55' ;;
+    TW) printf '25.03 121.57' ;;
+    JP) printf '35.68 139.76' ;;
+    KR) printf '37.57 126.98' ;;
+    SG) printf '1.35 103.82' ;;
+    AU) printf '-33.87 151.21' ;;
+    NZ) printf '-36.85 174.76' ;;
+    DE) printf '50.11 8.68' ;;
+    NL) printf '52.37 4.90' ;;
+    GB|UK) printf '51.51 -0.13' ;;
+    FR) printf '48.86 2.35' ;;
+    US) printf '39.00 -98.00' ;;
+    CA) printf '43.65 -79.38' ;;
+    CN) printf '39.90 116.41' ;;
+    *) printf '' ;;
+  esac
+}
+route_distance_km() { # lat1 lon1 lat2 lon2
+  awk -v lat1="$1" -v lon1="$2" -v lat2="$3" -v lon2="$4" 'BEGIN {
+    if (lat1+0==0 && lon1+0==0 && lat2+0==0 && lon2+0==0) { print 0; exit }
+    pi=atan2(0, -1)
+    r1=lat1*pi/180; r2=lat2*pi/180
+    dlat=(lat2-lat1)*pi/180; dlon=(lon2-lon1)*pi/180
+    a=sin(dlat/2)^2 + cos(r1)*cos(r2)*sin(dlon/2)^2
+    if (a<0) a=0
+    if (a>1) a=1
+    c=2*atan2(sqrt(a), sqrt(1-a))
+    printf "%d", 6371*c+0.5
+  }'
+}
+route_rtt_floor_ms() {
+  local km=$1 ms
+  [[ $km =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  ms=$(( (km + 50) / 100 ))
+  if (( ms < 1 && km > 0 )); then ms=1; fi
+  printf '%s' "$ms"
+}
+route_pick_upstreams() { # looking-glass 列表、邻居列表、邻居个数。超过 12 个 left 邻居不用
+  local lg=$1 neigh=$2 n=$3 x
+  local -a picked=() lg_words=() nb_words=()
+  read -r -a lg_words <<<"$lg"
+  for x in "${lg_words[@]}"; do route_asn_usable "$x" && picked+=("$x"); done
+  if [[ $n =~ ^[0-9]+$ ]] && (( n <= 12 )); then
+    read -r -a nb_words <<<"$neigh"
+    for x in "${nb_words[@]}"; do route_asn_usable "$x" && picked+=("$x"); done
+  fi
+  if ((${#picked[@]})); then route_uniq_words "${picked[@]}"; fi
+  return 0
+}
+route_unused_upstreams() { # 上游列表 路径 ASN。只点名 Tier1、HE、RETN 里没出现在路径上的
+  local ups=$1 path=$2 x out=""
+  local -a up_words=()
+  read -r -a up_words <<<"$ups"
+  for x in "${up_words[@]}"; do
+    x=${x#AS}; x=${x#as}
+    route_is_tier1 "$x" || [[ $x == 6939 || $x == 9002 ]] || continue
+    [[ " $path " == *" $x "* ]] && continue
+    out+="$x "
+  done
+  printf '%s' "$out"
+}
+route_unused_note() {
+  local ups=$1 path=$2 u names="" used="" x nm
+  u=$(route_unused_upstreams "$ups" "$path")
+  [[ -n ${u// } ]] || return 0
+  for x in $u; do
+    nm=$(route_asn_name "$x")
+    names+="${nm:-AS$x}（AS${x}）、"
+  done
+  names=${names%、}
+  for x in $path; do
+    x=${x#AS}; x=${x#as}
+    nm=$(route_asn_name "$x")
+    [[ -n $nm ]] && used+="${nm}（AS${x}）、"
+  done
+  used=${used%、}
+  if [[ -n $used ]]; then
+    printf '对等或上游里有 %s，但这条路径上没有看到它们，实际经过的是 %s。名单里有这家运营商，不能当成这条路真的用了它。\n' "$names" "$used"
+  else
+    printf '对等或上游里有 %s，但这条路径上没有看到它们。有这些上游只说明具备互联条件，不代表去这个目标时走了过去。\n' "$names"
+  fi
+}
+route_he_cogent_note() { # 地址族 上游列表
+  local fam=$1 ups=$2
+  [[ $fam == 6 ]] || return 0
+  [[ " $ups " == *" 6939 "* && " $ups " == *" 174 "* ]] || return 0
+  printf '%s\n' "IPv6 上同时看到了 Hurricane Electric（AS6939）和 Cogent（AS174）。这两家长期不互相交换 IPv6 路由，只在其中一边的目标，另一边往往要绕很远，甚至根本到不了。某一侧不可达时先考虑这个原因，不要当成整条 IPv6 都坏了。"
+}
+route_is_china_return_asn() { # 回国回程里的电信 / 联通 / 移动，不算国际线路上游
+  case $1 in
+    4134|4809|23764|4811|4812|4813|4816|4847|58466|\
+    4837|4808|9929|10099|17816|17621|17622|17623|\
+    9808|58453|58807|56040|56041|56042|56044|56046|56047|56048)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_peer_excluded() { # 真：不要放进国际线路上游（中国回程或这次探测的目标 ASN）
+  local x=$1
+  route_asn_usable "$x" || return 0
+  route_is_china_return_asn "$x" && return 0
+  if [[ -n ${ROUTE_DEST_ASNS:-} && " ${ROUTE_DEST_ASNS} " == *" $x "* ]]; then return 0; fi
+  return 1
+}
+route_note_path_peers() { # 只记紧挨本机的下一跳。源 ASN 不在路径里时也只取第一跳，不往后扫
+  local -a words=()
+  local i n x j origin=${ROUTE_ORIGIN:-}
+  read -r -a words <<<"${ROUTE_PATH_ASNS:-}"
+  n=${#words[@]}
+  (( n == 0 )) && return 0
+  origin=${origin#AS}; origin=${origin#as}
+  if [[ $origin =~ ^[0-9]+$ ]]; then
+    for (( i = 0; i < n; i++ )); do
+      [[ ${words[i]} == "$origin" ]] || continue
+      for (( j = i + 1; j < n; j++ )); do
+        x=${words[j]}
+        route_asn_usable "$x" || continue
+        if ! route_peer_excluded "$x"; then ROUTE_PATH_PEERS+="$x "; fi
+        return 0
+      done
+      return 0
+    done
+  fi
+  for x in "${words[@]}"; do
+    route_asn_usable "$x" || continue
+    if [[ $origin =~ ^[0-9]+$ && $x == "$origin" ]]; then continue; fi
+    if ! route_peer_excluded "$x"; then ROUTE_PATH_PEERS+="$x "; fi
+    return 0
+  done
+  return 0
+}
+route_merge_path_peers() { # 并进 ROUTE_UPSTREAMS。只并路径上的下一跳，中国回程和目标 ASN 仍排除
+  local -a cur=() peers=() merged=()
+  local x
+  read -r -a cur <<<"${ROUTE_UPSTREAMS:-}"
+  read -r -a peers <<<"${ROUTE_PATH_PEERS:-}"
+  for x in "${cur[@]}"; do
+    x=${x#AS}; x=${x#as}
+    route_asn_usable "$x" || continue
+    merged+=("$x")
+  done
+  for x in "${peers[@]}"; do
+    x=${x#AS}; x=${x#as}
+    route_peer_excluded "$x" && continue
+    merged+=("$x")
+  done
+  if ((${#merged[@]})); then
+    ROUTE_UPSTREAMS=$(route_uniq_words "${merged[@]}")
+    ROUTE_UP_OK=1
+  fi
+  return 0
+}
+route_lg_upstreams_from_json() { # 源 ASN；JSON 从标准输入来
+  local origin=$1
+  if have jq; then
+    jq -r --arg origin "$origin" '
+      [ .data.rrcs[]?.peers[]?
+        | (.as_path | tostring | gsub("[^0-9 ]+"; "") | split(" ") | map(select(length > 0))) as $p
+        | select(($p | length) >= 2)
+        | $p[-2]
+        | select(. != $origin and . != "")
+      ] | unique | .[]
+    ' && return 0
+  fi
+  if have python3; then
+    ROUTE_PY_ORIGIN=$origin python3 -c 'import json,os,sys
+origin=os.environ.get("ROUTE_PY_ORIGIN","")
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+seen=[]
+for r in ((d.get("data") or {}).get("rrcs") or []):
+    for peer in (r.get("peers") or []):
+        path=str(peer.get("as_path") or "")
+        nums=[]
+        for tok in path.replace(","," ").split():
+            t="".join(ch for ch in tok if ch.isdigit())
+            if t:
+                nums.append(t)
+        if len(nums)<2:
+            continue
+        hop=nums[-2]
+        if hop==origin or hop=="" or hop in seen:
+            continue
+        seen.append(hop)
+        print(hop)
+'
+    return 0
+  fi
+  local line path hop
+  local -a nums=()
+  while IFS= read -r line; do
+    path=${line##*\"}
+    read -r -a nums <<<"$path"
+    ((${#nums[@]} >= 2)) || continue
+    hop=${nums[${#nums[@]}-2]}
+    [[ $hop =~ ^[0-9]+$ && $hop != "$origin" ]] || continue
+    printf '%s\n' "$hop"
+  done < <(grep -oE '"as_path"[[:space:]]*:[[:space:]]*"[0-9 ]+"' || true)
+}
+route_neigh_left_from_json() {
+  if have jq; then
+    jq -r '[.data.neighbours[]? | select(.type=="left") | (.asn | tostring)] | unique | .[]' && return 0
+  fi
+  if have python3; then
+    python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+seen=[]
+for n in ((d.get("data") or {}).get("neighbours") or []):
+    if n.get("type")!="left":
+        continue
+    a=str(n.get("asn") or "")
+    if not a or a in seen:
+        continue
+    seen.append(a)
+    print(a)
+'
+    return 0
+  fi
+  return 0
+}
+route_pdb_ix_count_from_json() {
+  if have jq; then
+    jq '[.data[]?.ix_id] | unique | length' && return 0
+  fi
+  if have python3; then
+    python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+seen=[]
+for row in (d.get("data") or []):
+    i=row.get("ix_id")
+    if i is None or i in seen:
+        continue
+    seen.append(i)
+print(len(seen))
+'
+    return 0
+  fi
+  printf '0'
+}
+route_prefix_overview_from_json() {
+  if have python3; then
+    python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+data=d.get("data") or {}
+asns=data.get("asns") or []
+asn=""
+holder=""
+if asns and isinstance(asns[0], dict):
+    asn=asns[0].get("asn") or ""
+    holder=asns[0].get("holder") or ""
+print(asn)
+print(holder)
+print(data.get("resource") or "")
+'
+    return 0
+  fi
+  return 0
+}
+route_announced_prefixes_from_json() {
+  if have jq; then
+    jq -r '.data.prefixes[]?.prefix // empty' && return 0
+  fi
+  if have python3; then
+    python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for row in ((d.get("data") or {}).get("prefixes") or []):
+    p=row.get("prefix") or ""
+    if p:
+        print(p)
+'
+    return 0
+  fi
+  grep -oE '"prefix"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' || true
+}
+route_pdb_net_from_json() { # 两行：id、name
+  if have jq; then
+    jq -r '"\(.data[0].id // "")\n\(.data[0].name // "")"' && return 0
+  fi
+  if have python3; then
+    python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+rows=d.get("data") or []
+if rows:
+    print(rows[0].get("id") or "")
+    print(rows[0].get("name") or "")
+else:
+    print("")
+    print("")
+'
+    return 0
+  fi
+  printf '\n'
+}
+route_pdb_fac_count_from_json() {
+  if have jq; then
+    jq '.data | length' && return 0
+  fi
+  if have python3; then
+    python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print(len(d.get("data") or []))
+'
+    return 0
+  fi
+  printf '0'
+}
+route_network_asn_from_json() {
+  if have jq; then
+    jq -r '.data.asns[0] // empty' && return 0
+  fi
+  if have python3; then
+    python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+asns=(d.get("data") or {}).get("asns") or []
+if asns:
+    print(asns[0])
+'
+    return 0
+  fi
+  grep -oE '"asns"[[:space:]]*:[[:space:]]*\[[[:space:]]*"?[0-9]+' | grep -oE '[0-9]+' | head -n 1 || true
+}
+route_whois_parse() {
+  awk -F'|' 'NF >= 2 {
+    gsub(/^[ \t]+|[ \t]+$/, "", $1)
+    gsub(/^[ \t]+|[ \t]+$/, "", $2)
+    if ($1 ~ /^[0-9]+$/ && $2 != "" && $1 !~ /^AS/) print $2, $1
+  }'
+}
+route_is_ip() {
+  local s=${1,,}
+  [[ $s =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0
+  [[ $s == *:* && $s =~ ^[0-9a-f:]+$ ]] && return 0
+  return 1
+}
+route_ip_private() {
+  local ip=$1 o
+  [[ $ip == 10.* || $ip == 192.168.* || $ip == 127.* || $ip == 169.254.* || $ip == 0.* ]] && return 0
+  if [[ $ip =~ ^172\.([0-9]+)\. ]]; then
+    o=${BASH_REMATCH[1]}
+    (( o >= 16 && o <= 31 )) && return 0
+  fi
+  if [[ $ip =~ ^100\.([0-9]+)\. ]]; then
+    o=${BASH_REMATCH[1]}
+    (( o >= 64 && o <= 127 )) && return 0
+  fi
+  [[ ${ip,,} == fe80:* || ${ip,,} == fc* || ${ip,,} == fd* || ${ip,,} == ::1 ]] && return 0
+  return 1
+}
+route_parse_trace_line() {
+  local line=$1 target=$2
+  [[ $line == traceroute* || $line == Tracing* || $line == tracing* ]] && return 0
+  [[ $line == *'hops max'* || $line == *'hop max'* ]] && return 0
+  local -a tok=()
+  local i t ip="" rtt="" stars=0 prev
+  read -r -a tok <<<"$line" || true
+  for (( i = 0; i < ${#tok[@]}; i++ )); do
+    t=${tok[i]}
+    t=${t#(}; t=${t%)}; t=${t%,}
+    if route_is_ip "$t"; then ip=$t
+    elif [[ $t == '*' ]]; then stars=$((stars + 1))
+    elif [[ $t == ms || $t == msec ]]; then
+      prev=${tok[i-1]:-}
+      prev=${prev%ms}
+      if [[ $prev =~ ^[0-9]+(\.[0-9]+)?$ && -z $rtt ]]; then rtt=${prev%%.*}; fi
+    fi
+  done
+  if [[ -z $ip && $stars -gt 0 ]]; then
+    ROUTE_STAR_HOPS=$((ROUTE_STAR_HOPS + 1))
+    ROUTE_HOP_N=$((ROUTE_HOP_N + 1))
+    return 0
+  fi
+  [[ -n $ip ]] || return 0
+  ROUTE_HOP_N=$((ROUTE_HOP_N + 1))
+  ROUTE_HOP_IPS+="$ip "
+  if [[ ${ip,,} == "$target" && -n $rtt ]]; then
+    ROUTE_REACHED=1
+    ROUTE_RTT=$rtt
+  elif [[ ${ip,,} == "$target" ]]; then
+    ROUTE_REACHED=1
+  fi
+}
+route_parse_mtr_line() {
+  local line=$1 target=$2
+  local ip="" loss="" avg=""
+  if [[ $line =~ ([0-9A-Fa-f:.]+|\?+)[[:space:]]+([0-9.]+)%?[[:space:]]+[0-9]+[[:space:]]+[0-9.]+[[:space:]]+([0-9.]+) ]]; then
+    ip=${BASH_REMATCH[1]}
+    loss=${BASH_REMATCH[2]%%.*}
+    avg=${BASH_REMATCH[3]%%.*}
+  else
+    return 0
+  fi
+  if [[ $ip == \?* ]]; then
+    ROUTE_STAR_HOPS=$((ROUTE_STAR_HOPS + 1))
+    ROUTE_HOP_N=$((ROUTE_HOP_N + 1))
+    return 0
+  fi
+  route_is_ip "$ip" || return 0
+  ROUTE_HOP_N=$((ROUTE_HOP_N + 1))
+  ROUTE_HOP_IPS+="$ip "
+  if [[ ${ip,,} == "$target" ]]; then
+    ROUTE_REACHED=1
+    [[ $avg =~ ^[0-9]+$ ]] && ROUTE_RTT=$avg
+    [[ $loss =~ ^[0-9]+$ ]] && ROUTE_LOSS=$loss
+  fi
+}
+route_parse_trace_text() { # 文本 目标地址
+  local text=$1 target=${2,,}
+  ROUTE_HOP_IPS="" ROUTE_STAR_HOPS=0 ROUTE_HOP_N=0
+  ROUTE_RTT=-1 ROUTE_REACHED=0 ROUTE_LOSS=-1 ROUTE_MTR=0
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=$(printf '%s' "$line" | sed -E $'s/\x1B\\[[0-9;?]*[ -/]*[@-~]//g')
+    if [[ $line == *'|'*'--'* ]]; then
+      ROUTE_MTR=1
+      route_parse_mtr_line "$line" "$target"
+    else
+      route_parse_trace_line "$line" "$target"
+    fi
+  done <<<"$text"
+  ROUTE_LOSS_STRONG=0
+  ROUTE_PING=0
+  if (( ROUTE_MTR )); then
+    if (( ! ROUTE_REACHED )); then ROUTE_LOSS=-1
+    elif [[ $ROUTE_LOSS =~ ^[0-9]+$ ]]; then ROUTE_LOSS_STRONG=1
+    fi
+  else
+    ROUTE_LOSS=-1
+  fi
+}
+route_china_targets() { # 地址族 运营商
+  case "$1:$2" in
+    4:telecom)
+      # vote 才定档：目的地址本身在 AS4134 / 202.97。ref 是 AS4809 的 CN2 段，只列出，不投票。
+      printf '%s\n' \
+        "202.96.134.133 23.13 113.26 vote 广东电信" \
+        "61.139.2.69 30.67 104.06 vote 四川电信" \
+        "222.88.88.88 34.76 113.65 vote 河南电信" \
+        "202.97.0.1 39.90 116.41 vote 电信202.97" \
+        "123.101.1.1 34.76 113.65 ref 河南CN2" \
+        "222.92.231.1 32.06 118.78 ref 江苏CN2" ;;
+    4:unicom)
+      printf '%s\n' \
+        "202.99.192.66 39.13 117.20 天津联通" \
+        "221.4.66.66 23.13 113.26 广东联通" \
+        "58.20.127.238 28.23 112.94 湖南联通" ;;
+    4:mobile)
+      printf '%s\n' \
+        "211.136.17.107 39.90 116.41 北京移动" \
+        "211.138.91.1 34.27 117.18 移动骨干" \
+        "117.135.169.1 34.75 113.65 河南移动" ;;
+    6:telecom) printf '%s\n' "240e:f7:4f:1::1 23.13 113.26 电信IPv6" ;;
+    6:unicom) printf '%s\n' "2408:8000::1 39.90 116.41 联通IPv6" ;;
+    6:mobile) printf '%s\n' "2409:8c00:1::1 39.90 116.41 移动IPv6" ;;
+  esac
+}
+route_intl_targets() { # 地址族 洲
+  case "$1:$2" in
+    4:apac)
+      printf '%s\n' \
+        "91.108.56.100 1.35 103.82 新加坡Telegram" \
+        "203.178.136.1 35.69 139.69 东京WIDE" \
+        "203.198.23.10 22.28 114.16 香港HGC" ;;
+    4:na)
+      printf '%s\n' \
+        "149.154.175.50 25.77 -80.19 迈阿密Telegram" \
+        "72.52.104.74 37.55 -121.98 弗里蒙特HE" ;;
+    4:eu)
+      printf '%s\n' \
+        "149.154.167.51 52.37 4.90 阿姆斯特丹Telegram" \
+        "95.211.20.80 52.37 4.89 阿姆斯特丹Leaseweb" ;;
+    6:apac)
+      printf '%s\n' \
+        "2001:b28:f23f:f005::a 1.35 103.82 新加坡Telegram" \
+        "2001:200::1 35.69 139.69 东京WIDE" ;;
+    6:na)
+      printf '%s\n' \
+        "2001:b28:f23d:f001::a 25.77 -80.19 迈阿密Telegram" \
+        "2001:470:0:503::2 37.55 -121.98 弗里蒙特HE" ;;
+    6:eu)
+      printf '%s\n' "2001:67c:4e8:f002::a 52.37 4.90 阿姆斯特丹Telegram" ;;
+  esac
+}
+route_carrier_zh() { case $1 in telecom) printf '电信' ;; unicom) printf '联通' ;; mobile) printf '移动' ;; esac; }
+
+route_whois_tcp() { # 主机 查询正文。$1 在内层 bash 才展开，避免查询正文被外层吃掉
+  local host=$1
+  timeout 12 bash -c "exec 3<>/dev/tcp/${host}/43 || exit 1; printf '%s' \"\$1\" >&3; timeout 8 cat <&3" _ "$2"
+}
+route_ripe_asn() {
+  local j asn=""
+  j=$(curl -fsS --connect-timeout 6 -m 12 -A oneclick-proxy \
+    "https://stat.ripe.net/data/network-info/data.json?resource=$1" 2>/dev/null) || return 1
+  asn=$(printf '%s' "$j" | route_network_asn_from_json 2>/dev/null) || asn=""
+  [[ $asn =~ ^[0-9]+$ ]] || return 1
+  route_asn_usable "$asn" || return 1
+  printf '%s' "$asn"
+}
+route_whois_bulk() {
+  local -a ips=()
+  local ip a raw=""
+  for ip in "$@"; do
+    route_ip_private "$ip" && continue
+    [[ -n ${ROUTE_ASN_CACHE[$ip]+x} ]] && continue
+    ips+=("$ip")
+  done
+  ((${#ips[@]} == 0)) && return 0
+  local q=$'begin\nverbose\n'
+  for ip in "${ips[@]}"; do q+="$ip"$'\n'; done
+  q+=$'end\n'
+  raw=$(route_whois_tcp bgp.tools "$q" 2>/dev/null) || raw=""
+  if [[ -z $raw ]]; then raw=$(route_whois_tcp whois.cymru.com "$q" 2>/dev/null) || raw=""; fi
+  if [[ -n $raw ]]; then
+    while read -r ip a; do
+      [[ -n $ip && $a =~ ^[0-9]+$ ]] || continue
+      route_asn_usable "$a" || continue
+      ROUTE_ASN_CACHE["$ip"]=$a
+    done < <(printf '%s\n' "$raw" | route_whois_parse)
+  fi
+  if have curl; then
+    for ip in "${ips[@]}"; do
+      [[ -n ${ROUTE_ASN_CACHE[$ip]+x} ]] && continue
+      a=$(route_ripe_asn "$ip" 2>/dev/null) || a=""
+      [[ $a =~ ^[0-9]+$ ]] && ROUTE_ASN_CACHE["$ip"]=$a
+    done
+  fi
+  return 0
+}
+route_fill_path_asns() {
+  local ip asn prev=""
+  local -a hop_words=()
+  read -r -a hop_words <<<"$ROUTE_HOP_IPS"
+  if ((${#hop_words[@]})); then route_whois_bulk "${hop_words[@]}"; fi
+  ROUTE_PATH_ASNS=""
+  ROUTE_CLASS_TOKENS=""
+  for ip in "${hop_words[@]}"; do
+    ROUTE_CLASS_TOKENS+="$ip "
+    asn=${ROUTE_ASN_CACHE[$ip]:-}
+    route_asn_usable "$asn" || continue
+    ROUTE_CLASS_TOKENS+="$asn "
+    [[ $asn == "$prev" ]] && continue
+    ROUTE_PATH_ASNS+="$asn "
+    prev=$asn
+  done
+  return 0
+}
+route_trace_bin() {
+  if have traceroute; then printf 'traceroute'
+  elif have nexttrace; then printf 'nexttrace'
+  elif have mtr; then printf 'mtr'
+  elif have ping || have ping6; then printf 'ping'
+  else printf 'none'; fi
+}
+route_run_capture() { # 超时秒 命令...
+  local sec=$1
+  shift
+  if have timeout; then timeout "$sec" "$@" 2>&1 || true
+  else "$@" 2>&1 || true; fi
+}
+route_nexttrace_args() { # 地址族；把参数打到标准输出，一行一个
+  local fam=$1 help
+  help=$(nexttrace --help 2>&1 || true)
+  if [[ $help == *'--traceroute'* ]]; then printf '%s\n' --traceroute; fi
+  if [[ $help == *'--tcp'* || $help == *'-T,'* || $help == *$'\n'"  -T"* || $help == *' -T '* ]]; then
+    printf '%s\n' -T -p 8080
+  fi
+  [[ $fam == 6 ]] && printf '%s\n' -6
+  if [[ $help == *' -q '* || $help == *$'\n'"  -q"* ]]; then printf '%s\n' -q 1; fi
+  printf '%s\n' -m 18
+}
+route_obs_reset() {
+  ROUTE_HOP_IPS=""
+  ROUTE_STAR_HOPS=0
+  ROUTE_HOP_N=0
+  ROUTE_RTT=-1
+  ROUTE_REACHED=0
+  ROUTE_LOSS=-1
+  ROUTE_MTR=0
+  ROUTE_LOSS_STRONG=0
+  ROUTE_PING=0
+}
+route_best_reset() {
+  ROUTE_BEST_HOPS=""
+  ROUTE_BEST_STARS=0
+  ROUTE_BEST_N=0
+  ROUTE_BEST_RTT=-1
+  ROUTE_BEST_REACHED=0
+  ROUTE_BEST_LOSS=-1
+  ROUTE_BEST_MTR=0
+  ROUTE_BEST_STRONG=0
+  ROUTE_BEST_PING=0
+}
+route_best_merge() { # 路径留更完整或已到达的那次；往返用先测到的；丢包只用 mtr/ping
+  local take=0
+  if [[ -n ${ROUTE_HOP_IPS// } && -z ${ROUTE_BEST_HOPS// } ]]; then
+    take=1
+  elif (( ROUTE_REACHED && ! ROUTE_BEST_REACHED )); then
+    take=1
+  elif (( ROUTE_REACHED == ROUTE_BEST_REACHED && ROUTE_HOP_N > ROUTE_BEST_N )); then
+    take=1
+  fi
+  if (( take )); then
+    ROUTE_BEST_HOPS=$ROUTE_HOP_IPS
+    ROUTE_BEST_STARS=$ROUTE_STAR_HOPS
+    ROUTE_BEST_N=$ROUTE_HOP_N
+    ROUTE_BEST_REACHED=$ROUTE_REACHED
+  fi
+  if (( ROUTE_REACHED )); then ROUTE_BEST_REACHED=1; fi
+  if [[ ! $ROUTE_BEST_RTT =~ ^[0-9]+$ && $ROUTE_RTT =~ ^[0-9]+$ ]]; then
+    ROUTE_BEST_RTT=$ROUTE_RTT
+  fi
+  if [[ $ROUTE_LOSS =~ ^[0-9]+$ ]] && (( ROUTE_LOSS_STRONG )) && (( ! ROUTE_BEST_STRONG )); then
+    ROUTE_BEST_LOSS=$ROUTE_LOSS
+    ROUTE_BEST_STRONG=1
+    ROUTE_BEST_MTR=$ROUTE_MTR
+    ROUTE_BEST_PING=$ROUTE_PING
+  fi
+  return 0
+}
+route_best_commit() {
+  ROUTE_HOP_IPS=$ROUTE_BEST_HOPS
+  ROUTE_STAR_HOPS=$ROUTE_BEST_STARS
+  ROUTE_HOP_N=$ROUTE_BEST_N
+  ROUTE_RTT=$ROUTE_BEST_RTT
+  ROUTE_REACHED=$ROUTE_BEST_REACHED
+  ROUTE_LOSS=$ROUTE_BEST_LOSS
+  ROUTE_MTR=$ROUTE_BEST_MTR
+  ROUTE_LOSS_STRONG=$ROUTE_BEST_STRONG
+  ROUTE_PING=$ROUTE_BEST_PING
+}
+route_trace_bad() { # 选项不被这个 traceroute/ping 接受，或完全没有输出
+  local raw=$1 flat
+  flat=${raw//[$' \t\r\n']/}
+  [[ -z $flat ]] && return 0
+  [[ $raw == *'invalid option'* || $raw == *'unknown option'* || $raw == *'not recognized'* || $raw == *'unrecognized'* || $raw == *'bad option'* || $raw == *'Invalid argument'* || $raw == *'not permitted'* ]] && return 0
+  return 1
+}
+route_ingest_trace() {
+  route_parse_trace_text "$1" "$2"
+  route_best_merge
+}
+route_traceroute_once() { # 地址族 目标 额外参数...
+  local fam=$1 target=$2
+  shift 2
+  local -a args=(traceroute)
+  [[ $fam == 6 ]] && args+=(-6)
+  if (( $# )); then args+=("$@"); fi
+  args+=(-n -w 1 -q 1 -m 18 "$target")
+  route_run_capture 22 "${args[@]}"
+}
+route_try_traceroute() {
+  local target=$1 fam=$2 raw=""
+  raw=$(route_traceroute_once "$fam" "$target" -T -p 8080)
+  if ! route_trace_bad "$raw"; then route_ingest_trace "$raw" "$target"; fi
+  if [[ $ROUTE_BEST_RTT =~ ^[0-9]+$ ]] && (( ROUTE_BEST_REACHED )); then return 0; fi
+  raw=$(route_traceroute_once "$fam" "$target" -I)
+  if route_trace_bad "$raw"; then
+    raw=$(route_traceroute_once "$fam" "$target")
+  fi
+  if ! route_trace_bad "$raw"; then route_ingest_trace "$raw" "$target"; fi
+  return 0
+}
+route_try_nexttrace() {
+  local target=$1 fam=$2 raw="" line
+  local -a args=()
+  while IFS= read -r line; do [[ -n $line ]] && args+=("$line"); done < <(route_nexttrace_args "$fam")
+  raw=$(route_run_capture 25 nexttrace "${args[@]}" "$target")
+  route_ingest_trace "$raw" "$target"
+  if [[ $ROUTE_BEST_RTT =~ ^[0-9]+$ ]]; then return 0; fi
+  args=(--traceroute -m 18)
+  [[ $fam == 6 ]] && args+=(-6)
+  raw=$(route_run_capture 25 nexttrace "${args[@]}" "$target")
+  route_ingest_trace "$raw" "$target"
+  return 0
+}
+route_try_mtr_icmp() {
+  have mtr || return 0
+  if [[ $ROUTE_BEST_RTT =~ ^[0-9]+$ ]] && (( ROUTE_BEST_STRONG )); then return 0; fi
+  local target=$1 fam=$2 raw
+  local -a mt=(mtr -n -r -c 4 -w -m 18)
+  if [[ $fam == 6 ]]; then mt+=(-6); else mt+=(-4); fi
+  raw=$(route_run_capture 28 "${mt[@]}" "$target")
+  if [[ $raw == *'|'*'--'* ]]; then route_ingest_trace "$raw" "$target"; fi
+  return 0
+}
+route_try_mtr_primary() {
+  local target=$1 fam=$2 raw=""
+  local -a mt=(mtr -n -r -c 4 -w -m 18)
+  if [[ $fam == 6 ]]; then mt+=(-6); else mt+=(-4); fi
+  raw=$(route_run_capture 28 "${mt[@]}" -T -P 8080 "$target")
+  if ! route_trace_bad "$raw" && [[ $raw == *'|'*'--'* ]]; then
+    route_ingest_trace "$raw" "$target"
+  fi
+  if [[ $ROUTE_BEST_RTT =~ ^[0-9]+$ ]] && (( ROUTE_BEST_STRONG )); then return 0; fi
+  raw=$(route_run_capture 28 "${mt[@]}" "$target")
+  if [[ $raw == *'|'*'--'* ]]; then route_ingest_trace "$raw" "$target"; fi
+  return 0
+}
+route_ping_metrics() { # 文本 →「往返 丢包」。100% 丢包或没有往返时两个都是 -1
+  local text=$1 loss="" rtt="" sample=""
+  if [[ $text =~ ([0-9]+)%[[:space:]]+packet[[:space:]]+loss ]]; then
+    loss=${BASH_REMATCH[1]}
+  fi
+  if [[ $loss == 100 ]]; then printf -- '-1 -1'; return 0; fi
+  if [[ $text =~ (rtt|round-trip)[[:space:]]+min/avg/max(/mdev)?[[:space:]]*=[[:space:]]*[0-9.]+/([0-9.]+)/ ]]; then
+    rtt=${BASH_REMATCH[3]%%.*}
+  fi
+  if [[ ! $rtt =~ ^[0-9]+$ ]]; then
+    sample=$(printf '%s\n' "$text" | grep -oE 'time[=<][0-9.]+' | tail -n 1 || true)
+    sample=${sample#time=}
+    sample=${sample#<}
+    rtt=${sample%%.*}
+  fi
+  if [[ ! $rtt =~ ^[0-9]+$ ]]; then printf -- '-1 -1'; return 0; fi
+  if [[ ! $loss =~ ^[0-9]+$ ]]; then loss=-1; fi
+  printf '%s %s' "$rtt" "$loss"
+}
+route_apply_ping() {
+  local text=$1 rtt="" loss=""
+  read -r rtt loss <<<"$(route_ping_metrics "$text")"
+  [[ $rtt =~ ^[0-9]+$ ]] || return 1
+  route_obs_reset
+  ROUTE_RTT=$rtt
+  ROUTE_PING=1
+  if [[ $loss =~ ^[0-9]+$ ]]; then
+    ROUTE_LOSS=$loss
+    ROUTE_LOSS_STRONG=1
+  fi
+  route_best_merge
+  return 0
+}
+route_try_ping() {
+  if [[ $ROUTE_BEST_RTT =~ ^[0-9]+$ ]] && (( ROUTE_BEST_STRONG )); then return 0; fi
+  local target=$1 fam=$2 raw=""
+  if [[ $fam == 6 ]]; then
+    if have ping; then
+      raw=$(route_run_capture 14 ping -6 -c 4 -W 2 "$target")
+      if route_trace_bad "$raw"; then
+        raw=$(route_run_capture 16 ping -6 -c 4 -w 8 "$target")
+      fi
+    fi
+    if { [[ -z ${raw//[$' \t\r\n']/} ]] || route_trace_bad "$raw"; } && have ping6; then
+      raw=$(route_run_capture 16 ping6 -c 4 -w 8 "$target")
+    fi
+  else
+    have ping || return 0
+    raw=$(route_run_capture 14 ping -c 4 -W 2 "$target")
+    if route_trace_bad "$raw"; then
+      raw=$(route_run_capture 16 ping -c 4 -w 8 "$target")
+    fi
+  fi
+  route_apply_ping "$raw" || true
+  return 0
+}
+route_probe() { # 目标。TCP/8080 没有往返时改 ICMP traceroute，再 ICMP mtr，再 ping
+  local target=$1 fam=4 mode
+  [[ $target == *:* ]] && fam=6
+  mode=$(route_trace_bin)
+  route_best_reset
+  route_obs_reset
+  [[ $mode == none ]] && return 1
+  case $mode in
+    traceroute)
+      route_try_traceroute "$target" "$fam"
+      route_try_mtr_icmp "$target" "$fam"
+      ;;
+    nexttrace)
+      route_try_nexttrace "$target" "$fam"
+      route_try_mtr_icmp "$target" "$fam"
+      ;;
+    mtr) route_try_mtr_primary "$target" "$fam" ;;
+    ping) ;;
+  esac
+  route_try_ping "$target" "$fam"
+  route_best_commit
+  if (( ROUTE_HOP_N > 0 || ROUTE_REACHED == 1 )); then return 0; fi
+  [[ $ROUTE_RTT =~ ^[0-9]+$ ]] && return 0
+  return 1
+}
+route_url_res() { printf '%s' "${1//\//%2F}"; }
+route_curl_json() { # 外层 timeout，避免 curl 自己的 -m 在卡住的连接上拖很久
+  if have timeout; then
+    timeout -k 3 18 curl -fsS --connect-timeout 5 --retry 0 -m 12 -A oneclick-proxy "$1" 2>/dev/null
+  else
+    curl -fsS --connect-timeout 5 --retry 0 -m 12 -A oneclick-proxy "$1" 2>/dev/null
+  fi
+}
+route_load_origin() { # ip
+  local ip=$1 j oline="" hline="" pline=""
+  ROUTE_ORIGIN="" ROUTE_HOLDER="" ROUTE_PREFIX=""
+  if have curl; then
+    j=$(route_curl_json "https://stat.ripe.net/data/prefix-overview/data.json?resource=$(route_url_res "$ip")") || j=""
+    if [[ -n $j ]]; then
+      if have jq; then
+        ROUTE_ORIGIN=$(jq -r '.data.asns[0].asn // empty' <<<"$j" 2>/dev/null || true)
+        ROUTE_HOLDER=$(jq -r '.data.asns[0].holder // empty' <<<"$j" 2>/dev/null || true)
+        ROUTE_PREFIX=$(jq -r '.data.resource // empty' <<<"$j" 2>/dev/null || true)
+      else
+        {
+          IFS= read -r oline || true
+          IFS= read -r hline || true
+          IFS= read -r pline || true
+        } < <(printf '%s' "$j" | route_prefix_overview_from_json)
+        ROUTE_ORIGIN=$oline
+        ROUTE_HOLDER=$hline
+        ROUTE_PREFIX=$pline
+      fi
+    fi
+  fi
+  if ! route_asn_usable "${ROUTE_ORIGIN:-}"; then ROUTE_ORIGIN=""; fi
+  if [[ ! $ROUTE_ORIGIN =~ ^[0-9]+$ ]]; then
+    route_whois_bulk "$ip"
+    ROUTE_ORIGIN=${ROUTE_ASN_CACHE[$ip]:-}
+  fi
+  if ! route_asn_usable "${ROUTE_ORIGIN:-}"; then ROUTE_ORIGIN=""; fi
+}
+route_set_place() { # loc colo
+  local loc=$1 colo=$2 ll=""
+  ll=$(route_colo_latlon "$colo")
+  [[ -n $ll ]] || ll=$(route_cc_latlon "$loc")
+  ROUTE_LOC=$loc ROUTE_COLO=$colo
+  if [[ -n $ll ]]; then
+    read -r ROUTE_LAT ROUTE_LON <<<"$ll"
+    if [[ -n $loc ]]; then ROUTE_CONT=$(route_cc_continent "$loc")
+    else ROUTE_CONT=other; fi
+  else
+    ROUTE_LAT="" ROUTE_LON="" ROUTE_CONT=other
+  fi
+}
+route_load_place() { # 地址族
+  local fam=$1 raw="" loc="" colo=""
+  ROUTE_LOC="" ROUTE_COLO=""
+  if have curl; then
+    if [[ $fam == 6 ]]; then
+      raw=$(curl -6 -fsS --connect-timeout 5 -m 8 "https://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null) || raw=""
+    else
+      raw=$(curl -4 -fsS --connect-timeout 5 -m 8 "https://1.1.1.1/cdn-cgi/trace" 2>/dev/null) || raw=""
+    fi
+    loc=$(awk -F= '$1=="loc"{print $2; exit}' <<<"$raw")
+    colo=$(awk -F= '$1=="colo"{print $2; exit}' <<<"$raw")
+  fi
+  route_set_place "$loc" "$colo"
+}
+route_load_upstreams() { # 源 ASN 地址族
+  local asn=$1 fam=$2
+  ROUTE_UPSTREAMS="" ROUTE_UP_OK=0 ROUTE_IX=-1 ROUTE_IX_OK=0 ROUTE_FAC=-1
+  ROUTE_NEIGH_N=-1 ROUTE_PDB_NAME="" ROUTE_NEIGH_WIDE=0 ROUTE_LG_UP_N=-1
+  [[ $asn =~ ^[0-9]+$ ]] || return 0
+  have curl || return 0
+  local -a prefs=() lg_words=()
+  local ann p raw ups lg="" nb id ixj fac sz lg_u neigh_ok=0
+  [[ -n $ROUTE_PREFIX ]] && prefs+=("$ROUTE_PREFIX")
+  ann=$(route_curl_json "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${asn}") || ann=""
+  if [[ -n $ann ]]; then
+    while read -r p; do
+      [[ -z $p ]] && continue
+      if [[ $fam == 4 && $p == *:* ]]; then continue; fi
+      if [[ $fam == 6 && $p != *:* ]]; then continue; fi
+      [[ " ${prefs[*]} " == *" $p "* ]] && continue
+      prefs+=("$p")
+      ((${#prefs[@]} >= 4)) && break
+    done < <(printf '%s' "$ann" | route_announced_prefixes_from_json 2>/dev/null || true)
+  fi
+  for p in "${prefs[@]}"; do
+    raw=$(route_curl_json "https://stat.ripe.net/data/looking-glass/data.json?resource=$(route_url_res "$p")") || continue
+    ups=$(printf '%s' "$raw" | route_lg_upstreams_from_json "$asn" 2>/dev/null) || ups=""
+    lg+=" $ups"
+    ROUTE_UP_OK=1
+  done
+  read -r -a lg_words <<<"$lg"
+  if ((${#lg_words[@]})); then
+    lg_u=$(route_uniq_words "${lg_words[@]}")
+    read -r -a lg_words <<<"$lg_u"
+    ROUTE_LG_UP_N=${#lg_words[@]}
+  else
+    ROUTE_LG_UP_N=0
+  fi
+  mktmp
+  if have timeout; then
+    timeout -k 3 18 curl -fsS --connect-timeout 5 --retry 0 -m 12 -A oneclick-proxy \
+      -o "${TMP_DIR}/route-neigh.json" \
+      "https://stat.ripe.net/data/asn-neighbours/data.json?resource=AS${asn}" 2>/dev/null && neigh_ok=1
+  elif curl -fsS --connect-timeout 5 --retry 0 -m 12 -A oneclick-proxy \
+      -o "${TMP_DIR}/route-neigh.json" \
+      "https://stat.ripe.net/data/asn-neighbours/data.json?resource=AS${asn}" 2>/dev/null; then
+    neigh_ok=1
+  fi
+  if (( neigh_ok )); then
+    sz=$(wc -c < "${TMP_DIR}/route-neigh.json" 2>/dev/null || echo 0)
+    if (( sz > 250000 )); then
+      ROUTE_NEIGH_N=999
+      ROUTE_NEIGH_WIDE=1
+    else
+      nb=$(route_neigh_left_from_json < "${TMP_DIR}/route-neigh.json" 2>/dev/null) || nb=""
+      ROUTE_NEIGH_N=$(printf '%s\n' "$nb" | awk 'NF{c++} END{print c+0}')
+    fi
+  fi
+  if (( ROUTE_UP_OK )); then
+    if (( ROUTE_NEIGH_WIDE )); then
+      ROUTE_UPSTREAMS=$(route_pick_upstreams "$lg" "" 999)
+    else
+      ROUTE_UPSTREAMS=$(route_pick_upstreams "$lg" "$nb" "$ROUTE_NEIGH_N")
+    fi
+  elif [[ ${ROUTE_NEIGH_N:-0} =~ ^[0-9]+$ ]] && (( ROUTE_NEIGH_N <= 12 && ROUTE_NEIGH_N > 0 )) && [[ -n ${nb:-} ]]; then
+    ROUTE_UPSTREAMS=$(route_pick_upstreams "" "$nb" "$ROUTE_NEIGH_N")
+    ROUTE_UP_OK=1
+  fi
+  raw=$(route_curl_json "https://www.peeringdb.com/api/net?asn=${asn}") || raw=""
+  if [[ -z $raw ]]; then ROUTE_IX=-1; return 0; fi
+  if have jq; then
+    id=$(jq -r '.data[0].id // empty' <<<"$raw" 2>/dev/null || true)
+    ROUTE_PDB_NAME=$(jq -r '.data[0].name // empty' <<<"$raw" 2>/dev/null || true)
+  else
+    {
+      IFS= read -r id || true
+      IFS= read -r ROUTE_PDB_NAME || true
+    } < <(printf '%s' "$raw" | route_pdb_net_from_json)
+  fi
+  if [[ -z $id ]]; then ROUTE_IX=0; ROUTE_IX_OK=1; return 0; fi
+  ixj=$(route_curl_json "https://www.peeringdb.com/api/netixlan?net_id=${id}") || { ROUTE_IX=-1; return 0; }
+  ROUTE_IX=$(printf '%s' "$ixj" | route_pdb_ix_count_from_json 2>/dev/null || echo -1)
+  [[ $ROUTE_IX =~ ^[0-9]+$ ]] && ROUTE_IX_OK=1
+  fac=$(route_curl_json "https://www.peeringdb.com/api/netfac?net_id=${id}") || fac=""
+  if [[ -n $fac ]]; then
+    ROUTE_FAC=$(printf '%s' "$fac" | route_pdb_fac_count_from_json 2>/dev/null || echo -1)
+  fi
+}
+route_bj_floor() {
+  [[ -n $ROUTE_LAT && -n $ROUTE_LON ]] || { printf ''; return 0; }
+  local km
+  km=$(route_distance_km "$ROUTE_LAT" "$ROUTE_LON" 39.90 116.41)
+  route_rtt_floor_ms "$km"
+}
+route_pair_floor() { # 目标纬度 经度
+  [[ -n $ROUTE_LAT && -n $ROUTE_LON ]] || { printf ''; return 0; }
+  local km
+  km=$(route_distance_km "$ROUTE_LAT" "$ROUTE_LON" "$1" "$2")
+  route_rtt_floor_ms "$km"
+}
+
+route_section_access() {
+  local fam=$1 ip=$2
+  printf '\n%s【本机接入】%s\n' "$C_BOLD" "$C_NONE"
+  route_load_origin "$ip"
+  route_load_place "$fam"
+  local place="没有从 Cloudflare 的 cdn-cgi/trace 读到位置"
+  if [[ -n ${ROUTE_LOC:-} || -n ${ROUTE_COLO:-} ]]; then
+    place="Cloudflare 把接入位置标成 ${ROUTE_LOC:-未知}，就近机房 colo 是 ${ROUTE_COLO:-未知}"
+  fi
+  local asn_txt="没有查到源 ASN"
+  if [[ $ROUTE_ORIGIN =~ ^[0-9]+$ ]]; then
+    asn_txt="源 ASN 是 AS${ROUTE_ORIGIN}"
+    [[ -n $ROUTE_HOLDER ]] && asn_txt+="（${ROUTE_HOLDER}）"
+    [[ -n $ROUTE_PREFIX ]] && asn_txt+="，覆盖前缀 ${ROUTE_PREFIX}"
+  fi
+  printf '这台机器这次用来检测的 IPv%s 是 %s。%s。%s。位置用来估算到北京、以及到各洲测试点的理论往返下限，算法是球面距离的公里数除以 100。地理库和 colo 都会偏，下限只是参照。\n' \
+    "$fam" "$ip" "$asn_txt" "$place"
+  if (( NAT_MODE )); then
+    printf '当前是 NAT 模式。traceroute 仍然从这台机器发出，看的是它出去的路径，不是宿主机或你家里的路径。\n'
+  fi
+  printf '下面的回国测试发向三大运营商自己的地址，方向是 VPS 到大陆，也就是回程。它不能代表你家里的宽带访问这台 VPS 的去程。去程要在你自己的电脑上测，命令在这份报告的最后。\n'
+}
+route_china_explain() {
+  local carrier=$1 class=$2 label=$3 ip=$4 rtt=$5 loss=$6
+  local zh asns_txt floor
+  local -a path_words=()
+  zh=$(route_carrier_zh "$carrier")
+  read -r -a path_words <<<"$ROUTE_PATH_ASNS"
+  if ((${#path_words[@]})); then asns_txt=$(route_fmt_asns "${path_words[@]}"); else asns_txt=""; fi
+  [[ -n $asns_txt ]] || asns_txt="（没有解析出自治系统号）"
+  printf '%s：发往%s（%s）。路径上看到的自治系统依次是 %s。' "$zh" "$label" "$ip" "$asns_txt"
+  case $class in
+    gia)
+      printf '同时有 AS4809 和 59.43 段，而且没有 AS4134、也没有 202.97，按 CN2 GIA 计。这是电信回程里通常最好的一档。'
+      ;;
+    ctg_cn2)
+      printf 'AS23764（CTG）出现在 AS4809 之前，按 CTG 转入 CN2 计。这好于直接走 163，但还不是只走 59.43、不夹 163 的 CN2 GIA。'
+      ;;
+    cn2_gt)
+      printf '路径里有 AS4809，同时又有 AS4134 或 202.97，按 CN2 GT 计。CN2 和 163 混在一起，通常不如 GIA，也不如干净的 CTG→CN2。'
+      ;;
+    cn2_unknown)
+      printf '只看到 AS4809，没有 59.43，也没有 202.97 或 AS4134，分不清是 GIA 还是 GT，档次放在两者之间。'
+      ;;
+    ctg_163)
+      printf '看到 AS23764 之后进入 AS4134，没有 AS4809，按 CTG 转入 163 计。这不是 CN2。'
+      ;;
+    163)
+      if route_any_fn route_is_ct_provincial "${path_words[@]}" && ! route_has 4134 "${path_words[@]}"; then
+        printf '没有 AS4809。看到的是电信省网 ASN，不是 163 骨干 AS4134，仍按普通 163 这一档计，不升到 CN2。'
+      else
+        printf '没有 AS4809。按普通 163（AS4134 或 202.97）计。'
+      fi
+      ;;
+    cuii) printf '看到 AS9929，按联通 CUII / 9929 计。这是联通回程里通常最好的一档，高于 10099 和 4837。' ;;
+    cug) printf '看到 AS10099，没有 AS9929，按联通 CUG / 10099 计。好于普通 4837，不如 9929。' ;;
+    4837) printf '没有 AS9929 和 AS10099。按普通联通（AS4837 或省网）计。' ;;
+    cmin2) printf '看到 AS58807，按移动 CMIN2 计。这是移动回程里通常最好的一档。' ;;
+    cmi) printf '看到 AS58453，没有 AS58807，按移动 CMI 计。好于普通 CMNET，不如 CMIN2。' ;;
+    cmnet) printf '没有 AS58807 和 AS58453。按普通移动 CMNET（AS9808 或省网）计。' ;;
+    *)
+      printf '这些 ASN 对不上这家运营商的 CN2 / 163、9929 / 10099 / 4837、CMIN2 / CMI / CMNET 判断，线路档次记 0。'
+      ;;
+  esac
+  floor=$(route_bj_floor)
+  if [[ $rtt =~ ^[0-9]+$ ]]; then
+    printf '最后一跳往返约 %s ms。' "$rtt"
+    if [[ $floor =~ ^[0-9]+$ && $floor != 0 ]]; then
+      printf '按本机到北京的球面距离，理论下限大约 %s ms。' "$floor"
+      if (( floor < 40 )); then
+        printf '这段距离短，延迟按绝对毫秒分档，不拿短途下限的比例把几十毫秒压低。'
+      elif (( rtt * 100 / floor > 180 )); then
+        printf '实际明显高于这个下限，延迟这一项不会给满。'
+      fi
+    else
+      printf '没有可靠坐标，延迟按绝对毫秒分档，不跟理论下限比。'
+    fi
+  else
+    printf '延迟未测，不按 0 分，也不把缺测折成满分。'
+  fi
+  if [[ $loss =~ ^[0-9]+$ ]]; then
+    if (( ROUTE_PING )); then
+      printf '丢包用 ping，约 %s%%。' "$loss"
+    elif (( ROUTE_MTR )); then
+      printf '丢包用 mtr 最后一跳，约 %s%%。' "$loss"
+    else
+      printf '丢包约 %s%%。' "$loss"
+    fi
+  else
+    printf '丢包未测，不把没测到的项目当成 0 分。'
+  fi
+  if (( ROUTE_STAR_HOPS > 0 )); then
+    printf '中间有 %s 跳没有回应探测。路由器不回探测很常见，这些星号不算进丢包分。' "$ROUTE_STAR_HOPS"
+  fi
+  printf '\n'
+}
+route_section_china() {
+  local fam=$1
+  printf '\n%s【回国回程】%s\n' "$C_BOLD" "$C_NONE"
+  printf '三家分开测，再取平均。某一家地址都测不通时记 0，并且算进平均。线路档次最多 60、延迟最多 25、丢包最多 15。延迟没测到时不按 0 分，也不按满分折到 100，封顶在常见的中等延迟档（14 分）。丢包没测到时不按 0 分，只按测到的项目折算，并写成未测。到北京的理论下限不到 40 毫秒时，延迟改按绝对毫秒分档，近距离的几十毫秒不再被比例压得很低。只有星号、解析不出自治系统的探测按测不通，不写成未能识别。电信 IPv4 定档只用普通电信地址（AS4134、202.97 这一类）。已经在 CN2（AS4809）里的地址可以另测，只作参照，不参与定档。每个目标的档次都会写出来。普通地址档次不一致时按出现次数最多的一档计分，次数相同则用更低的一档。回程探测目标可能与业务流量路径不同。\n'
+  local tool
+  tool=$(route_trace_bin)
+  if [[ $tool == none ]]; then
+    printf '本机没有 traceroute、mtr、nexttrace 或 ping，发不出路径探测。回国回程无法打分。\n'
+    ROUTE_CHINA_SCORE=na
+    return 0
+  fi
+  local carrier zh ip lat lon label class line_pts lat_pts loss_pts score
+  local -a scores=()
+  local responded=0 responded_lat=0
+  for carrier in telecom unicom mobile; do
+    zh=$(route_carrier_zh "$carrier")
+    local best_rank=-1 best_class=unknown best_ip="" best_label="" best_rtt=-1 best_loss=-1
+    local best_hops="" best_path="" best_stars=0 best_mtr=0 best_ping=0 best_n=0
+    local best_reached=0 tried=0 got=0 cap=3 ct_seen="" role=vote label=""
+    local -a ct_class=() ct_label=() ct_ip=() ct_reached=() ct_rtt=() ct_loss=()
+    local -a ct_hops=() ct_path=() ct_stars=() ct_mtr=() ct_ping=() ct_hopn=() ct_role=()
+    [[ $carrier == telecom ]] && cap=8
+    while read -r ip lat lon a b; do
+      [[ -n $ip ]] || continue
+      role=vote
+      label=$a
+      if [[ $carrier == telecom && -n $b ]]; then
+        role=$a
+        label=$b
+      fi
+      [[ $role == ref || $role == vote ]] || role=vote
+      tried=$((tried + 1))
+      (( tried > cap )) && break
+      info "正在探测${zh}回程：${label}（${ip}）"
+      if ! route_probe "$ip"; then
+        info "${zh}：${label}（${ip}）没有回应，换下一个"
+        continue
+      fi
+      route_fill_path_asns
+      if [[ -z ${ROUTE_HOP_IPS// } && -z ${ROUTE_PATH_ASNS// } ]]; then
+        info "${zh}：${label}（${ip}）只有星号，没有解析出自治系统，换下一个"
+        continue
+      fi
+      route_note_path_peers
+      local -a class_words=()
+      read -r -a class_words <<<"$ROUTE_CLASS_TOKENS"
+      if ((${#class_words[@]})); then class=$(route_china_classify "$carrier" "${class_words[@]}")
+      else class=$(route_china_classify "$carrier"); fi
+      local rank=0 take=0
+      [[ $class != unknown ]] && rank=$((rank + 2))
+      (( ROUTE_REACHED )) && rank=$((rank + 1))
+      if [[ $carrier == telecom ]]; then
+        ct_class+=("$class")
+        ct_label+=("$label")
+        ct_role+=("$role")
+        ct_ip+=("$ip")
+        ct_reached+=("${ROUTE_REACHED:-0}")
+        ct_rtt+=("$ROUTE_RTT")
+        ct_loss+=("$ROUTE_LOSS")
+        ct_hops+=("$ROUTE_HOP_IPS")
+        ct_path+=("$ROUTE_PATH_ASNS")
+        ct_stars+=("$ROUTE_STAR_HOPS")
+        ct_mtr+=("$ROUTE_MTR")
+        ct_ping+=("$ROUTE_PING")
+        ct_hopn+=("$ROUTE_HOP_N")
+        ct_seen+="${label}|${class}|${role}"$'\n'
+      else
+        if (( rank > best_rank )); then take=1; fi
+        if (( take )); then
+          best_rank=$rank best_class=$class best_ip=$ip best_label=$label
+          best_rtt=$ROUTE_RTT best_loss=$ROUTE_LOSS best_reached=$ROUTE_REACHED
+          best_hops=$ROUTE_HOP_IPS best_path=$ROUTE_PATH_ASNS
+          best_stars=$ROUTE_STAR_HOPS best_mtr=$ROUTE_MTR best_ping=$ROUTE_PING best_n=$ROUTE_HOP_N
+          got=1
+        fi
+        (( rank >= 3 )) && break
+      fi
+    done < <(route_china_targets "$fam" "$carrier")
+    if [[ $carrier == telecom && ${#ct_class[@]} -gt 0 ]]; then
+      local win="" i best_i=-1
+      local -a vote_cls=()
+      for i in "${!ct_class[@]}"; do
+        [[ ${ct_role[i]} == ref ]] && continue
+        vote_cls+=("${ct_class[i]}")
+      done
+      if ((${#vote_cls[@]})); then
+        win=$(route_china_majority "${vote_cls[@]}")
+      fi
+      for i in "${!ct_class[@]}"; do
+        [[ ${ct_role[i]} == ref ]] && continue
+        [[ -n $win && ${ct_class[i]} == "$win" ]] || continue
+        if (( best_i < 0 )); then
+          best_i=$i
+          continue
+        fi
+        if [[ $(route_china_same_better "${ct_reached[i]}" "${ct_rtt[i]}" "${ct_reached[best_i]}" "${ct_rtt[best_i]}") == 1 ]]; then
+          best_i=$i
+        fi
+      done
+      if (( best_i >= 0 )); then
+        best_class=${ct_class[best_i]}
+        best_label=${ct_label[best_i]}
+        best_ip=${ct_ip[best_i]}
+        best_reached=${ct_reached[best_i]}
+        best_rtt=${ct_rtt[best_i]}
+        best_loss=${ct_loss[best_i]}
+        best_hops=${ct_hops[best_i]}
+        best_path=${ct_path[best_i]}
+        best_stars=${ct_stars[best_i]}
+        best_mtr=${ct_mtr[best_i]}
+        best_ping=${ct_ping[best_i]}
+        best_n=${ct_hopn[best_i]}
+        got=1
+      fi
+    fi
+    if (( ! got )); then
+      if [[ $carrier == telecom && -n $ct_seen ]]; then
+        route_china_telecom_notes unknown "$ct_seen"
+        printf '%s：普通电信地址都没有定档。这一项记 0，并算进平均。CN2 段只列在上面，不参与定档。\n' "$zh"
+      else
+        printf '%s：这些地址都测不通。这一项记 0，并算进平均。这只说明准备的测试地址没有回答，不能单独证明整张运营商网络都不通。\n' "$zh"
+      fi
+      score=0
+      printf '%s\n' "$(route_china_item_text "$zh" "测不通" 0 0 -1 -1)"
+      scores+=("$score")
+      continue
+    fi
+    responded=$((responded + 1))
+    [[ $best_rtt =~ ^[0-9]+$ ]] && responded_lat=$((responded_lat + 1))
+    ROUTE_HOP_IPS=$best_hops ROUTE_PATH_ASNS=$best_path ROUTE_STAR_HOPS=$best_stars
+    ROUTE_MTR=$best_mtr ROUTE_PING=$best_ping ROUTE_HOP_N=$best_n ROUTE_RTT=$best_rtt ROUTE_LOSS=$best_loss
+    ROUTE_REACHED=$best_reached
+    route_china_explain "$carrier" "$best_class" "$best_label" "$best_ip" "$best_rtt" "$best_loss"
+    if [[ $carrier == telecom ]]; then
+      route_china_telecom_notes "$best_class" "$ct_seen"
+    fi
+    line_pts=$(route_china_line_points "$best_class")
+    if [[ $best_rtt =~ ^[0-9]+$ ]]; then lat_pts=$(route_latency_points "$best_rtt" "$(route_bj_floor)")
+    else lat_pts=-1; fi
+    if [[ $best_loss =~ ^[0-9]+$ ]]; then loss_pts=$(route_loss_points "$best_loss")
+    else loss_pts=-1; fi
+    score=$(route_china_carrier_score "$line_pts" "$lat_pts" "$loss_pts")
+    printf '%s\n' "$(route_china_item_text "$zh" "$(route_china_class_label "$best_class")" "$score" "$line_pts" "$lat_pts" "$loss_pts")"
+    scores+=("$score")
+  done
+  ROUTE_CHINA_SCORE=$(route_avg "${scores[@]}")
+  if [[ $ROUTE_CHINA_SCORE == na ]]; then
+    printf '回国回程无法打分。\n'
+  else
+    printf '三家平均之后，%s。\n' "$(route_grade_text "回国回程" "$ROUTE_CHINA_SCORE")"
+    if (( responded > 0 && responded_lat == 0 )); then
+      printf '测到路径的运营商都没有测到延迟。延迟不按 0 分，也不折成满分，封顶在常见的中等延迟档。\n'
+    fi
+  fi
+}
+route_section_line() {
+  local fam=$1
+  printf '\n%s【国际线路】%s\n' "$C_BOLD" "$C_NONE"
+  printf '这一节看「和谁连着」。上游先看 RIPEstat looking-glass：各采集点的 AS 路径里，紧挨在本 ASN 前面的那个 ASN。大网的采集点往往很瘦，所以也会把探测路径上紧挨本机的下一跳并进去。本机 ASN 不在路径里时只取这一跳，不把中国电信、联通、移动或目标自己的 ASN 算进上游。IP 反查 ASN 用 bgp.tools 的 43 端口（和 Team Cymru 同一类 whois），查不到再退回 RIPEstat。不抓 bgp.tools 的网页。邻居表里 left 方向如果超过 12 个，说明这张网太大，那些邻居不全是上游，就不拿来加分。交换中心用 PeeringDB 的 netixlan，按不重复的 ix_id 计数。\n'
+  printf '计分权重是上游最多 30（0/1/2/3/不少于 4 家对应 0/10/18/24/30）、Tier1 最多 40（0/1/2/3/不少于 4 家对应 0/18/28/35/40）、IX 最多 30（0/1/2至3/4至7/不少于 8 个对应 0/8/16/24/30）。三项缺一就不打分，避免把查询失败写成很差。Tier1 按这份名单：Cogent、Verizon、Sprint、Arelion、NTT、GTT、DTAG、Lumen、PCCW、Orange、Tata、Zayo、TI Sparkle、AT&T。Hurricane Electric 不是这份名单里的 Tier1，但会在下面点名。\n'
+  if [[ ! $ROUTE_ORIGIN =~ ^[0-9]+$ ]]; then
+    printf '没有本机源 ASN，上游和 IX 都无从查起。国际线路无法打分。\n'
+    ROUTE_LINE_SCORE=na
+    return 0
+  fi
+  if ! have curl; then
+    printf '没有 curl，读不了 RIPEstat 和 PeeringDB。国际线路无法打分。\n'
+    ROUTE_LINE_SCORE=na
+    return 0
+  fi
+  info "正在查询 AS${ROUTE_ORIGIN} 的上游、Tier1 和 PeeringDB"
+  route_load_upstreams "$ROUTE_ORIGIN" "$fam"
+  route_merge_path_peers
+  local note
+  note=$(route_he_cogent_note "$fam" "$ROUTE_UPSTREAMS") || true
+  [[ -n $note ]] && printf '%s\n' "$note"
+  if (( ! ROUTE_UP_OK || ! ROUTE_IX_OK )); then
+    printf 'looking-glass 或 PeeringDB 没有给齐上游和 IX。国际线路无法打分。已经看到的碎片不会按 0 分算进总评。\n'
+    if (( ROUTE_UP_OK )); then
+      local -a up_words=()
+      read -r -a up_words <<<"$ROUTE_UPSTREAMS"
+      if ((${#up_words[@]})); then printf '已经看到这些上游：%s。\n' "$(route_fmt_asns "${up_words[@]}")"
+      else printf 'looking-glass 没有给出上游 ASN。\n'; fi
+    fi
+    if (( ROUTE_NEIGH_WIDE )); then
+      printf 'asn-neighbours 的响应很大，left 邻居明显超过用来筛上游的 12 家门槛，这份名单没有拿来当上游。\n'
+    fi
+    ROUTE_LINE_SCORE=na
+    return 0
+  fi
+  local nu nt up_pts t1_pts ix_pts t1s="" x
+  local -a up_words=()
+  read -r -a up_words <<<"$ROUTE_UPSTREAMS"
+  if ((${#up_words[@]})); then
+    nu=$(route_count_words "${up_words[@]}")
+    nt=$(route_count_tier1 "${up_words[@]}")
+  else
+    nu=0
+    nt=0
+  fi
+  for x in "${up_words[@]}"; do route_is_tier1 "$x" && t1s+="$x "; done
+  up_pts=$(route_line_part_up "$nu")
+  t1_pts=$(route_line_part_t1 "$nt")
+  ix_pts=$(route_line_part_ix "$ROUTE_IX")
+  ROUTE_LINE_SCORE=$(route_line_score "$nu" "$nt" "$ROUTE_IX")
+  if (( nu == 0 )); then
+    printf '采集点的路径里没有看到本 ASN 前面还有别的 ASN。这可能是前缀没传播到这些采集点，不等于已经证明没有上游。按查到的结果，上游家数是 0。\n'
+  else
+    printf '观察到的上游有 %s 家：%s。\n' "$nu" "$(route_fmt_asns "${up_words[@]}")"
+  fi
+  if [[ ${ROUTE_LG_UP_N:--1} =~ ^[0-9]+$ ]] && (( ROUTE_LG_UP_N < 3 )) && [[ -n ${ROUTE_PATH_PEERS// } ]]; then
+    local -a peer_words=()
+    local peer_u
+    read -r -a peer_words <<<"$ROUTE_PATH_PEERS"
+    if ((${#peer_words[@]})); then
+      peer_u=$(route_uniq_words "${peer_words[@]}")
+      read -r -a peer_words <<<"$peer_u"
+      printf 'looking-glass 只看到 %s 家上游，采样偏少，已把探测路径上紧挨本机的下一跳并进去：%s。中国回程运营商和目标 ASN 不算进这份上游。邻居超过 12 家时仍然不用整张邻居表。\n' \
+        "$ROUTE_LG_UP_N" "$(route_fmt_asns "${peer_words[@]}")"
+    fi
+  fi
+  if (( nt == 0 )); then
+    printf '其中没有这份名单里的 Tier1。\n'
+  else
+    local -a t1_words=()
+    read -r -a t1_words <<<"$t1s"
+    printf '其中 Tier1 有 %s 家：%s。\n' "$nt" "$(route_fmt_asns "${t1_words[@]}")"
+  fi
+  if (( ROUTE_NEIGH_WIDE )); then
+    printf '邻居表太大，没有并进上游。上面的家数只来自 looking-glass。\n'
+  elif [[ $ROUTE_NEIGH_N =~ ^[0-9]+$ ]] && (( ROUTE_NEIGH_N <= 12 )); then
+    printf 'left 邻居有 %s 个，没有超过 12，已和 looking-glass 的结果合并后去重。\n' "$ROUTE_NEIGH_N"
+  fi
+  if (( ROUTE_IX == 0 )); then
+    printf 'PeeringDB 没有这个 ASN 的交换中心记录（网络名：%s）。IX 按 0 计，这是查到了空名单，不是接口失败。\n' "${ROUTE_PDB_NAME:-无}"
+  else
+    printf 'PeeringDB 上%s登记了 %s 个不重复的交换中心。' \
+      "${ROUTE_PDB_NAME:+（${ROUTE_PDB_NAME}）}" "$ROUTE_IX"
+    if [[ $ROUTE_FAC =~ ^[0-9]+$ ]]; then printf '设施记录 %s 条，只作说明，不进分数。' "$ROUTE_FAC"; fi
+    printf '\n'
+  fi
+  printf '分项是上游 %s/30、Tier1 %s/40、IX %s/30。%s。有多少家 Tier1，只说明互联条件；去具体目标时如果路径上没有这些 ASN，下一节会单独写。\n' \
+    "$up_pts" "$t1_pts" "$ix_pts" "$(route_grade_text "国际线路" "$ROUTE_LINE_SCORE")"
+}
+route_printf() { # 和 printf 一样。HOLD=1 时先攒着，避免国际互联正文跑到国际线路前面
+  local line
+  # 末尾加一个标记，避免命令替换吃掉 printf 产生的换行。
+  # shellcheck disable=SC2059
+  line=$(printf "$@"; printf x)
+  line=${line%x}
+  if (( ${ROUTE_HOLD:-0} )); then
+    ROUTE_INTL_BODY+="$line"
+  else
+    printf '%s' "$line"
+  fi
+}
+route_emit_intl() { # 此时上游已经合并，@@UNUSED@@ 行才展开成「名单里有、路径上没有」
+  local line path un
+  [[ -n ${ROUTE_INTL_BODY:-} ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == '@@UNUSED@@'* ]]; then
+      path=${line#@@UNUSED@@ }
+      if [[ -n ${ROUTE_UPSTREAMS// } && -n ${path// } ]]; then
+        un=$(route_unused_note "$ROUTE_UPSTREAMS" "$path") || true
+        [[ -n $un ]] && printf '%s\n' "$un"
+      fi
+    else
+      printf '%s\n' "$line"
+    fi
+  done <<<"$ROUTE_INTL_BODY"
+}
+route_intl_one() { # 地址族 洲 权重。把该洲分数写入 ROUTE_REGION_SCORE（数字或 na 不用，死目标记空）
+  local fam=$1 cont=$2 weight=$3
+  local zh ip lat lon label floor class lat_pts score rtt_arg dest_asn path_known
+  local -a scores=() path_words=()
+  local tried=0 answered=0
+  zh=$(route_cont_zh "$cont")
+  route_printf '\n%s（这一洲在总权重里占 %s）。\n' "$zh" "$weight"
+  while read -r ip lat lon label; do
+    [[ -n $ip ]] || continue
+    tried=$((tried + 1))
+    if (( tried > 2 && answered >= 2 )); then break; fi
+    if (( tried > 3 )); then break; fi
+    info "正在探测${zh}：${label}（${ip}）"
+    if ! route_probe "$ip"; then
+      info "${label}（${ip}）没有回应，换下一个"
+      continue
+    fi
+    route_fill_path_asns
+    floor=$(route_pair_floor "$lat" "$lon")
+    rtt_arg=-1
+    [[ $ROUTE_RTT =~ ^[0-9]+$ ]] && rtt_arg=$ROUTE_RTT
+    route_whois_bulk "$ip"
+    dest_asn=${ROUTE_ASN_CACHE[$ip]:-}
+    route_asn_usable "$dest_asn" || dest_asn=""
+    if [[ -n $dest_asn ]]; then ROUTE_DEST_ASNS+="$dest_asn "; fi
+    route_note_path_peers
+    # 没有可用 ASN（全是星号或反查失败）：不按 0 分拉低这一洲。整洲都这样时仍记 0。
+    if [[ -z ${ROUTE_PATH_ASNS// } ]]; then
+      info "${label}（${ip}）没有解析出自治系统，不计入这一洲的平均"
+      continue
+    fi
+    path_known=1
+    class=$(route_path_class "$ROUTE_CONT" "$cont" "$ROUTE_PATH_ASNS" "$rtt_arg" "$floor" "$ROUTE_ORIGIN" "$dest_asn" "$ROUTE_REACHED")
+    if [[ $ROUTE_RTT =~ ^[0-9]+$ ]]; then lat_pts=$(route_intl_lat_points "$ROUTE_RTT" "$floor")
+    else lat_pts=-1; fi
+    if (( ! path_known )); then
+      if [[ $lat_pts =~ ^[0-9]+$ ]]; then score=$(( (lat_pts * 100 + 20) / 40 ))
+      else score=0; fi
+    elif [[ $class == unreach ]]; then
+      score=0
+    else
+      score=$(route_intl_target_score "$class" "$lat_pts")
+    fi
+    answered=$((answered + 1))
+    scores+=("$score")
+    route_printf '到%s（%s）。' "$label" "$ip"
+    if (( path_known )); then
+      path_words=()
+      read -r -a path_words <<<"$ROUTE_PATH_ASNS"
+      route_printf '路径上的 ASN 是 %s。' "$(route_fmt_asns "${path_words[@]}")"
+      route_printf '按跳数和是否经过 Tier1，这一条记为%s。直连只在路径里只剩目标自己的 ASN 时才算，中间不能再有别的运营商，两条 Tier1 也不算直连。' "$(route_path_class_label "$class")"
+    else
+      route_printf '没有解析出路径 ASN，路径未测，不把这条记成不可达的 0 分。'
+    fi
+    if [[ $ROUTE_RTT =~ ^[0-9]+$ ]]; then
+      route_printf '往返约 %s ms。' "$ROUTE_RTT"
+      if [[ $floor =~ ^[0-9]+$ && $floor != 0 ]]; then
+        route_printf '按两端坐标，理论下限大约 %s ms，实际大约是下限的 %s.%s 倍。' \
+          "$floor" $((ROUTE_RTT / floor)) $(( (ROUTE_RTT * 10 / floor) % 10 ))
+      fi
+    else
+      route_printf '延迟未测，不把没测到的项目当成 0 分。'
+    fi
+    if [[ $class == detour && $rtt_arg =~ ^[0-9]+$ ]]; then
+      local kind extra
+      kind=$(route_detour_kind "$ROUTE_CONT" "$cont" "$ROUTE_PATH_ASNS" "$rtt_arg" "$floor")
+      extra=$(route_detour_extra "$rtt_arg" "$floor")
+      if [[ $kind == us ]]; then
+        route_printf '这是绕美：路径上有以北美为中心的运营商，而这条路的两端并不该绕到北美。相对理论下限大约多出 %s ms。' "$extra"
+      elif [[ $kind == eu ]]; then
+        route_printf '这是绕欧：路径上有以欧洲为中心的运营商，而这条路的两端并不该绕到欧洲。相对理论下限大约多出 %s ms。' "$extra"
+      elif [[ $kind == slow && $floor =~ ^[0-9]+$ && $floor != 0 ]]; then
+        route_printf '往返明显高于理论下限（约为下限的 %s.%s 倍，多出 %s ms），按绕路计。' \
+          "$((rtt_arg / floor))" "$(( (rtt_arg * 10 / floor) % 10 ))" "$extra"
+      fi
+    fi
+    if (( ! path_known )); then
+      route_printf '这一条 %s/100（路径未测，延迟按 40 分满分折算）。\n' "$score"
+    elif [[ $lat_pts == -1 ]]; then
+      route_printf '这一条 %s/100（路径档按 60 分满分折算，延迟未测）。\n' "$score"
+    else
+      route_printf '这一条 %s/100（路径档最多 60，延迟相对下限最多 40）。\n' "$score"
+    fi
+    if (( path_known )); then
+      route_printf '%s\n' "@@UNUSED@@ ${ROUTE_PATH_ASNS}"
+    fi
+  done < <(route_intl_targets "$fam" "$cont")
+  if (( answered == 0 )); then
+    route_printf '%s的目标都测不通，这一洲按不可达记 0，并计入加权。\n' "$zh"
+    ROUTE_REGION_SCORE=0
+  else
+    ROUTE_REGION_SCORE=$(route_avg "${scores[@]}")
+    route_printf '%s可用目标的平均是 %s/100。\n' "$zh" "$ROUTE_REGION_SCORE"
+  fi
+}
+route_section_intl() {
+  local fam=$1
+  route_printf '\n%s【国际互联】%s\n' "$C_BOLD" "$C_NONE"
+  route_printf '这一节看实际走到了哪里，和上一节的「有哪些上游」分开。路径档次按直连/对等、Tier1 中转、Tier2/3、多跳、绕路、不可达。直连要求路径里只剩下目标自己的 ASN，中间不能再有别的运营商。两条 Tier1 不算直连，AS0 这类未知 ASN 不算一跳。延迟拿实测往返和理论下限比，下限仍是距离公里数除以 100。没有测到往返时不把延迟记成 0 分，只按路径档折算，并写明延迟未测。绕路要有往返和理论下限。路径上出现不该出现的北美或欧洲骨干，并且往返超过下限两倍、多出不少于 30 毫秒，写成绕美或绕欧。同向长途没有这种绕洲时，要超过下限的 2.5 倍并且多出不少于 40 毫秒才按绕路计；亚太到欧洲接近两倍下限很常见，单凭两倍不算绕路。没有解析出自治系统的探测不写入平均，也不按 0 分拉低；某一洲全部如此，这一洲记 0。\n'
+  local tool
+  tool=$(route_trace_bin)
+  if [[ $tool == none ]]; then
+    route_printf '没有 traceroute、mtr、nexttrace 或 ping。国际互联无法打分。\n'
+    ROUTE_INTL_SCORE=na
+    return 0
+  fi
+  local w_ap w_na w_eu
+  read -r w_ap w_na w_eu <<<"$(route_continent_weights "$ROUTE_CONT")"
+  route_printf '本机按接入位置算在%s。三洲权重是亚太 %s、北美 %s、欧洲 %s。权重大的是离这台机器所在洲更该走好的方向，不是三洲平均成一个和线路分混在一起的总分。\n' \
+    "$(route_cont_zh "$ROUTE_CONT")" "$w_ap" "$w_na" "$w_eu"
+  route_intl_one "$fam" apac "$w_ap"
+  local s_ap=$ROUTE_REGION_SCORE
+  route_intl_one "$fam" na "$w_na"
+  local s_na=$ROUTE_REGION_SCORE
+  route_intl_one "$fam" eu "$w_eu"
+  local s_eu=$ROUTE_REGION_SCORE
+  ROUTE_INTL_SCORE=$(route_intl_combine "$s_ap" "$w_ap" "$s_na" "$w_na" "$s_eu" "$w_eu")
+  route_printf '\n加权之后，%s。这个数只来自上面三洲的路径，没有把国际线路的上游分加进来。\n' \
+    "$(route_grade_text "国际互联" "$ROUTE_INTL_SCORE")"
+}
+route_section_summary() {
+  printf '\n%s【总评】%s\n' "$C_BOLD" "$C_NONE"
+  route_summary_text "$ROUTE_CHINA_SCORE" "$ROUTE_LINE_SCORE" "$ROUTE_INTL_SCORE"
+  printf '\n'
+}
+route_report_family() {
+  local fam=$1 ip=""
+  if [[ $fam == 4 ]]; then ip=${PUBLIC_IP4:-}; else ip=${PUBLIC_IP6:-}; fi
+  echo
+  hr
+  _green "  IPv${fam} 线路检测"
+  hr
+  ROUTE_CHINA_SCORE="" ROUTE_LINE_SCORE="" ROUTE_INTL_SCORE=""
+  ROUTE_UPSTREAMS="" ROUTE_ORIGIN="" ROUTE_PATH_PEERS="" ROUTE_DEST_ASNS=""
+  ROUTE_INTL_BODY="" ROUTE_HOLD=0
+  if [[ -z $ip ]]; then
+    printf '本机没有检测到公网 IPv%s，这一侧不打分，也不编一个看起来完整的结果。\n' "$fam"
+    return 0
+  fi
+  route_section_access "$fam" "$ip"
+  route_section_china "$fam"
+  ROUTE_HOLD=1
+  ROUTE_INTL_BODY=""
+  route_section_intl "$fam"
+  ROUTE_HOLD=0
+  route_section_line "$fam"
+  route_emit_intl
+  route_section_summary
+}
+route_print_limits() {
+  printf '\n%s【局限】%s\n' "$C_BOLD" "$C_NONE"
+  cat <<'EOF'
+这次只覆盖从 VPS 出发、发向大陆运营商的回程，以及从 VPS 向外的国际 traceroute。没有测从大陆到 VPS 的去程，报告里的回程分数不能拿去程来用。
+晚高峰和白天、工作日和周末，同一家上游的拥塞可能差一截。这是一次采样，不是全天结论。
+traceroute 和 mtr 看到的中间跳，很多路由器不回应探测，星号不等于丢包。TCP/8080 打到运营商 DNS 常常没有往返，这时会改用 ICMP traceroute、ICMP mtr 或 ping。延迟或丢包没测到就写成未测，不按 0 分打进档次。去程和回程可以走不同的运营商。
+若报告里延迟仍是未测，在这台 VPS 上先确认 ping 能通，再跑一次 proxy route。
+Telegram 数据中心是任播，落点不一定是写在上面的那个城市，时延下限会因此偏。东京 WIDE、香港 HGC、弗里蒙特 HE、阿姆斯特丹 Leaseweb 用来减少「全是任播」的情况，但这些地址本身也会变。东京 WIDE 换过仍会回应探测的地址。阿姆斯特丹不再用已经不回应的 RIPE 地址。
+电信 IPv4 定档只用普通地址：广东、四川、河南的电信地址，以及 202.97 骨干。这些前缀是 AS4134，不是 AS4809。河南 CN2 和江苏 CN2 会另测并写进报告，但不参与定档。若它们看到 GIA 或 GT，而定档是 163，报告写「CN2 段目标另见，不参与定档」。普通地址档次不一致时按出现次数最多的一档计分，次数相同则用更低的一档。GIA 仍要求路径里有 AS4809 和 59.43，且没有 202.97、也没有 AS4134。59.43 和 202.97 同时出现是 CN2 GT，只有 202.97 是 163。回程探测目标可能与业务流量路径不同。延迟没测到时不折成 100，封顶在 14 分那一档。联通用天津、广东、湖南，不再使用已经不回应的北京联通 DNS。移动用北京附近和骨干地址。IPv6 每家目前只放了一个运营商网段里的地址。单个地址没回应就换下一个，不写进报告；某一家全部测不通时该项记 0，并写明测不通。只有星号、解析不出自治系统时也按测不通，不写成未能识别。
+到北京的理论下限不到 40 毫秒时，回国延迟按绝对毫秒分档。绕到不该出现的洲，要往返超过下限两倍且多出不少于 30 毫秒。同向长途没有绕洲时，要超过 2.5 倍并且多出不少于 40 毫秒；亚太到欧洲接近两倍下限不算绕路。俄亥俄若被标成 Cloudflare colo CMH，理论下限用哥伦布，不用美国国土中心。直连要求中间没有别的运营商。国际线路的路径上游只取紧挨本机的下一跳，不含中国回程运营商和目标 ASN。PeeringDB 查询失败时国际线路无法打分，不会一直卡住。
+省网 ASN（例如电信 4812、联通 4808、移动 56048）在没有更高档次的骨干 ASN 时，按该运营商的普通档计，不升到 CN2、9929 或 CMIN2。AS0、私有 ASN 不计入路径跳数。
+IPv4 和 IPv6 是两份报告。没有公网 IPv6 时不为 IPv6 编分数。Hurricane Electric 和 Cogent 的 IPv6 长期不互联，只在 IPv6 上游里两家都出现时才会单独提醒。
+EOF
+}
+route_print_go_cmd() {
+  local ip=${SERVER_ADDR:-}
+  [[ -n $ip ]] || ip=${PUBLIC_IP4:-${PUBLIC_IP6:-}}
+  printf '\n%s【去程：请在你自己的电脑上跑】%s\n' "$C_BOLD" "$C_NONE"
+  if [[ -z $ip ]]; then
+    printf '没有可用的 VPS 地址，没法给出去程命令。\n'
+    return 0
+  fi
+  cat <<EOF
+下面测的是从你的电脑到这台 VPS（${ip}）的去程。不要在 VPS 上跑这些命令来代替去程。VPS 上的探测方向是反的。
+
+Linux / macOS：
+  traceroute -n -w 1 -q 1 ${ip}
+  nexttrace --traceroute ${ip}
+
+Windows：
+  tracert -d ${ip}
+
+看结果时沿途 ASN 靠近你的宽带那一侧，才是去程进了哪家骨干。和上面的回程不是同一条路。
+EOF
+}
+route_ensure_ips() {
+  if [[ -n ${PUBLIC_IP4:-} || -n ${PUBLIC_IP6:-} ]]; then return 0; fi
+  if have curl; then
+    detect_ip
+    return 0
+  fi
+  PUBLIC_IP4=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || true
+  PUBLIC_IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || true
+}
+route_ensure_jq() {
+  have jq && return 0
+  if have apt-get; then
+    DEBIAN_FRONTEND=noninteractive apt-get -y -qq install --no-install-recommends jq >/dev/null 2>&1 || {
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get -y -qq install --no-install-recommends jq >/dev/null 2>&1 || true
+    }
+  elif have apk; then
+    apk add --no-cache jq >/dev/null 2>&1 || true
+  elif have dnf; then
+    dnf -y install -q jq >/dev/null 2>&1 || true
+  elif have yum; then
+    yum -y install -q jq >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+do_route() {
+  [[ -f $STATE_FILE ]] && load_state
+  [[ -n ${INIT_SYS:-} ]] || detect_init
+  step "线路检测"
+  printf '只做路由检测。不改 Xray、Hysteria2、sing-box 和防火墙，不重启服务，也不测流媒体解锁。\n'
+  if ! have curl && [[ $(route_trace_bin) == none ]]; then
+    die "没有 curl，也没有 traceroute、mtr、nexttrace 或 ping，无法做线路检测。"
+  fi
+  route_ensure_jq
+  mktmp
+  route_ensure_ips
+  local -a fams=()
+  case ${OPT_ROUTE_FAM:-} in
+    4) fams=(4) ;;
+    6) fams=(6) ;;
+    *) fams=(4 6) ;;
+  esac
+  local f
+  for f in "${fams[@]}"; do route_report_family "$f"; done
+  route_print_limits
+  route_print_go_cmd
+}
+
+# ============================================================
 #                        菜单 / 参数
 # ============================================================
 proto_ensure_port() { # $1 reality|xhttp|hy2|trojan|tuic|anytls ；失败时调用方应把开关改回
@@ -6203,6 +11435,7 @@ proto_ensure_port() { # $1 reality|xhttp|hy2|trojan|tuic|anytls ；失败时调�
       anytls) NAT_USED_TCP=${NAT_USED_TCP// $ANYTLS_EXT_PORT /}; nat_pick_mapped tcp ANYTLS_EXT_PORT ANYTLS_PORT "" "AnyTLS" "sing-box" ;;
       hy2) NAT_USED_UDP=${NAT_USED_UDP// $HY2_EXT_PORT /}; nat_pick_mapped udp HY2_EXT_PORT HY2_PORT "" "Hysteria2" "hysteria" ;;
       tuic) NAT_USED_UDP=${NAT_USED_UDP// $TUIC_EXT_PORT /}; nat_pick_mapped udp TUIC_EXT_PORT TUIC_PORT "" "TUIC v5" "sing-box" ;;
+      xhttp-tls|ws) cdn_explain nat; return 1 ;;
     esac
   else
     local_seed_used
@@ -6213,6 +11446,8 @@ proto_ensure_port() { # $1 reality|xhttp|hy2|trojan|tuic|anytls ；失败时调�
       anytls) LOCAL_USED_TCP=${LOCAL_USED_TCP// $ANYTLS_PORT /}; local_pick tcp ANYTLS_PORT "" "AnyTLS" "sing-box" "${ANYTLS_PORT:-8445}" ;;
       hy2) LOCAL_USED_UDP=${LOCAL_USED_UDP// $HY2_PORT /}; local_pick udp HY2_PORT "" "Hysteria2" "hysteria" "${HY2_PORT:-443}" ;;
       tuic) LOCAL_USED_UDP=${LOCAL_USED_UDP// $TUIC_PORT /}; local_pick udp TUIC_PORT "" "TUIC v5" "sing-box" "${TUIC_PORT:-8446}" ;;
+      xhttp-tls) cdn_choose_port XHTTP_TLS_PORT "" "VLESS + XHTTP + TLS（CDN）" "${XHTTP_TLS_PORT:-2083}" ;;
+      ws) cdn_choose_port WS_PORT "" "VLESS + WebSocket + TLS（CDN）" "${WS_PORT:-2087}" ;;
     esac
   fi
 }
@@ -6231,7 +11466,9 @@ menu_proto() {
       "Hysteria2  $([[ $HY2_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
       "Trojan + REALITY  $([[ $TROJAN_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
       "TUIC v5  $([[ $TUIC_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
-      "AnyTLS  $([[ $ANYTLS_ENABLED == 1 ]] && echo "$on" || echo "$off")"
+      "AnyTLS  $([[ $ANYTLS_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
+      "VLESS + XHTTP + TLS（CDN）  $([[ $XHTTP_TLS_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
+      "VLESS + WebSocket + TLS（CDN）  $([[ $WS_ENABLED == 1 ]] && echo "$on" || echo "$off")"
     local c kind var
     ask c "请选择" "0"
     case $c in
@@ -6241,6 +11478,8 @@ menu_proto() {
       4) kind=trojan; var=TROJAN_ENABLED ;;
       5) kind=tuic; var=TUIC_ENABLED ;;
       6) kind=anytls; var=ANYTLS_ENABLED ;;
+      7) kind=xhttp-tls; var=XHTTP_TLS_ENABLED ;;
+      8) kind=ws; var=WS_ENABLED ;;
       *) return 0 ;;
     esac
     if (( ${!var} )); then
@@ -6253,7 +11492,15 @@ menu_proto() {
       info "已关闭（密钥保留）。"
     else
       printf -v "$var" 1
-      if ! proto_ensure_port "$kind"; then
+      if [[ $kind == xhttp-tls || $kind == ws ]]; then
+        if ! cdn_prepare_enable "$kind"; then
+          printf -v "$var" 0
+          cdn_sync_flag
+          save_state
+          warn "没有打开。REALITY 和原来的协议保持原样。"
+          continue
+        fi
+      elif ! proto_ensure_port "$kind"; then
         printf -v "$var" 0
         warn "没有可用端口，保持关闭。"
         continue
@@ -6264,6 +11511,10 @@ menu_proto() {
     if [[ $kind == hy2 && $HY2_ENABLED == 0 ]]; then svc_disable_stop hysteria-server; remove_nat_hop; fi
     apply_proto_services
     ok "协议状态已更新。"
+    if [[ $kind == xhttp-tls || $kind == ws ]] && (( ${!var} == 1 )); then
+      cdn_print_tutorial "$kind"
+      cdn_run_checks "$kind" || warn "检查没有全部通过。按上面的说明改完后执行 proxy cdn。"
+    fi
     show_info
   done
 }
@@ -6304,7 +11555,9 @@ show_menu() {
     "安装为落地机（Shadowsocks 2022 出口，给其它中转机用）" \
     "卸载" \
     "切换 NAT 模式（当前: $(nat_pref_text)）" \
-    "协议开关"
+    "协议开关" \
+    "申请证书" \
+    "线路检测（回程 / 国际线路 / 国际互联）"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -6324,6 +11577,8 @@ show_menu() {
     14) act=do_uninstall ;;
     15) act=menu_nat_pref ;;
     16) act=menu_proto ;;
+    17) act=menu_cert ;;
+    18) act=do_route ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -6366,7 +11621,8 @@ show_land_menu() {
     "网络调优（BBR / 队列算法 / 缓冲区 / 恢复）" \
     "改装为 Reality / Hysteria2 节点" \
     "卸载" \
-    "切换 NAT 模式（当前: $(nat_pref_text)）"
+    "切换 NAT 模式（当前: $(nat_pref_text)）" \
+    "线路检测（回程 / 国际线路 / 国际互联）"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -6381,6 +11637,7 @@ show_land_menu() {
     9) OPT_LAND=0; act=do_install ;;
     10) act=do_uninstall ;;
     11) act=menu_nat_pref ;;
+    12) act=do_route ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -6413,8 +11670,35 @@ usage() {
   --anytls            额外启用 AnyTLS（sing-box，自签证书，默认不装）
   --no-anytls         关闭 AnyTLS
   --anytls-port <端口> AnyTLS TCP 端口（默认 8445）
+  --xhttp-tls         额外启用 VLESS + XHTTP + TLS（放在 CDN 后面，默认不装）
+                      需要 --cert-domain。不替换 REALITY，也不要把 REALITY 放进 CDN
+  --no-xhttp-tls      关闭这条 CDN 线路
+  --xhttp-tls-port <端口>  回源端口（默认 2083，须是 Cloudflare 允许的 HTTPS 端口）
+  --ws-tls            额外启用 VLESS + WebSocket + TLS（放在 CDN 后面，默认不装）
+  --no-ws-tls         关闭这条 CDN 线路
+  --ws-port <端口>    回源端口（默认 2087）
   --hop <a-b|none>    Hysteria2 端口跳跃范围（默认 20000-50000，none 关闭）
   --name <名称>       节点名称（默认 国家-城市）
+  --cert-domain <域名>  可选：为自有域名申请证书。不写 --cert-kind 时是
+                      Let's Encrypt 单域名 HTTP-01（默认）。订阅只走 HTTPS；
+                      Hysteria2 / TUIC / AnyTLS 改用该证书和域名。
+                      REALITY 仍借用伪装站点。NAT 模式不可用
+  --cert-kind <种类>  le（默认）| wildcard | multi | zerossl | zerossl-wildcard
+                      | zerossl-multi | cf-origin
+                      通配符走 DNS-01。cf-origin 是 Cloudflare 源站证书，
+                      只有 Cloudflare 信任，只能给两条 CDN 线路
+  --cert-names <列表> 多域名或源站证书的名字，逗号分隔
+  --cert-link <主机名> 通配符证书写进链接的具体名字，默认是根域名
+  --cert-email <邮箱> 可选，登记给证书机构；不填则不登记邮箱
+  --cf-dns-token <令牌>  Cloudflare API 令牌，只用于通配符的 DNS-01
+                      权限要有 Zone.DNS 编辑和 Zone 读取。不是 Origin CA Key
+  --cf-origin-key <钥匙> Cloudflare Origin CA Key。写了就申请源站证书
+  --zerossl-kid <id>  ZeroSSL 的 EAB KID，须和 --zerossl-hmac 成对
+  --zerossl-hmac <key> ZeroSSL 的 EAB HMAC
+  --sub-port <端口>   订阅 HTTPS 端口（默认 8447，不能是 80，也不能占用 REALITY）
+                      源站证书不会打开订阅
+  --no-cert           关闭已申请的证书，Hysteria2 / TUIC / AnyTLS 改回自签
+                      开着的 CDN 线路一并关掉（不能改用自签）
   --no-firewall       不配置 nftables 防火墙
   --no-upgrade        跳过系统软件包升级
   --no-tune           跳过 sysctl 网络调优
@@ -6471,6 +11755,8 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
 管理命令:
   proxy               打开交互菜单
   proxy info          查看链接 / 二维码 / mihomo 配置
+  proxy cert          选择证书种类 / 续期 / 关闭（默认 Let's Encrypt 单域名）
+  proxy cdn           查看 CDN 线路教程并复查（XHTTP+TLS / WebSocket+TLS）
   proxy proto         单独打开或关闭协议（不删除已有密钥）
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
@@ -6478,13 +11764,21 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy user          用户管理
   proxy update        更新组件
   proxy update-script 只更新本脚本
-  proxy status        运行状态 / 日志
+  proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
   proxy speed         测速 / 延迟提示
-  proxy firewall      防火墙管理（NAT 模式为 NAT 信息 / 端口跳跃）
+  proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
   proxy nat           NAT 信息 / 修改映射端口 / 端口跳跃
   proxy tune          网络调优（见上）
+  proxy route         线路检测（回程 / 国际线路 / 国际互联；不改配置、不重启）
+  proxy route ipv4    只测 IPv4
+  proxy route ipv6    只测 IPv6
   proxy land          落地转发 / 落地机信息（见上）
   proxy uninstall     卸载
+
+线路检测（未安装节点也可以；NAT 模式也可以。不改代理、不重启、不测流媒体）:
+  测的是 VPS 发向大陆的回程，以及从 VPS 向外的国际线路和国际互联。
+  三项分数分开，不合成一个总分。IPv4 和 IPv6 各一份报告。
+  去程（家里的电脑 → VPS）不会在这台机器上测，报告末尾给出可复制的命令。
 USAGE
 }
 
@@ -6520,9 +11814,88 @@ parse_args() {
       --no-anytls) OPT_ANYTLS=0 ;;
       --anytls-port) is_port_opt "${2-}" || die "--anytls-port 参数无效"; OPT_ANYTLS_PORT=$2; shift ;;
       --anytls-port=*) OPT_ANYTLS_PORT=${1#*=}; is_port_opt "$OPT_ANYTLS_PORT" || die "--anytls-port 参数无效" ;;
+      --xhttp-tls) OPT_XHTTP_TLS=1 ;;
+      --no-xhttp-tls) OPT_XHTTP_TLS=0 ;;
+      --xhttp-tls-port)
+        is_port_opt "${2-}" || die "--xhttp-tls-port 参数无效"; OPT_XHTTP_TLS_PORT=$2; shift ;;
+      --xhttp-tls-port=*) OPT_XHTTP_TLS_PORT=${1#*=}; is_port_opt "$OPT_XHTTP_TLS_PORT" || die "--xhttp-tls-port 参数无效" ;;
+      --ws-tls|--ws) OPT_WS=1 ;;
+      --no-ws-tls|--no-ws) OPT_WS=0 ;;
+      --ws-port)
+        is_port_opt "${2-}" || die "--ws-port 参数无效"; OPT_WS_PORT=$2; shift ;;
+      --ws-port=*) OPT_WS_PORT=${1#*=}; is_port_opt "$OPT_WS_PORT" || die "--ws-port 参数无效" ;;
       --hop) [[ ${2-} == none ]] || is_range "${2-}" || valid_segs "${2-}" || die "--hop 参数无效（例如 20000-50000 或 none）"; OPT_HOP=$2; shift ;;
       --no-hop) OPT_HOP=none ;;
       --name) [[ -n ${2-} ]] || die "--name 需要参数"; OPT_NAME=$(tr -cd 'A-Za-z0-9_.-' <<<"$2"); shift ;;
+      --cert-domain)
+        [[ -n ${2-} ]] || die "--cert-domain 需要域名"
+        OPT_CERT_DOMAIN=${2,,}; OPT_CERT_DOMAIN=${OPT_CERT_DOMAIN%.}
+        cert_domain_syntax "$OPT_CERT_DOMAIN" || die "--cert-domain 不是可用的域名: $2（不能是 IP）"
+        OPT_CERT=1; shift ;;
+      --cert-domain=*)
+        OPT_CERT_DOMAIN=${1#*=}; OPT_CERT_DOMAIN=${OPT_CERT_DOMAIN,,}; OPT_CERT_DOMAIN=${OPT_CERT_DOMAIN%.}
+        cert_domain_syntax "$OPT_CERT_DOMAIN" || die "--cert-domain 不是可用的域名: ${OPT_CERT_DOMAIN}（不能是 IP）"
+        OPT_CERT=1 ;;
+      --cert-email)
+        [[ -n ${2-} ]] || die "--cert-email 需要邮箱"
+        cert_email_syntax "$2" || die "--cert-email 格式无效: $2"
+        OPT_CERT_EMAIL=$2; shift ;;
+      --cert-email=*)
+        cert_email_syntax "${1#*=}" || die "--cert-email 格式无效: ${1#*=}"
+        OPT_CERT_EMAIL=${1#*=} ;;
+      --cert-kind)
+        [[ -n ${2-} ]] || die "--cert-kind 需要种类：le、wildcard、multi、zerossl、zerossl-wildcard、zerossl-multi、cf-origin"
+        OPT_CERT_KIND=$(cert_normalize_kind "$2") || die "--cert-kind 无法识别: $2"
+        OPT_CERT=1; shift ;;
+      --cert-kind=*)
+        OPT_CERT_KIND=$(cert_normalize_kind "${1#*=}") || die "--cert-kind 无法识别: ${1#*=}"
+        OPT_CERT=1 ;;
+      --cert-names)
+        [[ -n ${2-} ]] || die "--cert-names 需要用逗号分隔的域名"
+        OPT_CERT_NAMES=$(cert_norm_names "$2") || die "--cert-names 里有无效域名: $2"
+        OPT_CERT=1; shift ;;
+      --cert-names=*)
+        OPT_CERT_NAMES=$(cert_norm_names "${1#*=}") || die "--cert-names 里有无效域名: ${1#*=}"
+        OPT_CERT=1 ;;
+      --cert-link)
+        [[ -n ${2-} ]] || die "--cert-link 需要主机名"
+        OPT_CERT_LINK=${2,,}; OPT_CERT_LINK=${OPT_CERT_LINK%.}
+        cert_domain_syntax "$OPT_CERT_LINK" || die "--cert-link 不是可用的主机名: $2"
+        shift ;;
+      --cert-link=*)
+        OPT_CERT_LINK=${1#*=}; OPT_CERT_LINK=${OPT_CERT_LINK,,}; OPT_CERT_LINK=${OPT_CERT_LINK%.}
+        cert_domain_syntax "$OPT_CERT_LINK" || die "--cert-link 不是可用的主机名: ${OPT_CERT_LINK}" ;;
+      --cf-dns-token)
+        [[ -n ${2-} ]] || die "--cf-dns-token 需要 Cloudflare API 令牌"
+        OPT_CF_DNS_TOKEN=$2; shift ;;
+      --cf-dns-token=*) OPT_CF_DNS_TOKEN=${1#*=}; [[ -n $OPT_CF_DNS_TOKEN ]] || die "--cf-dns-token 需要 Cloudflare API 令牌" ;;
+      --cf-origin-key)
+        [[ -n ${2-} ]] || die "--cf-origin-key 需要 Origin CA Key"
+        OPT_CF_ORIGIN_KEY=$2
+        [[ -n $OPT_CERT_KIND ]] || OPT_CERT_KIND=cf-origin
+        OPT_CERT=1; shift ;;
+      --cf-origin-key=*)
+        OPT_CF_ORIGIN_KEY=${1#*=}
+        [[ -n $OPT_CF_ORIGIN_KEY ]] || die "--cf-origin-key 需要 Origin CA Key"
+        [[ -n $OPT_CERT_KIND ]] || OPT_CERT_KIND=cf-origin
+        OPT_CERT=1 ;;
+      --zerossl-kid)
+        [[ -n ${2-} ]] || die "--zerossl-kid 需要 EAB KID"
+        OPT_ZEROSSL_KID=$2; OPT_CERT=1; shift ;;
+      --zerossl-kid=*) OPT_ZEROSSL_KID=${1#*=}; [[ -n $OPT_ZEROSSL_KID ]] || die "--zerossl-kid 需要 EAB KID"; OPT_CERT=1 ;;
+      --zerossl-hmac)
+        [[ -n ${2-} ]] || die "--zerossl-hmac 需要 EAB HMAC"
+        OPT_ZEROSSL_HMAC=$2; OPT_CERT=1; shift ;;
+      --zerossl-hmac=*) OPT_ZEROSSL_HMAC=${1#*=}; [[ -n $OPT_ZEROSSL_HMAC ]] || die "--zerossl-hmac 需要 EAB HMAC"; OPT_CERT=1 ;;
+      --sub-port)
+        is_port "${2-}" || die "--sub-port 参数无效"
+        [[ $2 == 80 ]] && die "--sub-port 不能是 80（80 只用于证书申请的 HTTP-01）"
+        OPT_SUB_PORT=$2; shift ;;
+      --sub-port=*)
+        OPT_SUB_PORT=${1#*=}; is_port "$OPT_SUB_PORT" || die "--sub-port 参数无效"
+        [[ $OPT_SUB_PORT == 80 ]] && die "--sub-port 不能是 80（80 只用于证书申请的 HTTP-01）" ;;
+      --cert) OPT_CERT=1 ;;
+      --no-cert) OPT_CERT=0 ;;
       --no-firewall) OPT_FIREWALL=0 ;;
       --no-upgrade) OPT_UPGRADE=0 ;;
       --no-tune) OPT_TUNE=0 ;;
@@ -6588,15 +11961,24 @@ parse_args() {
       speed) OPT_ACTION=speed ;;
       firewall|fw) OPT_ACTION=firewall ;;
       nat) OPT_ACTION=nat ;;
+      route|routes)
+        OPT_ACTION=route
+        case ${2-} in
+          4|ipv4|v4) OPT_ROUTE_FAM=4; shift ;;
+          6|ipv6|v6) OPT_ROUTE_FAM=6; shift ;;
+        esac ;;
+      cert|acme) OPT_ACTION=cert ;;
+      cdn) OPT_ACTION=cdn ;;
       uninstall|remove) OPT_ACTION=uninstall ;;
       *) usage; die "未知参数: $1" ;;
     esac
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
+  [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert
   # 只给了 --land-allow：修改落地机白名单
   [[ -z $OPT_ACTION && -n $OPT_LAND_ALLOW ]] && OPT_ACTION=allow
   # 只给了调优参数（或单独的 --tune）：执行独立调优
@@ -6608,7 +11990,7 @@ parse_args() {
   if [[ $OPT_NAT != 1 ]]; then
     [[ -z $OPT_PORT || $OPT_PORT != *:* || -f $STATE_FILE ]] || die "--port 的 外部:内部 写法仅用于 NAT 模式（--nat）。"
     local _po
-    for _po in "$OPT_HY2_PORT" "$OPT_XHTTP_PORT" "$OPT_TROJAN_PORT" "$OPT_TUIC_PORT" "$OPT_ANYTLS_PORT"; do
+    for _po in "$OPT_HY2_PORT" "$OPT_XHTTP_PORT" "$OPT_TROJAN_PORT" "$OPT_TUIC_PORT" "$OPT_ANYTLS_PORT" "$OPT_XHTTP_TLS_PORT" "$OPT_WS_PORT"; do
       [[ -z $_po || $_po != *:* || -f $STATE_FILE ]] || die "外部:内部 端口写法仅用于 NAT 模式（--nat）。"
     done
   fi
@@ -6651,7 +12033,10 @@ main() {
     speed) menu_speed ;;
     firewall) menu_firewall ;;
     nat) menu_nat ;;
+    cert) do_cert ;;
+    cdn) do_cdn ;;
     tune) do_tune ;;
+    route) do_route ;;
     land) do_land_cli ;;
     allow) land_menu_allow ;;
     uninstall) do_uninstall ;;
