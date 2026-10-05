@@ -9251,6 +9251,7 @@ ROUTE_NEIGH_N=-1 ROUTE_PDB_NAME=""
 ROUTE_HOP_IPS="" ROUTE_PATH_ASNS="" ROUTE_STAR_HOPS=0 ROUTE_HOP_N=0
 ROUTE_RTT=-1 ROUTE_REACHED=0 ROUTE_LOSS=-1 ROUTE_MTR=0
 ROUTE_LOSS_STRONG=0 ROUTE_PING=0 ROUTE_PATH_PEERS="" ROUTE_LG_UP_N=-1
+ROUTE_DEST_ASNS=""
 ROUTE_HOLD=0 ROUTE_INTL_BODY=""
 ROUTE_BEST_HOPS="" ROUTE_BEST_STARS=0 ROUTE_BEST_N=0
 ROUTE_BEST_RTT=-1 ROUTE_BEST_REACHED=0 ROUTE_BEST_LOSS=-1
@@ -9471,10 +9472,11 @@ route_china_class_label() {
     *) printf '未能识别' ;;
   esac
 }
-route_latency_points() { # 往返毫秒 理论下限；下限空或 0 时用绝对档。未知往返返回 -1
+route_latency_points() { # 往返毫秒 理论下限。下限空、0，或不到 40ms 时用绝对档。未知往返返回 -1
   local rtt=$1 floor=${2:-}
   [[ $rtt =~ ^[0-9]+$ ]] || { printf -- '-1'; return 0; }
-  if [[ $floor =~ ^[0-9]+$ ]] && (( floor > 0 )); then
+  # 近距离用比例会把四十毫秒压得很低（下限约 20ms 时 41ms 只有 8–14 分）。短途改按绝对毫秒。
+  if [[ $floor =~ ^[0-9]+$ ]] && (( floor >= 40 )); then
     local ratio=$((rtt * 100 / floor))
     if (( ratio <= 130 )); then printf '25'
     elif (( ratio <= 180 )); then printf '20'
@@ -9558,10 +9560,13 @@ route_line_score() { # 上游家数 Tier1家数 IX个数；任一为 -1 则 na�
 }
 route_na_centric() { case $1 in 174|3356|6939|701|7018|6461|1239) return 0 ;; *) return 1 ;; esac; }
 route_eu_centric() { case $1 in 3320|5511|1299|6762) return 0 ;; *) return 1 ;; esac; }
-route_detour_kind() { # 本机洲 目标洲 ASN... 往返 下限 → us / eu / 空
+route_detour_kind() { # 本机洲 目标洲 ASN... 往返 下限 → us / eu / slow / 空
   local vps=$1 dest=$2 asn_csv=$3 rtt=$4 floor=$5
   [[ $rtt =~ ^[0-9]+$ && $floor =~ ^[0-9]+$ ]] || return 0
   (( floor > 0 && rtt > floor * 2 )) || return 0
+  local extra=$((rtt - floor))
+  # 短途多出不到 30ms 当噪声，不判绕路。洲标签只决定写成绕美还是绕欧。
+  (( extra >= 30 )) || return 0
   local x na=0 eu=0
   local -a asn_words=()
   read -r -a asn_words <<<"$asn_csv"
@@ -9575,12 +9580,14 @@ route_detour_kind() { # 本机洲 目标洲 ASN... 往返 下限 → us / eu / �
     if [[ $vps == apac && $eu == 1 ]]; then printf 'eu'; return 0; fi
     if [[ $vps == na && $eu == 1 ]]; then printf 'eu'; return 0; fi
     if [[ $vps == eu && $na == 1 ]]; then printf 'us'; return 0; fi
+    printf 'slow'
     return 0
   fi
   if [[ $vps == apac && $dest == eu && $na == 1 ]]; then printf 'us'; return 0; fi
   if [[ $vps == apac && $dest == na && $eu == 1 ]]; then printf 'eu'; return 0; fi
   if [[ $vps == eu && $dest == apac && $na == 1 ]]; then printf 'us'; return 0; fi
   if [[ $vps == na && $dest == apac && $eu == 1 ]]; then printf 'eu'; return 0; fi
+  printf 'slow'
   return 0
 }
 route_detour_extra() {
@@ -9661,7 +9668,8 @@ route_path_class() { # 本机洲 目标洲 ASN串 往返 下限 [源ASN] [目标
   det=$(route_detour_kind "$vps" "$dest" "${arr[*]}" "$rtt" "$floor")
   if [[ -n $det ]]; then printf 'detour'; return 0; fi
   if (( t1n >= 2 )); then printf 't1'; return 0; fi
-  if (( dest_in && t1n == 0 && n <= 2 && reached )); then printf 'direct'; return 0; fi
+  # 直连只剩目标自己的 ASN。中间再有 Vodafone、RETN 或其他运营商就不是直连。
+  if (( dest_in && t1n == 0 && n == 1 && reached )); then printf 'direct'; return 0; fi
   if (( t1n >= 1 && n <= 4 )); then printf 't1'; return 0; fi
   if (( n >= 6 )); then printf 'multi'; return 0; fi
   printf 't23'
@@ -9834,9 +9842,25 @@ route_he_cogent_note() { # 地址族 上游列表
   [[ " $ups " == *" 6939 "* && " $ups " == *" 174 "* ]] || return 0
   printf '%s\n' "IPv6 上同时看到了 Hurricane Electric（AS6939）和 Cogent（AS174）。这两家长期不互相交换 IPv6 路由，只在其中一边的目标，另一边往往要绕很远，甚至根本到不了。某一侧不可达时先考虑这个原因，不要当成整条 IPv6 都坏了。"
 }
-route_note_path_peers() { # 把路径靠近本机的 ASN 记下来，留给国际线路。源 ASN 在路径里时只取下一跳
+route_is_china_return_asn() { # 回国回程里的电信 / 联通 / 移动，不算国际线路上游
+  case $1 in
+    4134|4809|23764|4811|4812|4813|4816|4847|58466|\
+    4837|4808|9929|10099|17816|17621|17622|17623|\
+    9808|58453|58807|56040|56041|56042|56044|56046|56047|56048)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+route_peer_excluded() { # 真：不要放进国际线路上游（中国回程或这次探测的目标 ASN）
+  local x=$1
+  route_asn_usable "$x" || return 0
+  route_is_china_return_asn "$x" && return 0
+  if [[ -n ${ROUTE_DEST_ASNS:-} && " ${ROUTE_DEST_ASNS} " == *" $x "* ]]; then return 0; fi
+  return 1
+}
+route_note_path_peers() { # 只记紧挨本机的下一跳。源 ASN 不在路径里时也只取第一跳，不往后扫
   local -a words=()
-  local i n x c=0 found=0 origin=${ROUTE_ORIGIN:-}
+  local i n x j origin=${ROUTE_ORIGIN:-}
   read -r -a words <<<"${ROUTE_PATH_ASNS:-}"
   n=${#words[@]}
   (( n == 0 )) && return 0
@@ -9844,32 +9868,36 @@ route_note_path_peers() { # 把路径靠近本机的 ASN 记下来，留给国�
   if [[ $origin =~ ^[0-9]+$ ]]; then
     for (( i = 0; i < n; i++ )); do
       [[ ${words[i]} == "$origin" ]] || continue
-      (( i + 1 < n )) || continue
-      x=${words[i+1]}
-      route_asn_usable "$x" || continue
-      ROUTE_PATH_PEERS+="$x "
-      found=1
-      break
+      for (( j = i + 1; j < n; j++ )); do
+        x=${words[j]}
+        route_asn_usable "$x" || continue
+        if ! route_peer_excluded "$x"; then ROUTE_PATH_PEERS+="$x "; fi
+        return 0
+      done
+      return 0
     done
   fi
-  if (( found )); then return 0; fi
   for x in "${words[@]}"; do
     route_asn_usable "$x" || continue
     if [[ $origin =~ ^[0-9]+$ && $x == "$origin" ]]; then continue; fi
-    ROUTE_PATH_PEERS+="$x "
-    c=$((c + 1))
-    (( c >= 3 )) && break
+    if ! route_peer_excluded "$x"; then ROUTE_PATH_PEERS+="$x "; fi
+    return 0
   done
   return 0
 }
-route_merge_path_peers() { # 并进 ROUTE_UPSTREAMS。looking-glass 很瘦时仍要这些路径上看到的互联
+route_merge_path_peers() { # 并进 ROUTE_UPSTREAMS。只并路径上的下一跳，中国回程和目标 ASN 仍排除
   local -a cur=() peers=() merged=()
   local x
   read -r -a cur <<<"${ROUTE_UPSTREAMS:-}"
   read -r -a peers <<<"${ROUTE_PATH_PEERS:-}"
-  for x in "${cur[@]}" "${peers[@]}"; do
+  for x in "${cur[@]}"; do
     x=${x#AS}; x=${x#as}
     route_asn_usable "$x" || continue
+    merged+=("$x")
+  done
+  for x in "${peers[@]}"; do
+    x=${x#AS}; x=${x#as}
+    route_peer_excluded "$x" && continue
     merged+=("$x")
   done
   if ((${#merged[@]})); then
@@ -10205,7 +10233,7 @@ route_intl_targets() { # 地址族 洲
     4:apac)
       printf '%s\n' \
         "91.108.56.100 1.35 103.82 新加坡Telegram" \
-        "203.178.148.1 35.69 139.69 东京WIDE" \
+        "203.178.136.1 35.69 139.69 东京WIDE" \
         "203.198.23.10 22.28 114.16 香港HGC" ;;
     4:na)
       printf '%s\n' \
@@ -10214,7 +10242,7 @@ route_intl_targets() { # 地址族 洲
     4:eu)
       printf '%s\n' \
         "149.154.167.51 52.37 4.90 阿姆斯特丹Telegram" \
-        "193.0.6.139 52.37 4.89 阿姆斯特丹RIPE" ;;
+        "95.211.20.80 52.37 4.89 阿姆斯特丹Leaseweb" ;;
     6:apac)
       printf '%s\n' \
         "2001:b28:f23f:f005::a 1.35 103.82 新加坡Telegram" \
@@ -10270,6 +10298,7 @@ route_whois_bulk() {
       [[ $a =~ ^[0-9]+$ ]] && ROUTE_ASN_CACHE["$ip"]=$a
     done
   fi
+  return 0
 }
 route_fill_path_asns() {
   local ip asn prev=""
@@ -10287,6 +10316,7 @@ route_fill_path_asns() {
     ROUTE_PATH_ASNS+="$asn "
     prev=$asn
   done
+  return 0
 }
 route_trace_bin() {
   if have traceroute; then printf 'traceroute'
@@ -10522,8 +10552,12 @@ route_probe() { # 目标。TCP/8080 没有往返时改 ICMP traceroute，再 ICM
   return 1
 }
 route_url_res() { printf '%s' "${1//\//%2F}"; }
-route_curl_json() {
-  curl -fsS --connect-timeout 8 --retry 1 --retry-delay 1 -m 25 -A oneclick-proxy "$1" 2>/dev/null
+route_curl_json() { # 外层 timeout，避免 curl 自己的 -m 在卡住的连接上拖很久
+  if have timeout; then
+    timeout -k 3 18 curl -fsS --connect-timeout 5 --retry 0 -m 12 -A oneclick-proxy "$1" 2>/dev/null
+  else
+    curl -fsS --connect-timeout 5 --retry 0 -m 12 -A oneclick-proxy "$1" 2>/dev/null
+  fi
 }
 route_load_origin() { # ip
   local ip=$1 j oline="" hline="" pline=""
@@ -10588,7 +10622,7 @@ route_load_upstreams() { # 源 ASN 地址族
   [[ $asn =~ ^[0-9]+$ ]] || return 0
   have curl || return 0
   local -a prefs=() lg_words=()
-  local ann p raw ups lg="" nb id ixj fac sz lg_u
+  local ann p raw ups lg="" nb id ixj fac sz lg_u neigh_ok=0
   [[ -n $ROUTE_PREFIX ]] && prefs+=("$ROUTE_PREFIX")
   ann=$(route_curl_json "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${asn}") || ann=""
   if [[ -n $ann ]]; then
@@ -10616,8 +10650,16 @@ route_load_upstreams() { # 源 ASN 地址族
     ROUTE_LG_UP_N=0
   fi
   mktmp
-  if curl -fsS --connect-timeout 8 -m 20 -A oneclick-proxy -o "${TMP_DIR}/route-neigh.json" \
+  if have timeout; then
+    timeout -k 3 18 curl -fsS --connect-timeout 5 --retry 0 -m 12 -A oneclick-proxy \
+      -o "${TMP_DIR}/route-neigh.json" \
+      "https://stat.ripe.net/data/asn-neighbours/data.json?resource=AS${asn}" 2>/dev/null && neigh_ok=1
+  elif curl -fsS --connect-timeout 5 --retry 0 -m 12 -A oneclick-proxy \
+      -o "${TMP_DIR}/route-neigh.json" \
       "https://stat.ripe.net/data/asn-neighbours/data.json?resource=AS${asn}" 2>/dev/null; then
+    neigh_ok=1
+  fi
+  if (( neigh_ok )); then
     sz=$(wc -c < "${TMP_DIR}/route-neigh.json" 2>/dev/null || echo 0)
     if (( sz > 250000 )); then
       ROUTE_NEIGH_N=999
@@ -10739,7 +10781,9 @@ route_china_explain() {
     printf '最后一跳往返约 %s ms。' "$rtt"
     if [[ $floor =~ ^[0-9]+$ && $floor != 0 ]]; then
       printf '按本机到北京的球面距离，理论下限大约 %s ms。' "$floor"
-      if (( rtt * 100 / floor > 180 )); then
+      if (( floor < 40 )); then
+        printf '这段距离短，延迟按绝对毫秒分档，不拿短途下限的比例把几十毫秒压低。'
+      elif (( rtt * 100 / floor > 180 )); then
         printf '实际明显高于这个下限，延迟这一项不会给满。'
       fi
     else
@@ -10767,7 +10811,7 @@ route_china_explain() {
 route_section_china() {
   local fam=$1
   printf '\n%s【回国回程】%s\n' "$C_BOLD" "$C_NONE"
-  printf '三家分开测，再取平均。某一家地址都测不通时记 0，并且算进平均。线路档次最多 60、延迟最多 25、丢包最多 15。延迟或丢包没测到时不按 0 分，只按测到的项目折算到 100，并写成未测。\n'
+  printf '三家分开测，再取平均。某一家地址都测不通时记 0，并且算进平均。线路档次最多 60、延迟最多 25、丢包最多 15。延迟或丢包没测到时不按 0 分，只按测到的项目折算到 100，并写成未测。到北京的理论下限不到 40 毫秒时，延迟改按绝对毫秒分档，近距离的几十毫秒不再被比例压得很低。只有星号、解析不出自治系统的探测按测不通，不写成未能识别。\n'
   local tool
   tool=$(route_trace_bin)
   if [[ $tool == none ]]; then
@@ -10793,6 +10837,10 @@ route_section_china() {
         continue
       fi
       route_fill_path_asns
+      if [[ -z ${ROUTE_HOP_IPS// } && -z ${ROUTE_PATH_ASNS// } ]]; then
+        info "${zh}：${label}（${ip}）只有星号，没有解析出自治系统，换下一个"
+        continue
+      fi
       route_note_path_peers
       local -a class_words=()
       read -r -a class_words <<<"$ROUTE_CLASS_TOKENS"
@@ -10844,7 +10892,7 @@ route_section_china() {
 route_section_line() {
   local fam=$1
   printf '\n%s【国际线路】%s\n' "$C_BOLD" "$C_NONE"
-  printf '这一节看「和谁连着」。上游先看 RIPEstat looking-glass：各采集点的 AS 路径里，紧挨在本 ASN 前面的那个 ASN。大网的采集点往往很瘦，所以也会把这次探测路径上靠近本机的 ASN 并进去。IP 反查 ASN 用 bgp.tools 的 43 端口（和 Team Cymru 同一类 whois），查不到再退回 RIPEstat。不抓 bgp.tools 的网页。邻居表里 left 方向如果超过 12 个，说明这张网太大，那些邻居不全是上游，就不拿来加分。交换中心用 PeeringDB 的 netixlan，按不重复的 ix_id 计数。\n'
+  printf '这一节看「和谁连着」。上游先看 RIPEstat looking-glass：各采集点的 AS 路径里，紧挨在本 ASN 前面的那个 ASN。大网的采集点往往很瘦，所以也会把探测路径上紧挨本机的下一跳并进去。本机 ASN 不在路径里时只取这一跳，不把中国电信、联通、移动或目标自己的 ASN 算进上游。IP 反查 ASN 用 bgp.tools 的 43 端口（和 Team Cymru 同一类 whois），查不到再退回 RIPEstat。不抓 bgp.tools 的网页。邻居表里 left 方向如果超过 12 个，说明这张网太大，那些邻居不全是上游，就不拿来加分。交换中心用 PeeringDB 的 netixlan，按不重复的 ix_id 计数。\n'
   printf '计分权重是上游最多 30（0/1/2/3/不少于 4 家对应 0/10/18/24/30）、Tier1 最多 40（0/1/2/3/不少于 4 家对应 0/18/28/35/40）、IX 最多 30（0/1/2至3/4至7/不少于 8 个对应 0/8/16/24/30）。三项缺一就不打分，避免把查询失败写成很差。Tier1 按这份名单：Cogent、Verizon、Sprint、Arelion、NTT、GTT、DTAG、Lumen、PCCW、Orange、Tata、Zayo、TI Sparkle、AT&T。Hurricane Electric 不是这份名单里的 Tier1，但会在下面点名。\n'
   if [[ ! $ROUTE_ORIGIN =~ ^[0-9]+$ ]]; then
     printf '没有本机源 ASN，上游和 IX 都无从查起。国际线路无法打分。\n'
@@ -10903,7 +10951,7 @@ route_section_line() {
     if ((${#peer_words[@]})); then
       peer_u=$(route_uniq_words "${peer_words[@]}")
       read -r -a peer_words <<<"$peer_u"
-      printf 'looking-glass 只看到 %s 家上游，采样偏少，已把探测路径上靠近本机的互联并进去：%s。邻居超过 12 家时仍然不用整张邻居表。\n' \
+      printf 'looking-glass 只看到 %s 家上游，采样偏少，已把探测路径上紧挨本机的下一跳并进去：%s。中国回程运营商和目标 ASN 不算进这份上游。邻居超过 12 家时仍然不用整张邻居表。\n' \
         "$ROUTE_LG_UP_N" "$(route_fmt_asns "${peer_words[@]}")"
     fi
   fi
@@ -10975,24 +11023,21 @@ route_intl_one() { # 地址族 洲 权重。把该洲分数写入 ROUTE_REGION_S
       continue
     fi
     route_fill_path_asns
-    route_note_path_peers
-    if (( ! ROUTE_REACHED )) && [[ -z ${ROUTE_PATH_ASNS// } ]] && [[ ! $ROUTE_RTT =~ ^[0-9]+$ ]]; then
-      info "${label}（${ip}）没有回应，换下一个"
-      continue
-    fi
     floor=$(route_pair_floor "$lat" "$lon")
     rtt_arg=-1
     [[ $ROUTE_RTT =~ ^[0-9]+$ ]] && rtt_arg=$ROUTE_RTT
     route_whois_bulk "$ip"
     dest_asn=${ROUTE_ASN_CACHE[$ip]:-}
     route_asn_usable "$dest_asn" || dest_asn=""
-    path_known=1
+    if [[ -n $dest_asn ]]; then ROUTE_DEST_ASNS+="$dest_asn "; fi
+    route_note_path_peers
+    # 没有可用 ASN（全是星号或反查失败）：不按 0 分拉低这一洲。整洲都这样时仍记 0。
     if [[ -z ${ROUTE_PATH_ASNS// } ]]; then
-      path_known=0
-      class=unreach
-    else
-      class=$(route_path_class "$ROUTE_CONT" "$cont" "$ROUTE_PATH_ASNS" "$rtt_arg" "$floor" "$ROUTE_ORIGIN" "$dest_asn" "$ROUTE_REACHED")
+      info "${label}（${ip}）没有解析出自治系统，不计入这一洲的平均"
+      continue
     fi
+    path_known=1
+    class=$(route_path_class "$ROUTE_CONT" "$cont" "$ROUTE_PATH_ASNS" "$rtt_arg" "$floor" "$ROUTE_ORIGIN" "$dest_asn" "$ROUTE_REACHED")
     if [[ $ROUTE_RTT =~ ^[0-9]+$ ]]; then lat_pts=$(route_intl_lat_points "$ROUTE_RTT" "$floor")
     else lat_pts=-1; fi
     if (( ! path_known )); then
@@ -11010,7 +11055,7 @@ route_intl_one() { # 地址族 洲 权重。把该洲分数写入 ROUTE_REGION_S
       path_words=()
       read -r -a path_words <<<"$ROUTE_PATH_ASNS"
       route_printf '路径上的 ASN 是 %s。' "$(route_fmt_asns "${path_words[@]}")"
-      route_printf '按跳数和是否经过 Tier1，这一条记为%s。直连只在路径里看到目标 ASN、且不是两条 Tier1 时才算。' "$(route_path_class_label "$class")"
+      route_printf '按跳数和是否经过 Tier1，这一条记为%s。直连只在路径里只剩目标自己的 ASN 时才算，中间不能再有别的运营商，两条 Tier1 也不算直连。' "$(route_path_class_label "$class")"
     else
       route_printf '没有解析出路径 ASN，路径未测，不把这条记成不可达的 0 分。'
     fi
@@ -11031,6 +11076,9 @@ route_intl_one() { # 地址族 洲 权重。把该洲分数写入 ROUTE_REGION_S
         route_printf '这是绕美：路径上有以北美为中心的运营商，而这条路的两端并不该绕到北美。相对理论下限大约多出 %s ms。' "$extra"
       elif [[ $kind == eu ]]; then
         route_printf '这是绕欧：路径上有以欧洲为中心的运营商，而这条路的两端并不该绕到欧洲。相对理论下限大约多出 %s ms。' "$extra"
+      elif [[ $kind == slow && $floor =~ ^[0-9]+$ && $floor != 0 ]]; then
+        route_printf '往返明显高于理论下限（约为下限的 %s.%s 倍，多出 %s ms），按绕路计。' \
+          "$((rtt_arg / floor))" "$(( (rtt_arg * 10 / floor) % 10 ))" "$extra"
       fi
     fi
     if (( ! path_known )); then
@@ -11055,7 +11103,7 @@ route_intl_one() { # 地址族 洲 权重。把该洲分数写入 ROUTE_REGION_S
 route_section_intl() {
   local fam=$1
   route_printf '\n%s【国际互联】%s\n' "$C_BOLD" "$C_NONE"
-  route_printf '这一节看实际走到了哪里，和上一节的「有哪些上游」分开。路径档次按直连/对等、Tier1 中转、Tier2/3、多跳、绕路、不可达。直连要求路径里出现目标自己的 ASN，两条 Tier1 不算直连，AS0 这类未知 ASN 不算一跳。延迟拿实测往返和理论下限比，下限仍是距离公里数除以 100。没有测到往返时不把延迟记成 0 分，只按路径档折算，并写明延迟未测。绕路必须同时有往返和理论下限，往返要超过下限的两倍，还要在不该出现的洲看到对应运营商。死掉的测试地址不写进报告、也不拉低平均；某一洲全部测不通，这一洲记 0。\n'
+  route_printf '这一节看实际走到了哪里，和上一节的「有哪些上游」分开。路径档次按直连/对等、Tier1 中转、Tier2/3、多跳、绕路、不可达。直连要求路径里只剩下目标自己的 ASN，中间不能再有别的运营商。两条 Tier1 不算直连，AS0 这类未知 ASN 不算一跳。延迟拿实测往返和理论下限比，下限仍是距离公里数除以 100。没有测到往返时不把延迟记成 0 分，只按路径档折算，并写明延迟未测。绕路要有往返和理论下限，往返超过下限的两倍，并且多出不少于 30 毫秒。路径上若出现不该出现的北美或欧洲骨干，写成绕美或绕欧；没有这些运营商、但时延仍然明显偏高，也按绕路计。没有解析出自治系统的探测不写入平均，也不按 0 分拉低；某一洲全部如此，这一洲记 0。\n'
   local tool
   tool=$(route_trace_bin)
   if [[ $tool == none ]]; then
@@ -11090,7 +11138,7 @@ route_report_family() {
   _green "  IPv${fam} 线路检测"
   hr
   ROUTE_CHINA_SCORE="" ROUTE_LINE_SCORE="" ROUTE_INTL_SCORE=""
-  ROUTE_UPSTREAMS="" ROUTE_ORIGIN="" ROUTE_PATH_PEERS=""
+  ROUTE_UPSTREAMS="" ROUTE_ORIGIN="" ROUTE_PATH_PEERS="" ROUTE_DEST_ASNS=""
   ROUTE_INTL_BODY="" ROUTE_HOLD=0
   if [[ -z $ip ]]; then
     printf '本机没有检测到公网 IPv%s，这一侧不打分，也不编一个看起来完整的结果。\n' "$fam"
@@ -11113,8 +11161,9 @@ route_print_limits() {
 晚高峰和白天、工作日和周末，同一家上游的拥塞可能差一截。这是一次采样，不是全天结论。
 traceroute 和 mtr 看到的中间跳，很多路由器不回应探测，星号不等于丢包。TCP/8080 打到运营商 DNS 常常没有往返，这时会改用 ICMP traceroute、ICMP mtr 或 ping。延迟或丢包没测到就写成未测，不按 0 分打进档次。去程和回程可以走不同的运营商。
 若报告里延迟仍是未测，在这台 VPS 上先确认 ping 能通，再跑一次 proxy route。
-Telegram 数据中心是任播，落点不一定是写在上面的那个城市，时延下限会因此偏。东京 WIDE、香港 HGC、弗里蒙特 HE、阿姆斯特丹 RIPE 用来减少「全是任播」的情况，但这些地址本身也会变。
-电信用广东、成都、湖南的地址（202.96.134.133 是广东电信，不是上海）。联通用天津、广东、湖南，不再使用已经不回应的北京联通 DNS。移动用北京附近和骨干地址。IPv6 每家目前只放了一个运营商网段里的地址。单个地址没回应就换下一个，不写进报告；某一家全部测不通时该项记 0，并写明测不通。
+Telegram 数据中心是任播，落点不一定是写在上面的那个城市，时延下限会因此偏。东京 WIDE、香港 HGC、弗里蒙特 HE、阿姆斯特丹 Leaseweb 用来减少「全是任播」的情况，但这些地址本身也会变。东京 WIDE 换过仍会回应探测的地址。阿姆斯特丹不再用已经不回应的 RIPE 地址。
+电信用广东、成都、湖南的地址（202.96.134.133 是广东电信，不是上海）。联通用天津、广东、湖南，不再使用已经不回应的北京联通 DNS。移动用北京附近和骨干地址。IPv6 每家目前只放了一个运营商网段里的地址。单个地址没回应就换下一个，不写进报告；某一家全部测不通时该项记 0，并写明测不通。只有星号、解析不出自治系统时也按测不通，不写成未能识别。
+到北京的理论下限不到 40 毫秒时，回国延迟按绝对毫秒分档。绕路按往返超过下限两倍、且多出不少于 30 毫秒判断；不要求路径上一定出现另一洲的骨干。直连要求中间没有别的运营商。国际线路的路径上游只取紧挨本机的下一跳，不含中国回程运营商和目标 ASN。PeeringDB 查询失败时国际线路无法打分，不会一直卡住。
 省网 ASN（例如电信 4812、联通 4808、移动 56048）在没有更高档次的骨干 ASN 时，按该运营商的普通档计，不升到 CN2、9929 或 CMIN2。AS0、私有 ASN 不计入路径跳数。
 IPv4 和 IPv6 是两份报告。没有公网 IPv6 时不为 IPv6 编分数。Hurricane Electric 和 Cogent 的 IPv6 长期不互联，只在 IPv6 上游里两家都出现时才会单独提醒。
 EOF
