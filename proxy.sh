@@ -17,6 +17,7 @@
 #   bash proxy.sh --xhttp-tls --ws-tls --cert-domain example.com
 #                                 # 可选：CDN 上的 XHTTP+TLS / WebSocket+TLS（默认不装，不替换 REALITY）
 #   bash proxy.sh route           # 线路检测：回程 / 国际线路 / 国际互联（不改配置）
+#   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
 #   bash proxy.sh --help          # 查看全部参数
 # 安装完成后可直接使用命令: proxy
 #
@@ -165,6 +166,7 @@ OPT_TUNE_RTT=""     # BDP：延迟 ms
 OPT_SCAN=0
 OPT_NAME=""
 OPT_ACTION=""
+OPT_OUTBOUND=""     # 46 IPv4优先 | 64 IPv6优先 | 4 仅IPv4 | 6 仅IPv6 | auto 按检测；空=未指定
 OPT_NAT=""          # 空=沿用已安装的模式; 1/0
 OPT_NAT_ADDR=""
 OPT_NAT_EXT=""      # 映射端口列表 --nat-ports（外部[:内部]，逗号分隔；或整段 a-b[:c-d]）
@@ -542,12 +544,20 @@ NAT_PREF=auto       # 菜单「切换 NAT 模式」：auto = 自动检测；on =
 NAT_SRC=""          # 本次安装 NAT_MODE 的来源：cli | manual | alpine | state | auto | detect
 # 已记住的出站策略：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6。空 = 还没问过。
 # 双栈且为空时保持原来的 AsIs / Hy2 happy eyeballs，直到交互询问或 --auto（默认 46）。
+# --outbound auto 清掉已记住的选择，再按本次检测决定。
 OUTBOUND_IP=""
 CERT_ON=0 CERT_DOMAIN="" CERT_EMAIL="" SUB_PORT=8447 SUB_TOKEN=""
 # 旧状态文件没有这几项时保持 Let's Encrypt 单域名 HTTP-01，已经签好的公开证书行为不变。
 CERT_CA=letsencrypt CERT_SCOPE=single CERT_NAMES="" CERT_PUBLIC=1 CERT_CHALLENGE=http
 OUTBOUND_EFFECTIVE=""   # 本次写配置实际使用的策略（单栈会强制 4 或 6，不覆盖 OUTBOUND_IP）
 OUTBOUND_IP_DONE=0      # 本次进程只决定一次
+OUTBOUND_IP_CHANGED=0
+OB_HAS_V4=0
+OB_HAS_V6=0
+OB_HAS_ULA=0            # 出站源是 ULA（fc00::/7），还没证明有公网 IPv6
+OB_ULA_SRC=""           # 路由选中的 ULA 源地址
+OB_NAT66=0              # 1 = ULA 源，但 curl -6 看到公网 IPv6
+OB_NAT66_PUB=""
 
 load_state() {
   [[ -f $STATE_FILE ]] || { STATE_HAS_XHTTP=0; return 0; }
@@ -2786,7 +2796,10 @@ xray_clients_json() { # $1 = flow（默认 xtls-rprx-vision；XHTTP 传空字符
 # ----------------------------- 出站地址族 -----------------------------
 # 双栈（同时能用 IPv4 和 IPv6 出站）在写节点配置时询问一次：IPv4优先 / IPv6优先 / 仅IPv4 / 仅IPv6。
 # 只有一种地址族时不询问，Xray 用 UseIPv4 或 UseIPv6。选择记在 OUTBOUND_IP，之后重配沿用。
-# IPv4：默认路由的源地址不是回环 / 链路本地（NAT 内网地址算有 IPv4）。IPv6：全球单播（2000::/3），不算 fe80 和 ULA。
+# IPv4：默认路由的源地址不是回环 / 链路本地（NAT 内网地址算有 IPv4）。
+# IPv6：全球单播（2000::/3）算有。fe80 和 ULA（fc00::/7）本身不算。
+# 源地址只有 ULA 时再 curl -6：NAT66 会把 fc00::/7 转成公网 IPv6（例如 2600:1700::）。
+# 探测到公网地址就按双栈，才能选「IPv6优先」。回显仍是 ULA 或探测失败，则当作没有 IPv6。
 outbound_ipv4_ok() {
   local a=$1 o1 o2 o3 o4
   [[ $a =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
@@ -2802,12 +2815,66 @@ outbound_ipv6_global() { # 2000::/3；排除 ::1、fe80::/10、ULA fc00::/7
   [[ $a == ::1 || $a == fe80:* || $a == fc* || $a == fd* ]] && return 1
   [[ $a == [23]* ]]
 }
+outbound_ipv6_ula() { # fc00::/7。fe80 不是 ULA。
+  local a=${1,,}
+  [[ $a == *:* ]] || return 1
+  [[ $a == fc* || $a == fd* ]]
+}
+# $1 为文本地址，或 /proc/net/if_inet6 的 32 位十六进制。只置位，不清除。
+outbound_note_v6_token() {
+  local a=${1,,}
+  a=${a%%%*}
+  a=${a%%/*}
+  if [[ $a == *:* ]]; then
+    if outbound_ipv6_global "$a"; then OB_HAS_V6=1
+    elif outbound_ipv6_ula "$a"; then OB_HAS_ULA=1
+    fi
+    return 0
+  fi
+  # /proc/net/if_inet6 固定 32 位十六进制。短字符串（例如误传入的 IPv4）不算。
+  [[ $a =~ ^[0-9a-f]{32}$ ]] || return 0
+  if [[ $a == [23]* ]]; then OB_HAS_V6=1
+  elif [[ $a == fc* || $a == fd* ]]; then OB_HAS_ULA=1
+  fi
+  return 0
+}
+outbound_ipv6_probe_public() { # 打印公网 IPv6；没有则空。curl 失败也返回 0，避免 set -e 中断。
+  local u ip=""
+  if ! have curl; then
+    printf ''
+    return 0
+  fi
+  for u in https://api64.ipify.org https://ipv6.icanhazip.com https://6.ipw.cn; do
+    ip=$(curl -6 -fsS --connect-timeout 4 -m 6 "$u" 2>/dev/null | tr -d '[:space:]') || ip=""
+    if outbound_ipv6_global "$ip"; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  done
+  printf ''
+  return 0
+}
+outbound_consider_nat66() { # 只有 ULA、没有全球单播源时才探测，避免无 IPv6 的机器白等。
+  local pub=""
+  if (( OB_HAS_V6 || ! OB_HAS_ULA )); then return 0; fi
+  pub=$(outbound_ipv6_probe_public) || pub=""
+  if outbound_ipv6_global "$pub"; then
+    OB_HAS_V6=1
+    OB_NAT66=1
+    OB_NAT66_PUB=${pub,,}
+    OB_NAT66_PUB=${OB_NAT66_PUB%%%*}
+  fi
+  return 0
+}
 outbound_detect_families_ip() {
   local s4="" s6=""
   s4=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || s4=""
   s6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || s6=""
   if outbound_ipv4_ok "$s4"; then OB_HAS_V4=1; fi
-  if outbound_ipv6_global "$s6"; then OB_HAS_V6=1; fi
+  if [[ -n $s6 ]]; then
+    outbound_note_v6_token "$s6"
+    if outbound_ipv6_ula "$s6"; then OB_ULA_SRC=${s6%%%*}; OB_ULA_SRC=${OB_ULA_SRC,,}; fi
+  fi
   return 0
 }
 outbound_detect_families_proc() {
@@ -2819,15 +2886,21 @@ outbound_detect_families_proc() {
   fi
   if awk '$1=="00000000000000000000000000000000" && $2=="00" && $NF!="lo" {found=1} END{exit !found}' /proc/net/ipv6_route 2>/dev/null; then
     while IFS= read -r a; do
-      # /proc/net/if_inet6 是 32 位十六进制；2000::/3 的首位为 2 或 3
-      if [[ ${a,,} == [23]* ]]; then OB_HAS_V6=1; break; fi
+      outbound_note_v6_token "$a"
+      if (( OB_HAS_V6 )); then break; fi
     done < <(awk '{print $1}' /proc/net/if_inet6 2>/dev/null)
   fi
   return 0
 }
 outbound_detect_families() {
-  OB_HAS_V4=0 OB_HAS_V6=0
+  OB_HAS_V4=0
+  OB_HAS_V6=0
+  OB_HAS_ULA=0
+  OB_ULA_SRC=""
+  OB_NAT66=0
+  OB_NAT66_PUB=""
   if have ip; then outbound_detect_families_ip; else outbound_detect_families_proc; fi
+  outbound_consider_nat66
   return 0
 }
 xray_domain_strategy() {
@@ -2873,10 +2946,31 @@ sb_resolver_is_new() {
   ver_ge "$v" "1.12.0"
 }
 outbound_can_ask() { [[ -t 0 || -r /dev/tty ]]; }
-outbound_apply_code() { OUTBOUND_IP=$1 OUTBOUND_EFFECTIVE=$1 OUTBOUND_IP_CHANGED=1; }
+outbound_apply_code() { # 与已保存的值相同则不标记改动，避免每次重配都写 state.env
+  local code=$1
+  OUTBOUND_EFFECTIVE=$code
+  if [[ ${OUTBOUND_IP:-} != "$code" ]]; then
+    OUTBOUND_IP=$code
+    OUTBOUND_IP_CHANGED=1
+  fi
+}
+outbound_label() {
+  case ${1:-} in
+    46) printf '%s' 'IPv4优先' ;;
+    64) printf '%s' 'IPv6优先' ;;
+    4) printf '%s' '仅IPv4' ;;
+    6) printf '%s' '仅IPv6' ;;
+    auto) printf '%s' '自动' ;;
+    *) printf '%s' '未指定' ;;
+  esac
+}
 outbound_ask() {
   local c def=1
-  echo "   出站地址（本机同时有 IPv4 和 IPv6；只影响代理出站，不会关闭系统 IPv6）："
+  if (( OB_NAT66 )); then
+    echo "   出站地址（IPv4 可用；IPv6 经 NAT66 到 ${OB_NAT66_PUB}。只影响代理出站，不会关闭系统 IPv6）："
+  else
+    echo "   出站地址（本机同时有 IPv4 和 IPv6；只影响代理出站，不会关闭系统 IPv6）："
+  fi
   echo "     1) IPv4优先"
   echo "     2) IPv6优先"
   echo "     3) 仅IPv4"
@@ -2902,18 +2996,55 @@ outbound_use_saved_or_default() { # 双栈或检测不到时：沿用已保存�
     info "自动模式：出站使用 IPv4优先。"
     return 0
   fi
-  if (( OB_HAS_V4 && OB_HAS_V6 )) && outbound_can_ask; then
+  # proxy outbound（不带策略）只查看，不在这里询问。安装和 proxy outbound auto 仍询问。
+  if (( OB_HAS_V4 && OB_HAS_V6 )) && [[ ${OUTBOUND_NO_ASK:-0} != 1 ]] && outbound_can_ask; then
     outbound_ask
     return 0
   fi
   # 还没问过，且这次不能问：保持原行为（Xray AsIs，Hy2 不写出站 mode）
   OUTBOUND_EFFECTIVE=""
 }
+outbound_warn_missing_family() { # 显式 --outbound 与检测结果冲突时只警告，仍按用户的选择写
+  case $1 in
+    64|6)
+      if (( ! OB_HAS_V6 )); then
+        warn "检测不到 IPv6 出站，仍按 $(outbound_label "$1") 写入。若客户端连不上，改回 46 或 4。"
+      fi
+      ;;
+    46|4)
+      if (( ! OB_HAS_V4 )); then
+        warn "检测不到 IPv4 出站，仍按 $(outbound_label "$1") 写入。若客户端连不上，改回 64 或 6。"
+      fi
+      ;;
+  esac
+  return 0
+}
 ensure_outbound_ip() {
   (( OUTBOUND_IP_DONE )) && return 0
   OUTBOUND_IP_DONE=1
   OUTBOUND_IP_CHANGED=0
   outbound_detect_families
+  if (( OB_NAT66 )); then
+    if [[ -n $OB_ULA_SRC ]]; then
+      info "IPv6 源地址是内网 ${OB_ULA_SRC}，探测到 NAT66 公网 ${OB_NAT66_PUB}，IPv6 出站可用。"
+    else
+      info "IPv6 源地址是内网 ULA，探测到 NAT66 公网 ${OB_NAT66_PUB}，IPv6 出站可用。"
+    fi
+  fi
+  if [[ ${OPT_OUTBOUND:-} =~ ^(46|64|4|6)$ ]]; then
+    outbound_apply_code "$OPT_OUTBOUND"
+    outbound_warn_missing_family "$OPT_OUTBOUND"
+    info "出站使用 $(outbound_label "$OPT_OUTBOUND")。"
+    if (( OUTBOUND_IP_CHANGED )); then save_state; fi
+    return 0
+  fi
+  if [[ ${OPT_OUTBOUND:-} == auto ]]; then
+    if [[ -n ${OUTBOUND_IP:-} ]]; then
+      OUTBOUND_IP=""
+      OUTBOUND_IP_CHANGED=1
+    fi
+    OUTBOUND_EFFECTIVE=""
+  fi
   if (( OB_HAS_V4 && ! OB_HAS_V6 )); then
     OUTBOUND_EFFECTIVE=4
     info "本机只有 IPv4，出站使用仅IPv4。"
@@ -2924,6 +3055,75 @@ ensure_outbound_ip() {
     outbound_use_saved_or_default
   fi
   if (( OUTBOUND_IP_CHANGED )); then save_state; fi
+  return 0
+}
+outbound_print_status() {
+  local fam="未检测到" pol
+  if (( OB_HAS_V4 && OB_HAS_V6 )); then
+    if (( OB_NAT66 )); then
+      if [[ -n $OB_ULA_SRC ]]; then
+        fam="双栈（本机 ${OB_ULA_SRC} 经 NAT66 到 ${OB_NAT66_PUB}）"
+      else
+        fam="双栈（内网 ULA 经 NAT66 到 ${OB_NAT66_PUB}）"
+      fi
+    else
+      fam="双栈"
+    fi
+  elif (( OB_HAS_V4 )); then
+    fam="只有 IPv4"
+  elif (( OB_HAS_V6 )); then
+    fam="只有 IPv6"
+  fi
+  if [[ -n ${OUTBOUND_EFFECTIVE:-} ]]; then pol=$(outbound_label "$OUTBOUND_EFFECTIVE")
+  else pol="未指定"
+  fi
+  echo "出站检测: ${fam}"
+  echo "出站策略: ${pol}"
+  if (( OB_HAS_V4 && OB_HAS_V6 )) && [[ -z ${OUTBOUND_EFFECTIVE:-} ]]; then
+    echo "设置: proxy outbound 46|64|4|6|auto"
+  fi
+  return 0
+}
+outbound_apply_installed() { # 已安装时按当前策略重写配置。未安装的调用方不要进来。
+  (( INSTALLED )) || return 0
+  local did=0
+  if [[ -f $XRAY_CONF && -x $XRAY_BIN ]]; then
+    write_xray_config || die "重写 Xray 出站策略失败。"
+    restart_xray
+    did=1
+  fi
+  if (( ${HY2_ENABLED:-0} )) && [[ -f $HY_CONF && -x $HY_BIN ]]; then
+    write_hy2_config || die "重写 Hysteria2 出站策略失败。"
+    restart_hy2
+    did=1
+  fi
+  if sb_needed && [[ -f $SB_CONF && -x $SB_BIN ]]; then
+    write_singbox_config || die "重写 sing-box 出站策略失败。"
+    restart_singbox
+    did=1
+  fi
+  if (( ! did )); then
+    info "已记住出站策略。当前没有可更新的节点配置，下次重写配置时生效。"
+  fi
+  return 0
+}
+do_outbound() {
+  if [[ -f $STATE_FILE ]]; then load_state; fi
+  step "出站地址"
+  OUTBOUND_IP_DONE=0
+  # 不带 46|64|4|6|auto 时只查看。带 auto 表示清掉旧选择后按检测（双栈且有终端则询问）。
+  if [[ -z ${OPT_OUTBOUND:-} ]]; then OUTBOUND_NO_ASK=1; else OUTBOUND_NO_ASK=0; fi
+  ensure_outbound_ip
+  OUTBOUND_NO_ASK=0
+  outbound_print_status
+  if [[ -n ${OPT_OUTBOUND:-} ]] || (( OUTBOUND_IP_CHANGED )); then
+    if (( INSTALLED )); then
+      outbound_apply_installed
+    else
+      info "尚未安装节点。这个选择会在安装时写入。"
+    fi
+  fi
+  return 0
 }
 xray_apply_ip_strategy() { # $1 临时配置。未选择时不改（freedom 无 domainStrategy，routing 保持 AsIs）
   local ds f=$1
@@ -11718,6 +11918,8 @@ usage() {
 
 安装选项:
   --auto              使用全部默认值自动安装（非交互）
+  --outbound <策略>   出站：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6 / auto 按检测
+                      内网 ULA（fc00::/7）若 NAT66 到公网 IPv6，按双栈，可选 IPv6优先
   --sni <域名>        指定 REALITY 目标网站（会进行合规检测）
   --force-sni         与 --sni 一起使用：检测不通过也强制使用
   --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
@@ -11772,6 +11974,10 @@ usage() {
   -h, --help          显示帮助
 
 双栈（同时有 IPv4 和 IPv6）写入节点配置时询问出站策略：IPv4优先 / IPv6优先 / 仅IPv4 / 仅IPv6（记在 state.env，之后沿用；--auto 默认 IPv4优先；只有一种地址时不询问）。
+本机 IPv6 只有内网 ULA（fc00::/7，例如 fd42::）时，会用 curl -6 探测。若回显是公网 IPv6（NAT66），按双栈处理，可以选 IPv6优先。回显仍是 ULA 或探测失败，则当作没有 IPv6。
+  --outbound 46|64|4|6|auto    直接指定。auto 清掉已记住的选择，再按本次检测决定。
+  proxy outbound                  查看检测结果
+  proxy outbound 64               设为 IPv6优先，已安装时重写配置并重启
 
 NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙·fail2ban·Swap；调优可选）:
   --nat               启用 NAT 模式（Alpine 自动启用；LXC/OpenVZ 未指定时询问；之后 proxy 命令自动沿用）
@@ -11838,6 +12044,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy route         线路检测（回程 / 国际线路 / 国际互联；不改配置、不重启）
   proxy route ipv4    只测 IPv4
   proxy route ipv6    只测 IPv6
+  proxy outbound      查看出站地址族（含 NAT66）。proxy outbound 46|64|4|6|auto 设置并应用
   proxy land          落地转发 / 落地机信息（见上）
   proxy uninstall     卸载
 
@@ -11852,6 +12059,20 @@ parse_args() {
   while (( $# )); do
     case $1 in
       --auto|-y) OPT_AUTO=1 ;;
+      --outbound)
+        [[ -n ${2-} ]] || die "--outbound 需要参数：46、64、4、6 或 auto"
+        case ${2,,} in
+          46|64|4|6|auto) OPT_OUTBOUND=${2,,} ;;
+          *) die "--outbound 参数无效: $2（可选 46、64、4、6、auto）" ;;
+        esac
+        shift ;;
+      --outbound=*)
+        OPT_OUTBOUND=${1#*=}
+        case ${OPT_OUTBOUND,,} in
+          46|64|4|6|auto) OPT_OUTBOUND=${OPT_OUTBOUND,,} ;;
+          *) die "--outbound 参数无效: ${OPT_OUTBOUND}（可选 46、64、4、6、auto）" ;;
+        esac
+        ;;
       --sni) [[ -n ${2-} ]] || die "--sni 需要参数"; OPT_SNI=$2; shift ;;
       --sni=*) OPT_SNI=${1#*=} ;;
       --force-sni) OPT_FORCE_SNI=1 ;;
@@ -12033,6 +12254,14 @@ parse_args() {
           4|ipv4|v4) OPT_ROUTE_FAM=4; shift ;;
           6|ipv6|v6) OPT_ROUTE_FAM=6; shift ;;
         esac ;;
+      outbound)
+        OPT_ACTION=outbound
+        if [[ -n ${2-} ]]; then
+          case ${2,,} in
+            46|64|4|6|auto) OPT_OUTBOUND=${2,,}; shift ;;
+          esac
+        fi
+        ;;
       cert|acme) OPT_ACTION=cert ;;
       cdn) OPT_ACTION=cdn ;;
       uninstall|remove) OPT_ACTION=uninstall ;;
@@ -12052,6 +12281,8 @@ parse_args() {
     OPT_ACTION=tune
   fi
   [[ -n $OPT_TUNE_BW && -z $OPT_TUNE_RTT || -z $OPT_TUNE_BW && -n $OPT_TUNE_RTT ]] && die "--tune-bw 与 --tune-rtt 需要同时使用"
+  # 只给了 --outbound：查看或设置出站，不进入安装
+  if [[ -z $OPT_ACTION && -n ${OPT_OUTBOUND:-} ]]; then OPT_ACTION=outbound; fi
   # 普通模式下 --port / --hy2-port 只接受单个端口；NAT 模式的 外部:内部 写法在安装时再校验
   if [[ $OPT_NAT != 1 ]]; then
     [[ -z $OPT_PORT || $OPT_PORT != *:* || -f $STATE_FILE ]] || die "--port 的 外部:内部 写法仅用于 NAT 模式（--nat）。"
@@ -12103,6 +12334,7 @@ main() {
     cdn) do_cdn ;;
     tune) do_tune ;;
     route) do_route ;;
+    outbound) do_outbound ;;
     land) do_land_cli ;;
     allow) land_menu_allow ;;
     uninstall) do_uninstall ;;
