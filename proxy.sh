@@ -3087,20 +3087,23 @@ outbound_print_status() {
 outbound_apply_installed() { # 已安装时按当前策略重写配置。未安装的调用方不要进来。
   (( INSTALLED )) || return 0
   local did=0
-  if [[ -f $XRAY_CONF && -x $XRAY_BIN ]]; then
+  # 落地机也走这里。不要调用 need_node：落地机没有 Reality / Hysteria2，need_node 会直接拒绝。
+  if [[ -x $XRAY_BIN ]] && { [[ -f $XRAY_CONF ]] || (( LAND_MODE )); }; then
     write_xray_config || die "重写 Xray 出站策略失败。"
     restart_xray
     did=1
   fi
-  if (( ${HY2_ENABLED:-0} )) && [[ -f $HY_CONF && -x $HY_BIN ]]; then
-    write_hy2_config || die "重写 Hysteria2 出站策略失败。"
-    restart_hy2
-    did=1
-  fi
-  if sb_needed && [[ -f $SB_CONF && -x $SB_BIN ]]; then
-    write_singbox_config || die "重写 sing-box 出站策略失败。"
-    restart_singbox
-    did=1
+  if (( ! LAND_MODE )); then
+    if (( ${HY2_ENABLED:-0} )) && [[ -f $HY_CONF && -x $HY_BIN ]]; then
+      write_hy2_config || die "重写 Hysteria2 出站策略失败。"
+      restart_hy2
+      did=1
+    fi
+    if sb_needed && [[ -f $SB_CONF && -x $SB_BIN ]]; then
+      write_singbox_config || die "重写 sing-box 出站策略失败。"
+      restart_singbox
+      did=1
+    fi
   fi
   if (( ! did )); then
     info "已记住出站策略。当前没有可更新的节点配置，下次重写配置时生效。"
@@ -3241,7 +3244,8 @@ write_xray_config() {
   mkdir -p "$(dirname "$XRAY_CONF")"
   tmp=$(mktemp "$(dirname "$XRAY_CONF")/.config.XXXXXX"); mv -f "$tmp" "${tmp}.json"; tmp="${tmp}.json"
   if (( LAND_MODE )); then
-    land_xray_json >"$tmp"
+    ensure_outbound_ip
+    land_xray_json >"$tmp" || die "生成落地机 Xray 配置失败。"
   else
   jq -n \
     --argjson port "$XRAY_PORT" --argjson clients "$clients" --argjson cplain "$cplain" --argjson tclients "$tclients" \
@@ -3303,7 +3307,7 @@ write_xray_config() {
       return 2
     fi
   fi
-  ensure_outbound_ip
+  if (( ! LAND_MODE )); then ensure_outbound_ip; fi
   xray_apply_ip_strategy "$tmp" || die "写入 Xray 出站地址族失败。"
   if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2
@@ -8431,7 +8435,10 @@ land_allow_json() { # 白名单 + 本机回环（自检用）→ JSON 数组
 
 # ---------- 落地机 Xray 配置 ----------
 land_xray_json() {
+  local ds
+  ds=$(xray_domain_strategy)
   jq -n --argjson port "$XRAY_PORT" --arg method "$LAND_METHOD" --arg key "$LAND_KEY" \
+    --arg ds "$ds" \
     --argjson privnets "$PRIV_NETS_JSON" --argjson allow "$(land_allow_json)" --argjson wl "$([[ -n $LAND_ALLOW ]] && echo 1 || echo 0)" '
   {
     log: {loglevel: "warning", access: "none"},
@@ -8443,11 +8450,12 @@ land_xray_json() {
       sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
     }],
     outbounds: [
-      {tag: "direct", protocol: "freedom"},
+      ({tag: "direct", protocol: "freedom"}
+        + (if $ds != "" then {settings: {domainStrategy: $ds}} else {} end)),
       {tag: "block", protocol: "blackhole"}
     ],
     routing: {
-      domainStrategy: "AsIs",
+      domainStrategy: (if $ds != "" then $ds else "AsIs" end),
       rules: ([
         {type: "field", ip: $privnets, outboundTag: "block"},
         {type: "field", protocol: ["bittorrent"], outboundTag: "block"}
@@ -8617,11 +8625,17 @@ UNIT
 
 # ---------- 经 SS2022 服务器的真实请求测试（落地机自检 / 中转机添加落地前） ----------
 LAND_EXIT_IP=""
-ss_probe() { # $1 地址 $2 端口 $3 方法 $4 密钥；成功时 LAND_EXIT_IP=出口 IP
+ss_probe() { # $1 地址 $2 端口 $3 方法 $4 密钥 [$5=1 优先查 IPv6 出口]；成功时 LAND_EXIT_IP=出口 IP
   LAND_EXIT_IP=""
   [[ -x $XRAY_BIN ]] || { warn "未找到 xray，无法测试。"; return 1; }
   mktmp
   local dir port="" i pid url ip="" rc=1
+  local -a urls
+  if [[ ${5:-} == 1 ]]; then
+    urls=(https://api64.ipify.org https://ipv6.icanhazip.com https://api.ipify.org https://ifconfig.co/ip https://icanhazip.com)
+  else
+    urls=(https://api.ipify.org https://api64.ipify.org https://ifconfig.co/ip https://icanhazip.com)
+  fi
   dir=$(mktemp -d "${TMP_DIR}/ssprobe.XXXXXX") || return 1
   for i in 1 2 3 4 5 6 7 8 9 10; do
     port=$(( 20000 + RANDOM % 40000 ))
@@ -8640,7 +8654,7 @@ ss_probe() { # $1 地址 $2 端口 $3 方法 $4 密钥；成功时 LAND_EXIT_IP=
     port_in_use tcp "$port" && break
   done
   if kill -0 "$pid" 2>/dev/null; then
-    for url in "https://api.ipify.org" "https://api64.ipify.org" "https://ifconfig.co/ip" "https://icanhazip.com"; do
+    for url in "${urls[@]}"; do
       ip=$(curl -s --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null | tr -d '[:space:]') || ip=""
       if [[ $ip =~ ^[0-9A-Fa-f:.]{3,45}$ ]] && { is_ipv4 "$ip" || [[ $ip == *:* ]]; }; then rc=0; break; fi
     done
@@ -8659,9 +8673,12 @@ tcp_probe() { # $1 地址 $2 端口
 }
 
 land_selftest() {
+  local prefer6=0 fam="IPv4"
+  [[ ${OUTBOUND_EFFECTIVE:-} == 64 || ${OUTBOUND_EFFECTIVE:-} == 6 ]] && prefer6=1
   info "落地机自检：临时客户端 → 本机 127.0.0.1:${XRAY_PORT}（SS2022）→ 外网 ..."
-  if ss_probe 127.0.0.1 "$XRAY_PORT" "$LAND_METHOD" "$LAND_KEY"; then
-    ok "落地机自检通过：出口 IP ${LAND_EXIT_IP}"
+  if ss_probe 127.0.0.1 "$XRAY_PORT" "$LAND_METHOD" "$LAND_KEY" "$prefer6"; then
+    [[ $LAND_EXIT_IP == *:* ]] && fam="IPv6"
+    ok "落地机自检通过：出口 ${fam} ${LAND_EXIT_IP}（$(outbound_label "${OUTBOUND_EFFECTIVE:-}")）"
   else
     warn "落地机自检未通过（经本机 SS2022 访问外网失败）。可查看: proxy status"
   fi
@@ -8766,6 +8783,11 @@ do_install_land() {
   step "Shadowsocks 2022 设置"
   land_choose_method
   land_choose_allow
+
+  # 与节点安装相同：检测地址族（含 NAT66）、询问或采用 --outbound，并记住 OUTBOUND_IP。
+  step "出站地址"
+  OUTBOUND_IP_DONE=0
+  ensure_outbound_ip
 
   # 清理节点模式的组件（若之前装过）
   RELAY_ON=0
@@ -11975,9 +11997,10 @@ usage() {
 
 双栈（同时有 IPv4 和 IPv6）写入节点配置时询问出站策略：IPv4优先 / IPv6优先 / 仅IPv4 / 仅IPv6（记在 state.env，之后沿用；--auto 默认 IPv4优先；只有一种地址时不询问）。
 本机 IPv6 只有内网 ULA（fc00::/7，例如 fd42::）时，会用 curl -6 探测。若回显是公网 IPv6（NAT66），按双栈处理，可以选 IPv6优先。回显仍是 ULA 或探测失败，则当作没有 IPv6。
-  --outbound 46|64|4|6|auto    直接指定。auto 清掉已记住的选择，再按本次检测决定。
+落地机（--land）使用同一套出站策略，写进 Xray freedom 的 domainStrategy。
+  --outbound 46|64|4|6|auto    直接指定。auto 清掉已记住的选择，再按本次检测决定。可与 --land 一起用。
   proxy outbound                  查看检测结果
-  proxy outbound 64               设为 IPv6优先，已安装时重写配置并重启
+  proxy outbound 64               设为 IPv6优先；节点或落地机已安装时重写配置并重启
 
 NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙·fail2ban·Swap；调优可选）:
   --nat               启用 NAT 模式（Alpine 自动启用；LXC/OpenVZ 未指定时询问；之后 proxy 命令自动沿用）
@@ -12013,12 +12036,13 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
 
 落地机 / 落地转发（中转机 → 落地机，出口 IP 为落地机）:
   --land              安装为落地机：只运行 Xray Shadowsocks 2022（TCP+UDP），无 Reality/Hy2，内存占用最低
-                      可与 --nat（NAT 映射端口 / Alpine）、--port、--name、--auto 组合
+                      可与 --nat（NAT 映射端口 / Alpine）、--port、--name、--auto、--outbound 组合
   --land-method <m>   aes-128（默认 2022-blake3-aes-128-gcm）| aes-256 | chacha20
   --land-allow <列表> 来源 IP 白名单（只允许中转机；IPv4/IPv6/CIDR，逗号分隔；none = 不限制）
   --no-land           落地机改装回 Reality / Hysteria2 节点
   例: bash proxy.sh --land --auto --land-allow 203.0.113.10          # 落地机，只允许中转机 203.0.113.10
       bash proxy.sh --land --nat --auto --port 52430:8388            # NAT 落地机：公网 52430 → 内部 8388
+      bash proxy.sh --land --nat --outbound 64 --port 12446:80       # NAT 落地机，出站 IPv6优先
   proxy allow [--land-allow 列表]   （落地机）修改来源白名单
   proxy land-add 'ss://...'         （中转机）添加 / 替换落地：测试连通后设为默认出站（--force 测试失败也启用）
   proxy land-test | land-off | land-on | land-del   （中转机）测试 / 停用（恢复直连，保留链接）/ 重新启用 / 删除
