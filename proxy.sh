@@ -6318,9 +6318,9 @@ xray_supports_vlessenc() {
 vless_enc_parse() { # 标准输入为 xray vlessenc 的输出。只取 ML-KEM-768 那一组，打印「种子 客户端公钥」
   local out d e seed client
   out=$(cat)
-  d=$(awk '/^Authentication:/ {s = ($0 ~ /ML-KEM-768/)} s && /"decryption"/ {print; exit}' <<<"$out" |
+  d=$(awk '/^[[:space:]]*Authentication:/ {s = ($0 ~ /ML-KEM-768/)} s && /"decryption"/ {print; exit}' <<<"$out" |
       sed -E 's/.*"decryption"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
-  e=$(awk '/^Authentication:/ {s = ($0 ~ /ML-KEM-768/)} s && /"encryption"/ {print; exit}' <<<"$out" |
+  e=$(awk '/^[[:space:]]*Authentication:/ {s = ($0 ~ /ML-KEM-768/)} s && /"encryption"/ {print; exit}' <<<"$out" |
       sed -E 's/.*"encryption"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
   [[ $d == "${VLESS_ENC_HEAD}."* && $e == "${VLESS_ENC_HEAD}."* ]] || return 1
   # 中间的外观 / 票据 / padding 由本脚本统一写，这里只要最后一块钥匙
