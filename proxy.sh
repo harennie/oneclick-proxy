@@ -16,6 +16,7 @@
 #   bash proxy.sh --cert-kind cf-origin --cf-origin-key <钥匙> --cert-domain cdn.example.com
 #   bash proxy.sh --xhttp-tls --ws-tls --cert-domain example.com
 #                                 # 可选：CDN 上的 XHTTP+TLS / WebSocket+TLS（默认不装，不替换 REALITY）
+#                                 # 这两条默认带 VLESS Encryption；--no-vless-enc 不加，proxy vless-enc on|off|rotate
 #   bash proxy.sh route           # 线路检测：回程 / 国际线路 / 国际互联（不改配置）
 #   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
 #   bash proxy.sh --help          # 查看全部参数
@@ -119,6 +120,13 @@ readonly XRAY_CERT_DIR="/usr/local/etc/xray/certs"
 readonly XRAY_CERT_FULL="${XRAY_CERT_DIR}/fullchain.pem"
 readonly XRAY_CERT_KEY="${XRAY_CERT_DIR}/privkey.pem"
 readonly CDN_FLAG="${CERT_BASE}/cdn-xray"
+# VLESS Encryption：xray vlessenc 和现在的字符串格式从 Xray-core 25.9.5 开始。
+# native 外观 + 服务端票据 600s（300~600 秒随机）+ 客户端 0rtt，与 xray vlessenc 的默认输出一致。
+readonly VLESS_ENC_MIN_XRAY="25.9.5"
+readonly VLESS_ENC_HEAD="mlkem768x25519plus"
+readonly VLESS_ENC_MODE="native"
+readonly VLESS_ENC_TICKET="600s"
+readonly VLESS_ENC_RTT="0rtt"
 # 令牌和 EAB 只放在这些 600 文件里，不写入 state.env。
 readonly CERT_DNS_TOKEN="${CERT_BASE}/cf-dns.token"
 readonly CERT_ZEROSSL_EAB="${CERT_BASE}/zerossl.eab"
@@ -152,6 +160,8 @@ OPT_XHTTP_TLS=""    # 空=默认关。VLESS + XHTTP + TLS，给 CDN，不是 REA
 OPT_XHTTP_TLS_PORT=""
 OPT_WS=""           # 空=默认关。VLESS + WebSocket + TLS，给 CDN
 OPT_WS_PORT=""
+OPT_VLESS_ENC=""    # 空=沿用（新开 CDN 线路时默认开）; 1/0。只作用于两条 CDN 线路
+OPT_VENC_ACT=""     # proxy vless-enc 子命令: on | off | rotate；空=查看
 OPT_HOP=""          # "20000-50000" 或 "none"
 OPT_FIREWALL=1
 OPT_UPGRADE=""      # 空=默认（普通模式 1，NAT 模式 0）
@@ -520,6 +530,7 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             ANYTLS_ENABLED ANYTLS_PORT ANYTLS_PASS ANYTLS_EXT_PORT
             XHTTP_TLS_ENABLED XHTTP_TLS_PORT XHTTP_TLS_PATH
             WS_ENABLED WS_PORT WS_PATH
+            VLESS_ENC VLESS_ENC_SEED VLESS_ENC_CLIENT
             OUTBOUND_IP
             CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
             CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
@@ -535,6 +546,10 @@ ANYTLS_ENABLED=0 ANYTLS_PORT=8445 ANYTLS_PASS="" ANYTLS_EXT_PORT=""
 # CDN 线路默认关闭。2083 / 2087 是 Cloudflare 允许回源的 HTTPS 端口，避开 REALITY 的 443。
 XHTTP_TLS_ENABLED=0 XHTTP_TLS_PORT=2083 XHTTP_TLS_PATH=""
 WS_ENABLED=0 WS_PORT=2087 WS_PATH=""
+# 两条 CDN 线路的 VLESS Encryption（ML-KEM-768 + X25519）。空 = 旧状态文件里没有这一项：
+# 已经开着 CDN 的旧安装保持 none，免得旧客户端失效；新开 CDN 线路时默认开。
+# SEED 是服务端 ML-KEM-768 种子，CLIENT 是对应的客户端公钥，只在明确轮换时重新生成。
+VLESS_ENC="" VLESS_ENC_SEED="" VLESS_ENC_CLIENT=""
 STATE_HAS_XHTTP=0
 EXTRA_TCP="" EXTRA_UDP="" DISABLED_FW="" SWAP_CREATED=0 SERVER_ADDR=""
 NAT_MODE=0 NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE=""
@@ -6261,14 +6276,121 @@ cdn_sync_flag() {
     rm -f "$CDN_FLAG"
   fi
 }
+
+# ---------- VLESS Encryption：只用于两条 CDN 线路，REALITY / Hysteria2 等不变 ----------
+# Cloudflare 在边缘解开 TLS，不加这一层时它能看到明文 VLESS。外面已经有 TLS，
+# 所以外观选 native；xorpub / random 只在没有外层 TLS 时才有意义。不加 flow：
+# CDN 中间断开了 TLS，Vision 不能 Splice，客户端兼容面也更窄。
+vless_enc_default() { # $1=1 表示旧安装里已有 CDN 线路在用 none
+  [[ -z ${VLESS_ENC:-} ]] || return 0
+  if [[ ${1:-0} == 1 ]]; then
+    VLESS_ENC=0
+    info "已有的 CDN 线路保持 encryption=none，旧客户端不受影响。要打开 VLESS Encryption：proxy vless-enc on"
+  else
+    VLESS_ENC=1
+  fi
+}
+vless_enc_keys_ok() {
+  [[ ${VLESS_ENC_SEED:-} =~ ^[A-Za-z0-9_-]{86}$ && ${VLESS_ENC_CLIENT:-} =~ ^[A-Za-z0-9_-]{1579}$ ]]
+}
+vless_enc_active() { [[ ${VLESS_ENC:-} == 1 ]] && vless_enc_keys_ok; }
+vless_enc_decryption() {
+  if vless_enc_active; then printf '%s.%s.%s.%s' "$VLESS_ENC_HEAD" "$VLESS_ENC_MODE" "$VLESS_ENC_TICKET" "$VLESS_ENC_SEED"
+  else printf 'none'; fi
+}
+vless_enc_encryption() {
+  if vless_enc_active; then printf '%s.%s.%s.%s' "$VLESS_ENC_HEAD" "$VLESS_ENC_MODE" "$VLESS_ENC_RTT" "$VLESS_ENC_CLIENT"
+  else printf 'none'; fi
+}
+xray_version_num() { # $1 xray 路径，默认 XRAY_BIN。输出 26.3.27 这样的版本号
+  local b=${1:-$XRAY_BIN} v
+  [[ -x $b ]] || return 1
+  v=$("$b" version 2>/dev/null | awk 'NR==1{print $2; exit}') || return 1
+  v=${v#v}
+  [[ $v =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
+  printf '%s' "$v"
+}
+xray_supports_vlessenc() {
+  local v
+  v=$(xray_version_num "${1:-$XRAY_BIN}") || return 1
+  ver_ge "$v" "$VLESS_ENC_MIN_XRAY"
+}
+vless_enc_parse() { # 标准输入为 xray vlessenc 的输出。只取 ML-KEM-768 那一组，打印「种子 客户端公钥」
+  local out d e seed client
+  out=$(cat)
+  d=$(awk '/^Authentication:/ {s = ($0 ~ /ML-KEM-768/)} s && /"decryption"/ {print; exit}' <<<"$out" |
+      sed -E 's/.*"decryption"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
+  e=$(awk '/^Authentication:/ {s = ($0 ~ /ML-KEM-768/)} s && /"encryption"/ {print; exit}' <<<"$out" |
+      sed -E 's/.*"encryption"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
+  [[ $d == "${VLESS_ENC_HEAD}."* && $e == "${VLESS_ENC_HEAD}."* ]] || return 1
+  # 中间的外观 / 票据 / padding 由本脚本统一写，这里只要最后一块钥匙
+  seed=${d##*.} client=${e##*.}
+  [[ $seed =~ ^[A-Za-z0-9_-]{86}$ && $client =~ ^[A-Za-z0-9_-]{1579}$ ]] || return 1
+  printf '%s %s\n' "$seed" "$client"
+}
+vless_enc_gen() { # 成功时写入 VLESS_ENC_SEED / VLESS_ENC_CLIENT
+  local b=$XRAY_BIN out pair="" seed="" client="" check
+  xray_supports_vlessenc "$b" || return 1
+  if out=$("$b" vlessenc 2>/dev/null); then pair=$(vless_enc_parse <<<"$out") || pair=""; fi
+  if [[ -z $pair ]] && out=$("$b" mlkem768 2>/dev/null); then
+    seed=$(awk -F': *' '$1=="Seed"{print $NF; exit}' <<<"$out")
+    client=$(awk -F': *' '$1=="Client"{print $NF; exit}' <<<"$out")
+    pair="$seed $client"
+  fi
+  read -r seed client <<<"$pair"
+  [[ $seed =~ ^[A-Za-z0-9_-]{86}$ && $client =~ ^[A-Za-z0-9_-]{1579}$ ]] || return 1
+  # 用种子再推一次客户端公钥，对不上就不用这对钥匙
+  if check=$("$b" mlkem768 -i "$seed" 2>/dev/null); then
+    check=$(awk -F': *' '$1=="Client"{print $NF; exit}' <<<"$check")
+    [[ $check == "$client" ]] || return 1
+  fi
+  VLESS_ENC_SEED=$seed VLESS_ENC_CLIENT=$client
+}
+vless_enc_persist() { if [[ -f $STATE_FILE ]]; then save_state; fi; return 0; }
+vless_enc_ensure() { # 写 Xray 配置前调用。开着却用不了时退回 none 并说明原因
+  [[ ${VLESS_ENC:-} == 1 ]] || return 0
+  (( ${LAND_MODE:-0} )) && return 0
+  cdn_wanted || return 0
+  if ! xray_supports_vlessenc; then
+    VLESS_ENC=0
+    warn "当前 Xray $(xray_version_num || echo 版本未知) 不支持 VLESS Encryption（需要 ${VLESS_ENC_MIN_XRAY} 或更新）。CDN 线路先用 encryption=none。升级 Xray（proxy update）后执行 proxy vless-enc on。"
+    vless_enc_persist
+    return 0
+  fi
+  vless_enc_keys_ok && return 0
+  if vless_enc_gen; then
+    info "已用 xray vlessenc 生成 VLESS Encryption 密钥（ML-KEM-768）。"
+  else
+    VLESS_ENC=0
+    warn "没能用 xray vlessenc 生成 VLESS Encryption 密钥，CDN 线路先用 encryption=none。"
+  fi
+  vless_enc_persist
+}
+vless_enc_need_xray() { # Xray 太旧时先升级一次。返回 0 表示可以用
+  xray_supports_vlessenc && return 0
+  warn "当前 Xray $(xray_version_num || echo 版本未知) 不支持 VLESS Encryption（需要 ${VLESS_ENC_MIN_XRAY} 或更新），先升级 Xray ..."
+  ( install_xray ) || true
+  xray_supports_vlessenc
+}
+vless_enc_label() {
+  if vless_enc_active; then printf '开'
+  elif [[ ${VLESS_ENC:-} == 1 ]]; then printf '开（密钥待生成）'
+  else printf '关'; fi
+}
+vless_enc_client_note() { # $1=1 着色
+  node_link_note "$1" "VLESS Encryption 已开启（ML-KEM-768 + X25519，native，0-RTT）。Cloudflare 只看到密文。"
+  node_link_note "$1" "需要 Xray-core ${VLESS_ENC_MIN_XRAY}+ 内核的客户端（v2rayN、v2rayNG 新版），或 mihomo v1.19.14+（Clash Verge Rev、FlClash、Mihomo Party）。"
+  node_link_note "$1" "sing-box 内核的客户端（NekoBox、Hiddify、Karing、sing-box 官方）可能不支持，连不上时执行 proxy vless-enc off。"
+}
+
 cdn_xhttp_inbound_json() {
   jq -n --argjson clients "$1" --argjson port "$XHTTP_TLS_PORT" \
-    --arg path "$XHTTP_TLS_PATH" --arg host "$CERT_DOMAIN" \
+    --arg path "$XHTTP_TLS_PATH" --arg host "$CERT_DOMAIN" --arg dec "$(vless_enc_decryption)" \
     --arg crt "$XRAY_CERT_FULL" --arg key "$XRAY_CERT_KEY" '{
       tag: "vless-xhttp-tls",
       port: $port,
       protocol: "vless",
-      settings: {clients: $clients, decryption: "none"},
+      settings: {clients: $clients, decryption: $dec},
       streamSettings: {
         network: "xhttp",
         security: "tls",
@@ -6280,12 +6402,12 @@ cdn_xhttp_inbound_json() {
 }
 cdn_ws_inbound_json() {
   jq -n --argjson clients "$1" --argjson port "$WS_PORT" \
-    --arg path "$WS_PATH" --arg host "$CERT_DOMAIN" \
+    --arg path "$WS_PATH" --arg host "$CERT_DOMAIN" --arg dec "$(vless_enc_decryption)" \
     --arg crt "$XRAY_CERT_FULL" --arg key "$XRAY_CERT_KEY" '{
       tag: "vless-ws-tls",
       port: $port,
       protocol: "vless",
-      settings: {clients: $clients, decryption: "none"},
+      settings: {clients: $clients, decryption: $dec},
       streamSettings: {
         network: "ws",
         security: "tls",
@@ -6302,6 +6424,7 @@ cdn_attach_inbounds() { # $1 配置文件 $2 无 flow 的客户端 JSON
     info "CDN 线路要等证书就绪后再写入。这一步先保持 REALITY 原样，不会把证书写进 REALITY。"
     return 0
   fi
+  vless_enc_ensure
   if (( ${XHTTP_TLS_ENABLED:-0} == 1 )); then
     cdn_install_xray_certs || return 1
     ib=$(cdn_xhttp_inbound_json "$clients") || return 1
@@ -6317,13 +6440,13 @@ cdn_attach_inbounds() { # $1 配置文件 $2 无 flow 的客户端 JSON
 cdn_xhttp_link() { # $1 uuid $2 名称
   local addr q
   addr=$(host_fmt "$CERT_DOMAIN")
-  q="encryption=none&security=tls&sni=${CERT_DOMAIN}&fp=chrome&type=xhttp&path=$(urlencode "$XHTTP_TLS_PATH")&host=${CERT_DOMAIN}&mode=packet-up"
+  q="encryption=$(urlencode "$(vless_enc_encryption)")&security=tls&sni=${CERT_DOMAIN}&fp=chrome&type=xhttp&path=$(urlencode "$XHTTP_TLS_PATH")&host=${CERT_DOMAIN}&mode=packet-up"
   printf 'vless://%s@%s:%s?%s#%s' "$1" "$addr" "$XHTTP_TLS_PORT" "$q" "$(urlencode "$2")"
 }
 cdn_ws_link() { # $1 uuid $2 名称
   local addr q
   addr=$(host_fmt "$CERT_DOMAIN")
-  q="encryption=none&security=tls&sni=${CERT_DOMAIN}&fp=chrome&type=ws&path=$(urlencode "$WS_PATH")&host=${CERT_DOMAIN}"
+  q="encryption=$(urlencode "$(vless_enc_encryption)")&security=tls&sni=${CERT_DOMAIN}&fp=chrome&type=ws&path=$(urlencode "$WS_PATH")&host=${CERT_DOMAIN}"
   printf 'vless://%s@%s:%s?%s#%s' "$1" "$addr" "$WS_PORT" "$q" "$(urlencode "$2")"
 }
 cdn_render_links() {
@@ -6347,6 +6470,11 @@ cdn_render_links() {
     fi
   fi
 }
+cdn_mihomo_enc() { # VLESS Encryption 开着时写进 mihomo 节点；旧版 mihomo 不认这一项，会连不上
+  vless_enc_active || return 0
+  printf '    # VLESS Encryption：需要 mihomo v1.19.14+；sing-box 内核不支持，关掉用 proxy vless-enc off\n'
+  printf '    encryption: "%s"\n' "$(vless_enc_encryption)"
+}
 cdn_mihomo() {
   tls_for_cdn || return 0
   if (( XHTTP_TLS_ENABLED )); then
@@ -6366,6 +6494,7 @@ cdn_mihomo() {
       mode: packet-up
       host: ${CERT_DOMAIN}
 Y
+    cdn_mihomo_enc
   fi
   if (( WS_ENABLED )); then
     cat <<Y
@@ -6384,6 +6513,15 @@ Y
       headers:
         Host: ${CERT_DOMAIN}
 Y
+    cdn_mihomo_enc
+  fi
+}
+cdn_print_qr() { # 带 VLESS Encryption 的链接约 1.8 KB，终端二维码会比一屏还宽
+  echo
+  if vless_enc_active; then
+    printf '%s链接里带 VLESS Encryption 公钥，二维码太大，没有显示。请复制上面的链接，或用订阅导入。%s\n' "$C_DIM" "$C_NONE"
+  else
+    print_qr "$1"
   fi
 }
 cdn_print_links() { # $1=1 着色
@@ -6391,9 +6529,10 @@ cdn_print_links() { # $1=1 着色
   if (( XHTTP_TLS_ENABLED )) && tls_for_cdn; then
     node_link_head "$paint" "VLESS + XHTTP + TLS（CDN）" "${NODE_NAME}-XHTTP-TLS" "$CERT_DOMAIN" "${XHTTP_TLS_PORT}  TCP"
     node_link_note "$paint" "不是 REALITY。path ${XHTTP_TLS_PATH}，mode=packet-up。不要套到 REALITY 上。"
+    vless_enc_active && vless_enc_client_note "$paint"
     qr=$(cdn_xhttp_link "$UUID" "${NODE_NAME}-XHTTP-TLS")
     node_link_uri "$qr"
-    (( paint )) && { echo; print_qr "$qr"; }
+    (( paint )) && cdn_print_qr "$qr"
     node_link_end "$paint"
     if [[ -s $USERS_FILE ]]; then
       while IFS=$'\t' read -r u r; do
@@ -6401,7 +6540,7 @@ cdn_print_links() { # $1=1 着色
         node_link_head "$paint" "额外用户 ${r} · XHTTP+TLS" "${NODE_NAME}-XHTTP-TLS-${r}" "$CERT_DOMAIN" "${XHTTP_TLS_PORT}  TCP"
         qr=$(cdn_xhttp_link "$u" "${NODE_NAME}-XHTTP-TLS-${r}")
         node_link_uri "$qr"
-        (( paint )) && { echo; print_qr "$qr"; }
+        (( paint )) && cdn_print_qr "$qr"
         node_link_end "$paint"
       done <"$USERS_FILE"
     fi
@@ -6409,9 +6548,10 @@ cdn_print_links() { # $1=1 着色
   if (( WS_ENABLED )) && tls_for_cdn; then
     node_link_head "$paint" "VLESS + WebSocket + TLS（CDN）" "${NODE_NAME}-WS-TLS" "$CERT_DOMAIN" "${WS_PORT}  TCP"
     node_link_note "$paint" "不是 REALITY。path ${WS_PATH}。Cloudflare 要打开 WebSockets。"
+    vless_enc_active && vless_enc_client_note "$paint"
     qr=$(cdn_ws_link "$UUID" "${NODE_NAME}-WS-TLS")
     node_link_uri "$qr"
-    (( paint )) && { echo; print_qr "$qr"; }
+    (( paint )) && cdn_print_qr "$qr"
     node_link_end "$paint"
     if [[ -s $USERS_FILE ]]; then
       while IFS=$'\t' read -r u r; do
@@ -6419,13 +6559,17 @@ cdn_print_links() { # $1=1 着色
         node_link_head "$paint" "额外用户 ${r} · WebSocket+TLS" "${NODE_NAME}-WS-TLS-${r}" "$CERT_DOMAIN" "${WS_PORT}  TCP"
         qr=$(cdn_ws_link "$u" "${NODE_NAME}-WS-TLS-${r}")
         node_link_uri "$qr"
-        (( paint )) && { echo; print_qr "$qr"; }
+        (( paint )) && cdn_print_qr "$qr"
         node_link_end "$paint"
       done <"$USERS_FILE"
     fi
   fi
 }
 
+cdn_tutorial_enc() {
+  if vless_enc_active; then printf 'encryption=%s.%s.%s.…（整串，见下面的链接）' "$VLESS_ENC_HEAD" "$VLESS_ENC_MODE" "$VLESS_ENC_RTT"
+  else printf 'encryption=none'; fi
+}
 cdn_print_tutorial() { # 可选 $1 = xhttp|ws，空则打印已开启的
   local which=${1:-} show_x=0 show_w=0
   case $which in
@@ -6463,6 +6607,16 @@ DNS（Cloudflare 或同类的 HTTPS 反向代理）：
 5. 源站端口填下面写的 TCP 端口。Cloudflare 连本机的同一个端口，云安全组要放行。不要把源站改成 443 来占用 REALITY。
 6. 缓存：给下面的路径加一条绕过缓存。不要用规则改写路径。
 EOF
+  if vless_enc_active; then
+    cat <<EOF
+7. VLESS Encryption 已开启：链接里的 encryption= 是一长串 ${VLESS_ENC_HEAD}.${VLESS_ENC_MODE}.${VLESS_ENC_RTT}.…，要整串原样导入，不能改成 none。
+   Cloudflare 解开 TLS 后只能看到这层密文。sing-box 内核的客户端可能不支持，需要时执行 proxy vless-enc off。
+EOF
+  else
+    cat <<'EOF'
+7. VLESS Encryption 没有开：Cloudflare 解开 TLS 后能看到明文 VLESS。要打开：proxy vless-enc on
+EOF
+  fi
   if (( show_x )); then
     cat <<EOF
 
@@ -6470,7 +6624,7 @@ EOF
 源站端口：TCP ${XHTTP_TLS_PORT}（Cloudflare 会连这个端口，请在云安全组放行）
 路径：${XHTTP_TLS_PATH}
 不需要打开 gRPC。mode 用 packet-up，不要用 stream-one（那是直连 REALITY 的 XHTTP）。
-客户端链接里要有：地址 ${CERT_DOMAIN}，端口 ${XHTTP_TLS_PORT}，security=tls，sni=${CERT_DOMAIN}，type=xhttp，path=${XHTTP_TLS_PATH}，host=${CERT_DOMAIN}，mode=packet-up。
+客户端链接里要有：地址 ${CERT_DOMAIN}，端口 ${XHTTP_TLS_PORT}，security=tls，sni=${CERT_DOMAIN}，type=xhttp，path=${XHTTP_TLS_PATH}，host=${CERT_DOMAIN}，mode=packet-up，$(cdn_tutorial_enc)。
 链接里不要有：flow、security=reality、pbk、sid、pqv、insecure。不要把地址改成 IP。
 $(cdn_xhttp_link "$UUID" "${NODE_NAME}-XHTTP-TLS")
 EOF
@@ -6482,7 +6636,7 @@ EOF
 源站端口：TCP ${WS_PORT}（云安全组放行这个 TCP）
 路径：${WS_PATH}
 Cloudflare「网络」里打开 WebSockets。
-客户端链接里要有：地址 ${CERT_DOMAIN}，端口 ${WS_PORT}，security=tls，sni=${CERT_DOMAIN}，type=ws，path=${WS_PATH}，host=${CERT_DOMAIN}。
+客户端链接里要有：地址 ${CERT_DOMAIN}，端口 ${WS_PORT}，security=tls，sni=${CERT_DOMAIN}，type=ws，path=${WS_PATH}，host=${CERT_DOMAIN}，$(cdn_tutorial_enc)。
 链接里不要有：flow、security=reality、pbk、sid、pqv、insecure。不要把地址改成 IP。
 $(cdn_ws_link "$UUID" "${NODE_NAME}-WS-TLS")
 EOF
@@ -6667,9 +6821,12 @@ cdn_prepare_enable() { # $1 xhttp|ws。失败返回 1，调用方保持关闭
   local_seed_used
   if [[ $kind == xhttp ]]; then
     cdn_choose_port XHTTP_TLS_PORT "$OPT_XHTTP_TLS_PORT" "VLESS + XHTTP + TLS（CDN）" "${XHTTP_TLS_PORT:-2083}" || return 1
+    vless_enc_default "$(( ${WS_ENABLED:-0} == 1 ))"
   else
     cdn_choose_port WS_PORT "$OPT_WS_PORT" "VLESS + WebSocket + TLS（CDN）" "${WS_PORT:-2087}" || return 1
+    vless_enc_default "$(( ${XHTTP_TLS_ENABLED:-0} == 1 ))"
   fi
+  if [[ $VLESS_ENC == 1 ]] && ! vless_enc_keys_ok; then vless_enc_need_xray || true; fi
   cdn_install_xray_certs || return 1
   cdn_sync_flag
   if [[ -f $CERT_HOOK || -d $CERT_LIB ]]; then write_cert_hook; fi
@@ -6704,6 +6861,104 @@ do_cdn() {
   fi
   cdn_print_tutorial
   cdn_run_checks || true
+}
+
+vless_enc_scope() {
+  local s=""
+  (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && s+="VLESS + XHTTP + TLS（TCP ${XHTTP_TLS_PORT}）"
+  (( ${WS_ENABLED:-0} == 1 )) && s+="${s:+、}VLESS + WebSocket + TLS（TCP ${WS_PORT}）"
+  [[ -n $s ]] || s="还没打开 CDN 线路（打开时按这里的开关生效）"
+  printf '%s' "$s"
+}
+vless_enc_print_status() {
+  local v
+  v=$(xray_version_num || echo 未安装)
+  step "VLESS Encryption（只用于 CDN 线路）"
+  printf '状态      %s\n' "$(vless_enc_label)"
+  printf '作用于    %s\n' "$(vless_enc_scope)"
+  if vless_enc_active; then
+    printf '参数      %s.%s，服务端票据 %s，客户端 %s，认证 ML-KEM-768\n' "$VLESS_ENC_HEAD" "$VLESS_ENC_MODE" "$VLESS_ENC_TICKET" "$VLESS_ENC_RTT"
+  fi
+  if xray_supports_vlessenc; then printf 'Xray      %s（支持，需要 %s+）\n' "$v" "$VLESS_ENC_MIN_XRAY"
+  else printf 'Xray      %s（不支持，需要 %s+）\n' "$v" "$VLESS_ENC_MIN_XRAY"; fi
+  cat <<EOF
+REALITY、XHTTP + REALITY、Hysteria2、Trojan、TUIC、AnyTLS 不受这个开关影响。
+开着时 Cloudflare 解开 TLS 后只能看到密文；关掉时链接里是 encryption=none。
+客户端：Xray-core ${VLESS_ENC_MIN_XRAY}+ 内核（v2rayN、v2rayNG 新版）和 mihomo v1.19.14+（Clash Verge Rev、FlClash、Mihomo Party）支持。
+sing-box 内核（NekoBox、Hiddify、Karing、sing-box 官方）可能不支持，这类客户端请关掉。
+用法：proxy vless-enc on | off | rotate（rotate 换新钥匙，旧的 CDN 链接失效）
+EOF
+}
+vless_enc_apply() { # 只重写 Xray，刷新链接、信息文件和订阅
+  local rc=0
+  save_state
+  if cdn_wanted && tls_for_cdn && xray_inbound_needed; then
+    write_xray_config || rc=$?
+    if (( rc == 0 )); then restart_xray
+    elif (( rc != 2 )); then return "$rc"; fi
+  fi
+  save_state
+  save_info
+}
+do_vless_enc() {
+  need_node
+  local act=${OPT_VENC_ACT:-}
+  case $act in
+    "") vless_enc_print_status; return 0 ;;
+    on)
+      if vless_enc_active; then
+        ok "VLESS Encryption 已经开着。"
+        vless_enc_print_status
+        return 0
+      fi
+      if ! cdn_wanted; then
+        VLESS_ENC=1
+        if ! vless_enc_keys_ok && xray_supports_vlessenc; then vless_enc_gen || true; fi
+        save_state
+        ok "VLESS Encryption 已设为开启。还没打开 CDN 线路，打开 XHTTP+TLS 或 WebSocket+TLS 时生效。"
+        return 0
+      fi
+      if ! vless_enc_need_xray; then
+        VLESS_ENC=0; save_state
+        die "Xray 仍不支持 VLESS Encryption（需要 ${VLESS_ENC_MIN_XRAY}+），CDN 线路保持 encryption=none。"
+      fi
+      VLESS_ENC=1
+      if ! vless_enc_keys_ok && ! vless_enc_gen; then
+        VLESS_ENC=0; save_state
+        die "没能用 xray vlessenc 生成密钥，CDN 线路保持 encryption=none。"
+      fi
+      ;;
+    off)
+      if [[ ${VLESS_ENC:-} != 1 ]]; then
+        VLESS_ENC=0; save_state
+        ok "VLESS Encryption 已经关着。"
+        vless_enc_print_status
+        return 0
+      fi
+      # 钥匙留着，再打开时链接和原来一样
+      VLESS_ENC=0
+      ;;
+    rotate)
+      [[ ${VLESS_ENC:-} == 1 ]] || die "VLESS Encryption 没有开。先执行 proxy vless-enc on。"
+      warn "换新钥匙后，两条 CDN 线路的旧链接全部失效，需要重新导入或更新订阅。REALITY 等其它协议不变。"
+      (( OPT_AUTO )) || confirm "确认更换 VLESS Encryption 密钥？" n || return 0
+      vless_enc_need_xray || die "Xray 不支持 VLESS Encryption（需要 ${VLESS_ENC_MIN_XRAY}+），没有更换。"
+      vless_enc_gen || die "没能用 xray vlessenc 生成新钥匙，原来的钥匙没有改动。"
+      ;;
+    *) die "proxy vless-enc 的参数只能是 on、off 或 rotate。" ;;
+  esac
+  vless_enc_apply
+  case $act in
+    on) ok "VLESS Encryption 已开启。CDN 线路的链接已经更新，客户端需要重新导入或更新订阅。" ;;
+    off) ok "VLESS Encryption 已关闭，CDN 线路改回 encryption=none。钥匙保留，再打开时链接不变。" ;;
+    rotate) ok "已换新钥匙。CDN 线路的链接已经更新。" ;;
+  esac
+  cdn_wanted || info "还没打开 CDN 线路。这个设置会在打开 XHTTP+TLS 或 WebSocket+TLS 时生效。"
+  if cdn_wanted && ! tls_for_cdn; then info "证书还没就绪，CDN 线路暂时没有写入 Xray。证书就绪后按这里的设置生效。"; fi
+  if cdn_wanted && tls_for_cdn; then
+    cdn_print_links 1
+    print_sub_block 1
+  fi
 }
 
 
@@ -7157,8 +7412,12 @@ resolve_install_protos() {
   if [[ -n $OPT_TROJAN ]]; then TROJAN_ENABLED=$OPT_TROJAN; fi
   if [[ -n $OPT_TUIC ]]; then TUIC_ENABLED=$OPT_TUIC; fi
   if [[ -n $OPT_ANYTLS ]]; then ANYTLS_ENABLED=$OPT_ANYTLS; fi
+  local had_cdn=0
+  cdn_wanted && had_cdn=1
   if [[ -n $OPT_XHTTP_TLS ]]; then XHTTP_TLS_ENABLED=$OPT_XHTTP_TLS; fi
   if [[ -n $OPT_WS ]]; then WS_ENABLED=$OPT_WS; fi
+  if [[ -n $OPT_VLESS_ENC ]]; then VLESS_ENC=$OPT_VLESS_ENC
+  else vless_enc_default "$(( INSTALLED && had_cdn ))"; fi
   return 0
 }
 confirm_xhttp() {
@@ -9074,13 +9333,14 @@ menu_change_sni() {
 menu_regen_keys() {
   need_installed
   if (( LAND_MODE )); then land_menu_key; return; fi
-  warn "将重新生成 UUID、x25519 密钥、ShortId、ML-DSA-65 密钥、XHTTP 路径、CDN 路径，以及 Hysteria2 / Trojan / TUIC / AnyTLS 密码。所有旧客户端将失效。已关闭的协议也会换新密钥，但不会被重新打开。"
+  warn "将重新生成 UUID、x25519 密钥、ShortId、ML-DSA-65 密钥、XHTTP 路径、CDN 路径、CDN 的 VLESS Encryption 密钥，以及 Hysteria2 / Trojan / TUIC / AnyTLS 密码。所有旧客户端将失效。已关闭的协议也会换新密钥，但不会被重新打开。"
   (( OPT_AUTO )) || confirm "确认重新生成？" n || return 0
   gen_xray_keys
   HY2_PASS=$(rand_pass)
   XHTTP_PATH="/$(rand_hex 8)"
   XHTTP_TLS_PATH="/xhttp-$(rand_hex 8)"
   WS_PATH="/ws-$(rand_hex 8)"
+  VLESS_ENC_SEED="" VLESS_ENC_CLIENT=""
   TROJAN_PASS=$(rand_pass)
   TUIC_PASS=$(rand_pass)
   ANYTLS_PASS=$(rand_pass)
@@ -9280,6 +9540,7 @@ menu_status() {
     ui_proto_line "$ANYTLS_ENABLED" "AnyTLS" "TCP $(pub_anytls_port)"
     ui_proto_line "$XHTTP_TLS_ENABLED" "VLESS + XHTTP + TLS（CDN）" "TCP ${XHTTP_TLS_PORT}"
     ui_proto_line "$WS_ENABLED" "VLESS + WebSocket + TLS（CDN）" "TCP ${WS_PORT}"
+    if cdn_wanted; then printf '  %s\n' "$(ui_pad "CDN 的 VLESS Encryption" 28)$(vless_enc_label)"; fi
   fi
   if (( LAND_MODE )); then
     printf '  落地机:         Shadowsocks 2022 %s，端口 %s (TCP+UDP)%s\n' "$LAND_METHOD" "$(pub_xray_port)" "$( ((NAT_MODE)) && echo " → 本机 ${XRAY_PORT}")"
@@ -11756,9 +12017,15 @@ menu_proto() {
       "TUIC v5  $([[ $TUIC_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
       "AnyTLS  $([[ $ANYTLS_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
       "VLESS + XHTTP + TLS（CDN）  $([[ $XHTTP_TLS_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
-      "VLESS + WebSocket + TLS（CDN）  $([[ $WS_ENABLED == 1 ]] && echo "$on" || echo "$off")"
+      "VLESS + WebSocket + TLS（CDN）  $([[ $WS_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
+      "CDN 的 VLESS Encryption  $(vless_enc_label)"
+    printf '%s第 9 项只给第 7、8 项加密，不影响 REALITY 和 Hysteria2。sing-box 内核的客户端可能不支持。%s\n' "$C_DIM" "$C_NONE"
     local c kind var
     ask c "请选择" "0"
+    if [[ $c == 9 ]]; then
+      menu_vless_enc
+      continue
+    fi
     case $c in
       1) kind=reality; var=REALITY_ENABLED ;;
       2) kind=xhttp; var=XHTTP_ENABLED ;;
@@ -11805,6 +12072,22 @@ menu_proto() {
     fi
     show_info
   done
+}
+menu_vless_enc() { # 协议开关第 9 项：开 / 关 CDN 线路的 VLESS Encryption
+  local act=on rc=0
+  [[ ${VLESS_ENC:-} == 1 ]] && act=off
+  vless_enc_print_status
+  if [[ $act == off ]]; then
+    confirm "关闭 CDN 线路的 VLESS Encryption？链接改回 encryption=none，Cloudflare 能看到明文 VLESS。" n || return 0
+  else
+    confirm "开启 CDN 线路的 VLESS Encryption？CDN 链接会变，要重新导入；sing-box 内核的客户端可能连不上。" y || return 0
+  fi
+  set +e
+  ( set -e; OPT_VENC_ACT=$act; do_vless_enc )
+  rc=$?
+  set -e
+  (( rc == 0 )) || warn "VLESS Encryption 没有改动（退出码 ${rc}）。"
+  load_state
 }
 
 show_menu() {
@@ -11967,6 +12250,8 @@ usage() {
   --ws-tls            额外启用 VLESS + WebSocket + TLS（放在 CDN 后面，默认不装）
   --no-ws-tls         关闭这条 CDN 线路
   --ws-port <端口>    回源端口（默认 2087）
+  --no-vless-enc      两条 CDN 线路不加 VLESS Encryption（默认加，ML-KEM-768 + X25519，
+                      Cloudflare 只看到密文）。sing-box 内核的客户端可能不支持时用它
   --hop <a-b|none>    Hysteria2 端口跳跃范围（默认 20000-50000，none 关闭）
   --name <名称>       节点名称（默认 国家-城市）
   --cert-domain <域名>  可选：为自有域名申请证书。不写 --cert-kind 时是
@@ -12053,6 +12338,8 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy info          查看链接 / 二维码 / mihomo 配置
   proxy cert          选择证书种类 / 续期 / 关闭（默认 Let's Encrypt 单域名）
   proxy cdn           查看 CDN 线路教程并复查（XHTTP+TLS / WebSocket+TLS）
+  proxy vless-enc     查看 CDN 线路的 VLESS Encryption。on / off 开关，rotate 换新钥匙
+                      只重写 Xray 并刷新链接和订阅，不重装；REALITY 等不变
   proxy proto         单独打开或关闭协议（不删除已有密钥）
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
@@ -12135,6 +12422,18 @@ parse_args() {
       --ws-port)
         is_port_opt "${2-}" || die "--ws-port 参数无效"; OPT_WS_PORT=$2; shift ;;
       --ws-port=*) OPT_WS_PORT=${1#*=}; is_port_opt "$OPT_WS_PORT" || die "--ws-port 参数无效" ;;
+      --vless-enc) OPT_VLESS_ENC=1 ;;
+      --no-vless-enc) OPT_VLESS_ENC=0 ;;
+      vless-enc|vlessenc)
+        OPT_ACTION=vless-enc
+        case ${2-} in
+          on|enable) OPT_VENC_ACT=on; shift ;;
+          off|disable) OPT_VENC_ACT=off; shift ;;
+          rotate|regen|rekey) OPT_VENC_ACT=rotate; shift ;;
+          status|show) shift ;;
+          ""|-*) ;;
+          *) die "proxy vless-enc 的参数只能是 on、off 或 rotate（不带参数为查看）: $2" ;;
+        esac ;;
       --hop) [[ ${2-} == none ]] || is_range "${2-}" || valid_segs "${2-}" || die "--hop 参数无效（例如 20000-50000 或 none）"; OPT_HOP=$2; shift ;;
       --no-hop) OPT_HOP=none ;;
       --name) [[ -n ${2-} ]] || die "--name 需要参数"; OPT_NAME=$(tr -cd 'A-Za-z0-9_.-' <<<"$2"); shift ;;
@@ -12294,7 +12593,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert
@@ -12356,6 +12655,7 @@ main() {
     nat) menu_nat ;;
     cert) do_cert ;;
     cdn) do_cdn ;;
+    vless-enc) do_vless_enc ;;
     tune) do_tune ;;
     route) do_route ;;
     outbound) do_outbound ;;

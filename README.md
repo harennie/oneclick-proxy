@@ -59,6 +59,7 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--xhttp-tls-port <N>` | 这条线路的回源 TCP 端口，默认 2083。须是 Cloudflare 允许代理的 HTTPS 端口：443、2053、2083、2087、2096、8443。不要占用 REALITY |
 | `--ws-tls` / `--no-ws-tls` | 额外启用 / 关闭 VLESS + WebSocket + TLS（放在 CDN 后面，默认不装）。需要 `--cert-domain` |
 | `--ws-port <N>` | 这条线路的回源 TCP 端口，默认 2087。端口范围同上 |
+| `--no-vless-enc` | 两条 CDN 线路不加 VLESS Encryption（默认加）。只影响 XHTTP+TLS 和 WebSocket+TLS |
 | `--hop <a-b\|none>` | Hysteria2 端口跳跃范围，默认 `20000-50000`，`none` 关闭（NAT 模式默认关闭，可写多段 `a-b,c-d`） |
 | `--name <名称>` | 节点名称（默认「国家-城市」） |
 | `--cert-domain <域名>` | 可选：申请证书。不写 `--cert-kind` 时是 Let's Encrypt 单域名 HTTP-01。订阅只走 HTTPS；Hysteria2 / TUIC / AnyTLS 改用该证书和域名。REALITY 仍借用伪装站点。NAT 模式不可用 |
@@ -101,7 +102,7 @@ NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239
 
 CDN 线路示例：`bash proxy.sh --auto --cert-domain example.com --xhttp-tls --ws-tls`（两条都可选，也可以只开一条。见「经过 CDN 的两条线路」）
 
-管理子命令：`proxy info | proto | sni | regen | port | user | update | status | speed | firewall | nat | cert | cdn | tune | route | land | land-add | land-test | land-off | land-on | land-del | allow | uninstall`（加 `--auto` 可在脚本/自动化里免确认，例如 `proxy uninstall --auto`）。`proxy route` 只做线路检测，不改配置。
+管理子命令：`proxy info | proto | sni | regen | port | user | update | status | speed | firewall | nat | cert | cdn | vless-enc | tune | route | land | land-add | land-test | land-off | land-on | land-del | allow | uninstall`（加 `--auto` 可在脚本/自动化里免确认，例如 `proxy uninstall --auto`）。`proxy route` 只做线路检测，不改配置。
 
 装完之后改协议（不删除已有 UUID、Reality 密钥、XHTTP 路径和各协议密码）：
 
@@ -620,6 +621,17 @@ bash proxy.sh --auto --cert-domain example.com --ws-tls
 proxy cdn
 ```
 
+这两条默认带 VLESS Encryption（ML-KEM-768 + X25519，`native`，0-RTT），链接里的 `encryption=` 是 `xray vlessenc` 生成的一长串，Cloudflare 解开 TLS 后只看到密文。REALITY、XHTTP+REALITY、Hysteria2 等不受影响。需要 Xray-core 25.9.5+ 内核的客户端或 mihomo v1.19.14+；sing-box 内核的客户端（NekoBox 等）可能不支持。安装时加 `--no-vless-enc` 不加；装好之后用下面的命令，或在「协议开关」里选第 9 项：
+
+```bash
+proxy vless-enc
+proxy vless-enc on
+proxy vless-enc off
+proxy vless-enc rotate
+```
+
+不带参数是查看。`on` / `off` 只重写 Xray，并刷新链接、`/root/proxy-info.txt` 和订阅，不重装。钥匙存在 state.env，重装、`proxy sni`、换证书都不变；`rotate` 和 `proxy regen` 才换新钥匙。
+
 Cloudflare 免费代理只转发这几个 HTTPS 端口：443、2053、2083、2087、2096、8443。默认避开 443，把 443 留给 REALITY 直连。8443 若已被 XHTTP+REALITY 占用，就不能再给 CDN。80 只留给证书申请，不能当回源端口。
 
 面板里建议这样填：
@@ -716,7 +728,7 @@ Hysteria2 ▶ …              sing-box  ▶ 未安装
 
 NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 12 项（没有客户端直连协议，第 12 项仍是线路检测），框标题同样是 `oneclick proxy`。
 
-**协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS，以及 CDN 上的 XHTTP+TLS（第 7 项）、WebSocket+TLS（第 8 项）。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径、CDN 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥和 CDN 路径，但不会把已关闭的协议重新打开。已申请公开证书时，重新生成密钥不会把 Hysteria2 / TUIC / AnyTLS 换回自签证书。打开 CDN 线路时会打印教程并做一次检查。想再看教程：`proxy cdn`。
+**协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS，以及 CDN 上的 XHTTP+TLS（第 7 项）、WebSocket+TLS（第 8 项）。第 9 项开关这两条的 VLESS Encryption，并显示当前状态。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径、CDN 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥和 CDN 路径，但不会把已关闭的协议重新打开。已申请公开证书时，重新生成密钥不会把 Hysteria2 / TUIC / AnyTLS 换回自签证书。打开 CDN 线路时会打印教程并做一次检查。想再看教程：`proxy cdn`。
 
 **申请证书**（第 17 项，或 `proxy cert`）：选择种类并申请、续期、查看链接，或关闭证书。默认仍是 Let's Encrypt 单域名。见「申请证书」。
 
