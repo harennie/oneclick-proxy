@@ -102,7 +102,7 @@ NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239
 
 CDN 线路示例：`bash proxy.sh --auto --cert-domain example.com --xhttp-tls --ws-tls`（两条都可选，也可以只开一条。见「经过 CDN 的两条线路」）
 
-管理子命令：`proxy info | proto | sni | regen | port | user | update | status | speed | firewall | nat | cert | cdn | vless-enc | tune | route | land | land-add | land-test | land-off | land-on | land-del | allow | uninstall`（加 `--auto` 可在脚本/自动化里免确认，例如 `proxy uninstall --auto`）。`proxy route` 只做线路检测，不改配置。
+管理子命令：`proxy info | proto | sni | regen | port | user | update | status | speed | firewall | nat | cert | cdn | vless-enc | tune | route | land | land-add | land-test | land-off | land-on | land-del | land-direct | land-forward | allow | uninstall`（加 `--auto` 可在脚本/自动化里免确认，例如 `proxy uninstall --auto`）。`proxy route` 只做线路检测，不改配置。`land-direct` 与 `land-forward` 只在落地机上切换出口。
 
 装完之后改协议（不删除已有 UUID、Reality 密钥、XHTTP 路径和各协议密码）：
 
@@ -361,8 +361,8 @@ apk add bash curl && bash proxy.sh --land --nat --auto --port 52430:8388 --nat-a
 - **协议**：Shadowsocks 2022（SIP022），`network: tcp,udp`。默认 `2022-blake3-aes-128-gcm`（16 字节密钥），可选 `2022-blake3-aes-256-gcm` / `2022-blake3-chacha20-poly1305`（32 字节密钥，无 AES 硬件加速的 ARM 机器选 chacha20）；密钥用 `openssl rand -base64 <长度>` 生成。SS2022 会校验时间戳，两端时间相差超过 30 秒会被拒绝，脚本会检查 / 启用时间同步。
 - **出站限制**：与节点模式一样屏蔽访问内网 / 保留地址段与 BT。
 - **来源 IP 白名单**（可选，强烈建议）：只允许列出的中转机 IP。实现为两层：
-  - Xray 路由：来源在白名单内 → 直连，否则 → blackhole（任何环境都有效，本机回环始终允许，用于自检）；
-  - nftables：非 NAT 容器且有 nft 时，额外加一张独立的表 `inet proxy_oneclick_land`，只在 SS 端口上丢弃非白名单来源（不影响其它端口，不是默认拒绝防火墙），开机由 `proxy-oneclick-land-fw` 服务加载。NAT 容器（LXC / OpenVZ 等）只用 Xray 路由。
+  - Xray 路由：来源在白名单内走当前出口（本机直连，或加密转发时的下一跳），否则 → blackhole（任何环境都有效，本机回环始终允许，用于自检）；
+  - nftables：非 NAT 容器且有 nft 时，额外加一张独立的表 `inet proxy_oneclick_land`，只在 SS 端口上丢弃非白名单来源（不影响其它端口，不是默认拒绝防火墙），开机由 `proxy-oneclick-land-fw` 服务加载。NAT 容器（LXC / OpenVZ 等）只用 Xray 路由。原样转发不让 Xray 听这个端口，来源限制写在 DNAT 上。
   - 注意：NAT 小鸡经服务商端口映射进来的连接，来源 IP 可能被改成服务商网关地址；中转机测试失败时，看落地机的实际来源 IP 再加进白名单。
 - **安装结束输出**：`ss://` 链接（SIP002，2022 加密使用百分号编码的 `方法:密钥`，不用 base64）、**中转机一键命令** `proxy land-add 'ss://...'`、可直接粘贴到其它 Xray 配置的 **outbound JSON 片段**、mihomo 片段；并做一次落地机自检（临时客户端 → 本机 SS2022 → 外网，显示出口 IP）。
 - **落地机菜单**（`proxy`）：
@@ -379,9 +379,30 @@ apk add bash curl && bash proxy.sh --land --nat --auto --port 52430:8388 --nat-a
  9) 改装为 Reality / Hysteria2 节点
 10) 卸载
 11) 切换 NAT 模式（当前: 自动/开/关）
+12) 线路检测（回程 / 国际线路 / 国际互联）
+13) 出口：本机直连（清除下一跳与原样转发）
+14) 出口：加密转发（SS2022 再加密到下一跳）
+15) 出口：原样转发（不解密，DNAT 到最终落地）
 ```
 
-命令行：`proxy info`（链接）、`proxy allow --land-allow 1.2.3.4,5.6.7.0/24`（改白名单，`none` 不限制）、`proxy port --port 9388`、`proxy regen [--land-method aes-256]`（换密钥 / 加密方式）、`proxy uninstall`。改端口或密钥后需要在中转机上重新 `land-add`。
+同一时间只启用一种出口。没有设置下一跳、也没有原样转发时，就是以前的本机直连：Shadowsocks 2022 入站后直连，`--land` 仍可与 `--outbound` 一起用。
+
+命令行：`proxy info`（链接）、`proxy allow --land-allow 1.2.3.4,5.6.7.0/24`（改白名单，`none` 不限制）、`proxy port --port 9388`、`proxy regen [--land-method aes-256]`（换密钥 / 加密方式）、`proxy uninstall`。本机直连或加密转发时，改端口或密钥后需要在上一台重新 `land-add`。
+
+**出口（落地机菜单第 13–15 项）**
+
+```bash
+proxy land-direct          # 同 land-clear：本机直连，清除下一跳、原样转发目标和 DNAT
+proxy land-add 'ss://...'  # 加密转发：本机仍用自己的 ss:// 接上一跳，白名单来源再拨到下一跳
+proxy land-forward 'ss://...'   # 同 land-raw：不解密，DNAT 到链接里的主机和端口
+proxy land-off             # 停用当前的加密转发或原样转发，保留链接
+proxy land-forward-off     # 同 land-raw-off：只去掉 DNAT，保留目标
+proxy land-forward-del     # 同 land-raw-del：只删除原样转发目标
+```
+
+加密转发不安装 hy2-relay。交给上一台的是本机自己的 `ss://`；下一跳链接单独打印，不要交给上一台。`land-on` 重新启用已保存的下一跳，`land-del` 只删除加密转发。从中转机改装成落地机时不会沿用原来的中转链接；已经是落地机时重新安装会保留下一跳和原样转发目标。
+
+原样转发要求来源白名单里已有与目标同族的地址，否则拒绝安装，不会留下开放的 DNAT。上一跳链接用本机地址和对外端口，加上最终落地的加密方式与密钥；最终机器的地址单独标出。Xray 不监听这个端口。出站策略（`--outbound`）同样约束目标地址族。切回本机直连或加密转发时会去掉 DNAT。
 
 ### 2. 在中转机上添加落地（`proxy land-add`）
 
@@ -703,7 +724,7 @@ proxy
 █▀▀▀█ █▀▀▀█
 █ 哈 █ █ 人 █
 █▄▄▄█ █▄▄▄█
-oneclick proxy  ·····  v1.3.0
+oneclick proxy  ·····  v1.4.0
 
 IP        ▶ …              Xray      ▶ …
 Hysteria2 ▶ …              sing-box  ▶ 未安装
@@ -726,7 +747,7 @@ Hysteria2 ▶ …              sing-box  ▶ 未安装
 ════════════════════════════════
 ```
 
-NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 12 项（没有客户端直连协议，第 12 项仍是线路检测），框标题同样是 `oneclick proxy`。
+NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 15 项（没有客户端直连协议，第 12 项仍是线路检测，第 13–15 项是出口：本机直连 / 加密转发 / 原样转发），框标题同样是 `oneclick proxy`。
 
 **协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS，以及 CDN 上的 XHTTP+TLS（第 7 项）、WebSocket+TLS（第 8 项）。第 9 项开关这两条的 VLESS Encryption，并显示当前状态。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径、CDN 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥和 CDN 路径，但不会把已关闭的协议重新打开。已申请公开证书时，重新生成密钥不会把 Hysteria2 / TUIC / AnyTLS 换回自签证书。打开 CDN 线路时会打印教程并做一次检查。想再看教程：`proxy cdn`。
 
@@ -846,11 +867,14 @@ proxy allow
 | `/root/.proxy-oneclick/nat-hop.sh` | NAT 模式端口跳跃规则脚本（仅开启跳跃时） |
 | `/etc/systemd/system/proxy-oneclick-hop.service` / `/etc/init.d/proxy-oneclick-hop` | 开机加载端口跳跃规则（仅开启跳跃时） |
 | `/etc/init.d/xray`、`/etc/init.d/hysteria-server` | OpenRC 服务脚本（Alpine） |
-| `/etc/sysctl.d/99-proxy-tune.conf` | 网络调优参数（唯一的 sysctl 文件） |
+| `/etc/sysctl.d/99-proxy-tune.conf` | 网络调优参数 |
 | `/root/.proxy-oneclick/tune/` | 调优前原值备份 `backup.env`、当前预设 `current.env`、容器开机脚本 `boot.sh` |
 | `/etc/systemd/system/proxy-oneclick-tune.service` / `/etc/init.d/proxy-oneclick-tune` | 容器内开机重新应用调优（仅容器环境） |
 | `/root/.proxy-oneclick/land-fw.nft` | 落地机来源白名单 nftables 规则（表 `inet proxy_oneclick_land`，仅启用白名单且非 NAT 容器时） |
 | `/etc/systemd/system/proxy-oneclick-land-fw.service` / `/etc/init.d/proxy-oneclick-land-fw` | 开机加载落地机白名单 |
+| `/root/.proxy-oneclick/land-fwd.nft`、`/root/.proxy-oneclick/land-fwd.sh` | 原样转发 DNAT（表 `proxy_oneclick_fwd`，仅启用原样转发时） |
+| `/etc/systemd/system/proxy-oneclick-fwd.service` / `/etc/init.d/proxy-oneclick-fwd` | 开机加载原样转发 |
+| `/etc/sysctl.d/99-proxy-oneclick-fwd.conf` | 原样转发打开的 IP 转发（停用后恢复） |
 | `/var/log/xray/`、`/var/log/hysteria/` | OpenRC 下的服务日志（systemd 下用 `journalctl -u xray` / `-u hysteria-server`） |
 
 ---
@@ -869,7 +893,7 @@ proxy uninstall
 proxy uninstall --auto
 ```
 
-会移除：Xray、Hysteria2（含 hysteria 用户）、sing-box（若装过 TUIC / AnyTLS）、nftables 表与 systemd 单元、sysctl / limits / journald 配置（并恢复调优前的参数值）、fail2ban 规则、`proxy` 命令、节点信息；可选择是否删除密钥与备份目录；安装时被停用的 firewalld / ufw 会询问是否恢复。安装时创建的 `/swapfile` 会保留（附删除方法）。NAT 模式还会移除 OpenRC 服务脚本、日志目录、端口跳跃规则，并恢复 `--dns64` 修改前的 `/etc/resolv.conf`。落地机还会移除白名单规则表与开机服务。若申请过证书，还会停掉订阅和续期、删除证书副本与订阅文件、CDN 标记和交给 Xray 的那份证书副本，并删除 certbot 里名为 `proxy-oneclick` 的那张证书；不卸载 certbot 软件包。最后别忘了在云控制台关闭不再需要的端口。
+会移除：Xray、Hysteria2（含 hysteria 用户）、sing-box（若装过 TUIC / AnyTLS）、nftables 表与 systemd 单元、sysctl / limits / journald 配置（并恢复调优前的参数值）、fail2ban 规则、`proxy` 命令、节点信息；可选择是否删除密钥与备份目录；安装时被停用的 firewalld / ufw 会询问是否恢复。安装时创建的 `/swapfile` 会保留（附删除方法）。NAT 模式还会移除 OpenRC 服务脚本、日志目录、端口跳跃规则，并恢复 `--dns64` 修改前的 `/etc/resolv.conf`。落地机还会移除白名单规则表、原样转发 DNAT 与对应开机服务，并恢复原样转发改过的 IP 转发开关。若申请过证书，还会停掉订阅和续期、删除证书副本与订阅文件、CDN 标记和交给 Xray 的那份证书副本，并删除 certbot 里名为 `proxy-oneclick` 的那张证书；不卸载 certbot 软件包。最后别忘了在云控制台关闭不再需要的端口。
 
 ---
 
@@ -896,3 +920,14 @@ proxy uninstall --auto
 - CDN 上的 XHTTP+TLS / WebSocket+TLS 需要自有域名，以及公开证书或 Cloudflare 源站证书，还有 Cloudflare 允许代理的回源端口。源站证书只有 Cloudflare 信任，不能给浏览器和直连客户端。NAT / Alpine / 落地机不能开。域名开了橙色云朵后，不要再用这个名字连接 Hysteria2、TUIC 或订阅。
 - XHTTP 走 CDN 时用 `packet-up`。`stream-one` 只用于直连的 XHTTP+REALITY。WebSocket 需要 CDN 打开 WebSockets，路径必须和链接里逐字相同。
 - `proxy route` 只测从 VPS 出发的回程和向外的国际路径。它不能代替在自己电脑上做的去程，也不能把国际线路和国际互联合成一个分数。测试地址会失效，任播目标的时延下限只是参照。
+
+---
+
+## 更新日志
+
+### v1.4.0
+- 落地机出口三选一，同一时间只启用一种。菜单第 13 / 14 / 15 项：本机直连、加密转发、原样转发。第 1–12 项不变。中转机菜单第 12 项仍是「本机作中转，出口走落地机」。
+- 本机直连（`proxy land-direct` / `land-clear`）：与以前的落地机相同，Shadowsocks 2022 入站后直连，`--land` 仍可与 `--outbound` 一起用。会清掉已保存的下一跳、原样转发目标和 DNAT。
+- 加密转发（落地机上的 `proxy land-add 'ss://...'`，以及 `land-on` / `land-off` / `land-del`）：本机仍用自己的 SS2022 接上一跳，白名单来源再拨到下一跳的 SS2022，不装 hy2-relay。交给上一台的是本机自己的 `ss://`；下一跳链接单独打印。中转机上的 `land-add` 行为不变。从中转机改装成落地机时不会沿用原来的中转链接；已经是落地机时重新安装会保留下一跳。
+- 原样转发（`proxy land-forward 'ss://...'` / `land-raw`）：不解密、不再加密。把本机落地端口的 TCP 和 UDP DNAT 到链接里的主机和端口，回程做 masquerade。上一跳链接用本机地址和对外端口，加上最终落地的加密方式与密钥；最终机器的地址单独标出。白名单为空，或没有与目标同族的地址时拒绝安装，不会留下开放的 DNAT。Xray 不监听该端口。`land-forward-off` / `land-forward-del`（以及 `land-raw-off` / `land-raw-del`）只动这一项。出站策略（`--outbound`）同样约束目标地址族。
+- `proxy land-off` 在落地机上停用当前的加密转发或原样转发，并保留链接。切回本机直连或另一种出口时，会拆掉当前这一种。
