@@ -7,6 +7,7 @@
 # 用法:
 #   bash proxy.sh                 # 交互式菜单
 #   bash proxy.sh --auto          # 全部默认值自动安装
+#   bash proxy.sh --firewall allow   # 只放行代理端口，不把入站改成默认拒绝（strict|allow|off）
 #   bash proxy.sh --nat           # NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine）
 #   bash proxy.sh tune            # 网络调优（BBR / 队列算法 / 缓冲区；可单独使用，NAT/容器也可用）
 #   bash proxy.sh --land          # 落地机：只运行 Shadowsocks 2022（给中转机做出口，可设来源 IP 白名单）
@@ -36,7 +37,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -173,7 +174,8 @@ OPT_WS_PORT=""
 OPT_VLESS_ENC=""    # 空=沿用（新开 CDN 线路时默认开）; 1/0。只作用于两条 CDN 线路
 OPT_VENC_ACT=""     # proxy vless-enc 子命令: on | off | rotate；空=查看
 OPT_HOP=""          # "20000-50000" 或 "none"
-OPT_FIREWALL=1
+OPT_FW_MODE=""      # 空=按环境决定；strict 默认拒绝 | allow 只放行 | off 不写规则
+OPT_FW_SET=0        # 1 = 命令行显式写了 --firewall（--no-firewall 只记模式，不单独触发安装）
 OPT_UPGRADE=""      # 空=默认（普通模式 1，NAT 模式 0）
 OPT_TUNE=""         # 空=默认（普通模式 1；NAT 模式 2 = 交互询问，--auto 时跳过）
 OPT_TUNE_ACT=""     # proxy tune 子命令: status | preview | apply | restore
@@ -228,6 +230,8 @@ if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-} != dumb ]]; then
 else
   C_TITLE="" C_OK="" C_WARN="" C_DIM="" C_BOLD="" C_NONE=""
 fi
+# 旧调用点留下的别名。颜色只实际使用 C_TITLE / C_OK / C_WARN / C_DIM / C_BOLD。
+# shellcheck disable=SC2034
 C_GREEN=$C_OK C_YELLOW=$C_WARN C_RED=$C_WARN C_BLUE="" C_CYAN=$C_TITLE C_MAG=$C_TITLE
 _red()    { printf '%s%s%s\n' "$C_WARN" "$*" "$C_NONE"; }
 _green()  { printf '%s%s%s\n' "$C_TITLE" "$*" "$C_NONE"; }
@@ -433,16 +437,16 @@ is_range() { # 20000-50000
   is_port "$a" && is_port "$b" && (( a < b ))
 }
 urlencode() {
-  local s=$1 out="" c i
+  local s=$1 enc="" c i
   local LC_ALL=C
   for (( i = 0; i < ${#s}; i++ )); do
     c=${s:i:1}
     case $c in
-      [a-zA-Z0-9.~_-]) out+=$c ;;
-      *) printf -v c '%%%02X' "'$c"; out+=$c ;;
+      [a-zA-Z0-9.~_-]) enc+=$c ;;
+      *) printf -v c '%%%02X' "'$c"; enc+=$c ;;
     esac
   done
-  printf '%s' "$out"
+  printf '%s' "$enc"
 }
 rand_hex() { openssl rand -hex "$1"; }
 rand_pass() { openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | cut -c1-24; }
@@ -529,7 +533,7 @@ take_lock() {
 # ----------------------------- 状态持久化 -----------------------------
 # 持久化的键
 STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY MLDSA_ON SNI SNI_TARGET
-            HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED SSH_PORTS
+            HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED FW_MODE SSH_PORTS
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
             HOP_BACKEND VIRT DNS64_SET
@@ -545,7 +549,7 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
             CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
-HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 SSH_PORTS=""
+HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
 # 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。
 REALITY_ENABLED=1
@@ -602,6 +606,7 @@ load_state() {
     if [[ $v =~ ^\'(.*)\'$ ]]; then v=${BASH_REMATCH[1]}; fi
     printf -v "$k" '%s' "$v"
   done <"$STATE_FILE"
+  fw_migrate_saved_mode
 }
 save_state() {
   mkdir -p "$STATE_DIR" "$BACKUP_DIR"; chmod 700 "$STATE_DIR" "$BACKUP_DIR"
@@ -3502,19 +3507,335 @@ remove_hysteria() { # $1 = purge：连证书目录一起删（卸载）。TUIC/A
 # ============================================================
 #                        防火墙 (nftables)
 # ============================================================
+# 三种模式，都只动本脚本自己的表 inet proxy_oneclick（以及旧内核端口跳跃用的
+# ip/ip6 proxy_oneclick_nat）。不 flush 全表，不改 Docker / Podman 的表和链。
+#   strict  入站默认拒绝（干净机器上的原有行为）
+#   allow   只给代理端口和端口跳跃写 accept，策略保持 accept，不接管入站
+#   off     不写 nftables（--no-firewall）
+fw_norm_mode() { # 输出 strict|allow|off；无法识别返回 1
+  case ${1,,} in
+    strict|drop|hard) printf 'strict' ;;
+    allow|allow-only|allowonly|gentle|soft) printf 'allow' ;;
+    off|none|disable|no) printf 'off' ;;
+    on|enable) printf 'strict' ;;
+    *) return 1 ;;
+  esac
+}
+fw_mode_label() {
+  case ${1:-${FW_MODE:-}} in
+    strict) printf '严格（入站默认拒绝）' ;;
+    allow) printf '只放行（不接管入站策略）' ;;
+    off) printf '关闭' ;;
+    *) printf '未设置' ;;
+  esac
+}
+# 旧 state.env 只有 FW_ENABLED。1 视为严格，0 视为关闭。
+fw_migrate_saved_mode() {
+  case ${FW_MODE:-} in
+    strict|allow|off) ;;
+    *)
+      if [[ ${FW_ENABLED:-1} == 0 ]]; then FW_MODE=off; else FW_MODE=strict; fi
+      ;;
+  esac
+  return 0
+}
+fw_table_loaded() { have nft && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; }
+
+fw_container_runtime() {
+  [[ -S /var/run/docker.sock || -S /run/docker.sock ]] && return 0
+  [[ -S /run/podman/podman.sock || -S /var/run/podman/podman.sock ]] && return 0
+  [[ -d /sys/class/net/docker0 || -d /sys/class/net/podman0 || -d /sys/class/net/cni-podman0 ]] && return 0
+  if have systemctl; then
+    systemctl is-active --quiet docker 2>/dev/null && return 0
+    systemctl is-active --quiet docker.socket 2>/dev/null && return 0
+    systemctl is-active --quiet podman 2>/dev/null && return 0
+    systemctl is-active --quiet podman.socket 2>/dev/null && return 0
+  fi
+  if have iptables; then
+    iptables -S 2>/dev/null | grep -Eq 'DOCKER|PODMAN' && return 0
+    iptables -t nat -S 2>/dev/null | grep -Eq 'DOCKER|PODMAN' && return 0
+  fi
+  if have nft; then
+    nft list chains 2>/dev/null | grep -Eq 'DOCKER|PODMAN' && return 0
+  fi
+  if have pgrep; then
+    pgrep -x dockerd >/dev/null 2>&1 && return 0
+    pgrep -x podman >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+fw_wireguard_present() {
+  local d
+  for d in /sys/class/net/*; do
+    [[ -e $d/wireguard ]] && return 0
+  done
+  if have wg && [[ -n $(wg show interfaces 2>/dev/null || true) ]]; then return 0; fi
+  if have ip && ip -d link show 2>/dev/null | grep -q wireguard; then return 0; fi
+  return 1
+}
+fw_ufw_active() {
+  svc_active ufw && return 0
+  have ufw && ufw status 2>/dev/null | grep -q 'Status: active'
+}
+fw_firewalld_active() {
+  svc_active firewalld && return 0
+  have firewall-cmd && firewall-cmd --state >/dev/null 2>&1
+}
+# 除本脚本的表以外，规则集里还有实际规则（空表、只有 chain 类型声明的不算）
+fw_foreign_nft() {
+  local rs
+  have nft || return 1
+  rs=$(nft -s list ruleset 2>/dev/null || true)
+  [[ -n $rs ]] || return 1
+  awk '
+    $1 == "table" { skip = ($0 ~ /proxy_oneclick/); next }
+    skip { next }
+    /^[[:space:]]*(type |chain |}|table )/ { next }
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*#/ { next }
+    { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' <<<"$rs"
+}
+# 有不是 Docker/Podman 的 iptables 规则。ufw / firewalld 另计，避免同一件事说两遍。
+fw_foreign_iptables() {
+  local bin line hit=0
+  for bin in iptables ip6tables; do
+    have "$bin" || continue
+    while IFS= read -r line; do
+      [[ $line == -A\ * || $line == -I\ * ]] || continue
+      [[ $line =~ DOCKER|PODMAN|CNI- ]] && continue
+      hit=1
+    done < <("$bin" -S 2>/dev/null || true)
+  done
+  (( hit == 1 ))
+}
+fw_collect_foreign() {
+  local t u p
+  detect_ssh_ports
+  t=$(other_listen_ports tcp)
+  u=$(other_listen_ports udp)
+  FW_FOREIGN_TCP=""
+  FW_FOREIGN_UDP=""
+  for p in $t; do
+    if [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || $p == "$XHTTP_TLS_PORT" || $p == "$WS_PORT" || $p == "${SUB_PORT:-}" ]]; then
+      continue
+    fi
+    cert_port_owned "$p" && continue
+    FW_FOREIGN_TCP+="$p "
+  done
+  for p in $u; do
+    [[ $p == "$HY2_PORT" || $p == "$TUIC_PORT" || $p == "$XRAY_PORT" ]] && continue
+    FW_FOREIGN_UDP+="$p "
+  done
+  FW_FOREIGN_TCP=${FW_FOREIGN_TCP% }
+  FW_FOREIGN_UDP=${FW_FOREIGN_UDP% }
+}
+fw_print_risk() { [[ -n ${FW_RISK_TEXT:-} ]] && printf '%s' "$FW_RISK_TEXT"; return 0; }
+# 会把「入站默认拒绝」弄坏现有服务的信号。只读，不改任何规则。
+fw_detect_risk() {
+  local p nstd=0 udp_note
+  FW_RISK=0
+  FW_RISK_TEXT=""
+  fw_collect_foreign
+  if fw_container_runtime; then
+    FW_RISK=1
+    FW_RISK_TEXT+="  · Docker 或 Podman 在用（发布端口 / iptables-nft 转发）。默认拒绝会挡住容器端口，本脚本也不会去改它们自己的表。"$'\n'
+  fi
+  if fw_wireguard_present; then
+    FW_RISK=1
+    FW_RISK_TEXT+="  · 检测到 WireGuard。默认拒绝会丢掉它的 UDP 握手。"$'\n'
+  fi
+  if [[ -n $FW_FOREIGN_UDP ]]; then
+    FW_RISK=1
+    udp_note=$FW_FOREIGN_UDP
+    FW_RISK_TEXT+="  · 还有其它 UDP 端口在监听：${udp_note}。"$'\n'
+  fi
+  for p in $FW_FOREIGN_TCP; do
+    [[ $p == 80 || $p == 443 || $p == 53 ]] && continue
+    nstd=$((nstd + 1))
+  done
+  if (( nstd >= 2 )); then
+    FW_RISK=1
+    FW_RISK_TEXT+="  · 有多个非标准端口在对外监听：${FW_FOREIGN_TCP}。"$'\n'
+  fi
+  if fw_firewalld_active; then
+    FW_RISK=1
+    FW_RISK_TEXT+="  · firewalld 正在运行。"$'\n'
+  fi
+  if fw_ufw_active; then
+    FW_RISK=1
+    FW_RISK_TEXT+="  · ufw 正在运行。"$'\n'
+  fi
+  if ! fw_firewalld_active && fw_foreign_nft; then
+    FW_RISK=1
+    FW_RISK_TEXT+="  · 已经有不是本脚本的 nftables 规则。"$'\n'
+  fi
+  if ! fw_ufw_active && ! fw_container_runtime && fw_foreign_iptables; then
+    FW_RISK=1
+    FW_RISK_TEXT+="  · 已经有 iptables 规则。"$'\n'
+  fi
+  return 0
+}
+fw_prompt_mode() {
+  local def=1 c prev
+  prev=${FW_MODE:-}
+  fw_detect_risk
+  echo
+  if (( FW_RISK )); then
+    warn "这台机器若使用入站默认拒绝，可能会打断已经在跑的服务："
+    fw_print_risk
+    echo "推荐「只放行」：只给本脚本的端口和端口跳跃加 accept，不把入站改成默认拒绝，也不改 Docker 或其它防火墙的表。"
+    def=2
+  else
+    info "没有发现 Docker、Podman、WireGuard、已有防火墙规则，也没有多个非标准端口在监听。"
+    echo "推荐「严格」：入站默认拒绝，并放行 SSH 和代理端口。"
+    def=1
+  fi
+  [[ -n $prev && ${INSTALLED:-0} == 1 ]] && echo "当前已保存：$(fw_mode_label "$prev")"
+  echo "  1) 严格 — 入站默认拒绝（一定会放行 SSH）"
+  echo "  2) 只放行 — 不接管入站策略"
+  echo "  3) 关闭 — 不写 nftables"
+  ask c "防火墙模式" "$def"
+  case $c in
+    1|strict) FW_MODE=strict ;;
+    2|allow|allow-only) FW_MODE=allow ;;
+    3|off|none) FW_MODE=off ;;
+    *)
+      warn "没有识别「${c}」，改用推荐项。"
+      if (( FW_RISK )); then FW_MODE=allow; else FW_MODE=strict; fi
+      ;;
+  esac
+}
+# 安装时决定 FW_MODE / FW_ENABLED。NAT 模式不配置这套防火墙。
+fw_decide_install() {
+  if (( NAT_MODE )); then
+    if [[ -f $FW_FILE || -f $FW_UNIT ]] || fw_table_loaded; then
+      info "NAT 模式不管理防火墙，移除之前安装的本脚本 nftables 规则 ..."
+      remove_firewall
+    fi
+    FW_MODE=off
+    FW_ENABLED=0
+    return 0
+  fi
+  if [[ -n $OPT_FW_MODE ]]; then
+    FW_MODE=$OPT_FW_MODE
+    if [[ $FW_MODE == strict ]]; then
+      fw_detect_risk
+      if (( FW_RISK )); then
+        warn "已按指定使用严格模式（入站默认拒绝）。下面这些情况仍可能受影响："
+        fw_print_risk
+        warn "SSH 会放行。若要改为只放行：proxy firewall allow"
+      fi
+    elif [[ $FW_MODE == allow ]]; then
+      info "防火墙使用只放行模式（不把入站改成默认拒绝）。"
+    else
+      info "已按指定跳过 nftables 防火墙。"
+    fi
+  elif (( OPT_AUTO )) || { [[ ! -t 0 && ! -r /dev/tty ]]; }; then
+    fw_detect_risk
+    if (( FW_RISK )); then
+      FW_MODE=allow
+      warn "未指定 --firewall。检测到可能被默认拒绝打断的环境，非交互安装改用只放行模式："
+      fw_print_risk
+      info "确认要入站默认拒绝时，请使用 --firewall strict，或之后执行 proxy firewall strict。"
+    else
+      FW_MODE=strict
+      info "未指定 --firewall，也没有发现 Docker、已有防火墙或额外的非标准监听，使用严格模式（入站默认拒绝）。"
+    fi
+  else
+    fw_prompt_mode
+  fi
+  case $FW_MODE in
+    off)
+      FW_ENABLED=0
+      if [[ -f $FW_FILE || -f $FW_UNIT ]] || fw_table_loaded; then
+        info "不配置防火墙，移除本脚本已有的 nftables 规则 ..."
+        remove_firewall
+      fi
+      ;;
+    allow)
+      FW_ENABLED=1
+      ;;
+    *)
+      FW_MODE=strict
+      FW_ENABLED=1
+      handle_other_firewalls
+      if (( FW_ENABLED )); then
+        ask_extra_ports
+      else
+        FW_MODE=off
+      fi
+      ;;
+  esac
+  return 0
+}
+fw_switch_mode() { # strict|allow|off。已安装后从菜单或 proxy firewall 调用
+  case $1 in
+    off)
+      remove_firewall
+      FW_MODE=off
+      FW_ENABLED=0
+      save_state
+      ok "已关闭本脚本防火墙（没有改系统其它规则）。"
+      ;;
+    allow)
+      FW_MODE=allow
+      FW_ENABLED=1
+      save_state
+      apply_firewall
+      save_state
+      ;;
+    strict)
+      FW_MODE=strict
+      FW_ENABLED=1
+      handle_other_firewalls
+      if (( ! FW_ENABLED )); then
+        FW_MODE=off
+        save_state
+        return 0
+      fi
+      ask_extra_ports
+      save_state
+      apply_firewall
+      save_state
+      ;;
+    *) die "未知防火墙模式: $1" ;;
+  esac
+}
+# strict 的规则文件必须包含每一个已探测的 SSH 端口，否则拒绝加载。
+fw_rules_cover_ssh() { # $1 nft 文件
+  local f=$1 line ports p cur
+  line=$(grep -F 'comment "SSH"' "$f" || true)
+  [[ -n $line ]] || return 1
+  ports=$(sed -n 's/.*tcp dport {[[:space:]]*\([^}]*\)}.*/\1/p' <<<"$line" | tr -d ' ')
+  [[ -n $ports ]] || return 1
+  for p in $SSH_PORTS; do
+    [[ ",${ports}," == *",${p},"* ]] || return 1
+  done
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    cur=$(awk '{print $4}' <<<"$SSH_CONNECTION")
+    if is_port "$cur"; then
+      [[ ",${ports}," == *",${cur},"* ]] || return 1
+    fi
+  fi
+  return 0
+}
+
 handle_other_firewalls() {
   local fw
   for fw in firewalld ufw; do
     if svc_active "$fw" || { [[ $fw == ufw ]] && have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; }; then
-      warn "检测到 ${fw} 正在运行，与本脚本的 nftables 规则同时使用会互相干扰。"
-      if confirm "是否停用 ${fw}（本脚本会接管防火墙，放行 SSH 与现有监听端口）？" y; then
+      warn "检测到 ${fw} 正在运行。严格模式会把入站改成默认拒绝，和它叠在一起容易互相挡住。"
+      if confirm "是否停用 ${fw}（严格模式由本脚本放行 SSH 和现有端口；卸载时可恢复）？" y; then
         [[ $fw == ufw ]] && { ufw --force disable >/dev/null 2>&1 || true; }
         systemctl disable --now "$fw" >/dev/null 2>&1 || true
         [[ " $DISABLED_FW " == *" $fw "* ]] || DISABLED_FW="${DISABLED_FW:+$DISABLED_FW }$fw"
         ok "已停用 ${fw}（卸载本脚本时可恢复）。"
       else
-        warn "保留 ${fw}，本脚本将不配置防火墙。请自行在 ${fw} 中放行 TCP ${XRAY_PORT}、UDP ${HY2_PORT} 及端口跳跃范围。"
+        warn "保留 ${fw}，已取消严格模式。可改用「只放行」（proxy firewall allow），或在 ${fw} 里自行放行代理端口。"
         FW_ENABLED=0
+        FW_MODE=off
         return 0
       fi
     fi
@@ -3553,27 +3874,37 @@ render_firewall() {
   (( HY2_ENABLED )) && udp_ports="$HY2_PORT"
   (( ${TUIC_ENABLED:-0} )) && fw_add_port udp_ports "$TUIC_PORT"
   for p in $EXTRA_UDP; do fw_add_port udp_ports "$p"; done
-  local hop=""
+  local hop="" mode=${FW_MODE:-strict}
   (( HY2_ENABLED )) && [[ -n $HOP_RANGE ]] && hop=$HOP_RANGE
+  [[ $mode == allow ]] || mode=strict
   {
     echo "#!/usr/sbin/nft -f"
-    echo "# 由 proxy-oneclick 生成；卸载时删除。原有规则备份在 ${BACKUP_DIR}"
+    if [[ $mode == allow ]]; then
+      echo "# 由 proxy-oneclick 生成（只放行，policy accept，不接管入站）。卸载时删除。原有规则备份在 ${BACKUP_DIR}"
+    else
+      echo "# 由 proxy-oneclick 生成；卸载时删除。原有规则备份在 ${BACKUP_DIR}"
+    fi
     echo "table inet ${NFT_TABLE}"
     echo "delete table inet ${NFT_TABLE}"
     echo "table inet ${NFT_TABLE} {"
     echo "  chain input {"
-    echo "    type filter hook input priority filter; policy drop;"
-    echo "    iif \"lo\" accept"
-    echo "    ct state established,related accept"
-    echo "    ct state invalid drop"
-    echo "    meta l4proto 1 accept comment \"ICMP\""
-    echo "    meta l4proto 58 accept comment \"ICMPv6\""
-    echo "    ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept comment \"DHCPv6\""
-    echo "    tcp dport { ${ssh_set} } accept comment \"SSH\""
+    # allow 用较晚的优先级，避免抢在 Docker / 已有防火墙前面把包判掉或截走。
+    if [[ $mode == allow ]]; then
+      echo "    type filter hook input priority 10; policy accept;"
+    else
+      echo "    type filter hook input priority filter; policy drop;"
+      echo "    iif \"lo\" accept"
+      echo "    ct state established,related accept"
+      echo "    ct state invalid drop"
+      echo "    meta l4proto 1 accept comment \"ICMP\""
+      echo "    meta l4proto 58 accept comment \"ICMPv6\""
+      echo "    ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept comment \"DHCPv6\""
+    fi
+    [[ -n $ssh_set ]] && echo "    tcp dport { ${ssh_set} } accept comment \"SSH\""
     [[ -n $tcp_ports ]] && echo "    tcp dport { ${tcp_ports} } accept"
     [[ -n $udp_ports ]] && echo "    udp dport { ${udp_ports} } accept"
     [[ -n $hop ]] && echo "    udp dport ${hop} accept comment \"hy2 port hopping\""
-    echo "    ct status dnat accept"
+    [[ $mode == strict ]] && echo "    ct status dnat accept"
     echo "  }"
     if [[ -n $hop ]]; then
       echo "  chain prerouting {"
@@ -3612,16 +3943,35 @@ render_firewall_compat() {
 apply_firewall() {
   if (( LAND_MODE )); then land_fw_apply; return; fi
   if (( NAT_MODE )); then apply_nat_hop; return; fi
-  (( FW_ENABLED )) || { warn "已跳过防火墙配置（--no-firewall 或保留了其它防火墙）。"; return 0; }
-  step "配置 nftables 防火墙"
+  case ${FW_MODE:-} in
+    off) FW_ENABLED=0 ;;
+    allow|strict) FW_ENABLED=1 ;;
+  esac
+  (( FW_ENABLED )) || { warn "已跳过防火墙配置（--no-firewall、--firewall off，或保留了其它防火墙）。"; return 0; }
+  [[ ${FW_MODE:-strict} == allow ]] || FW_MODE=strict
+  step "配置 nftables 防火墙（$(fw_mode_label)）"
   have nft || die "未安装 nftables。"
   detect_ssh_ports
+  if [[ $FW_MODE == strict && -z ${SSH_PORTS// } ]]; then
+    warn "没有检测到 SSH 端口，已改为只放行模式，避免把登录关在外面。"
+    FW_MODE=allow
+  fi
   mkdir -p "$STATE_DIR"
   render_firewall
+  if [[ $FW_MODE == strict ]] && ! fw_rules_cover_ssh "${FW_FILE}.tmp"; then
+    warn "严格模式的规则没有包含全部 SSH 端口，已改为只放行模式，避免把登录关在外面。"
+    FW_MODE=allow
+    FW_ENABLED=1
+    render_firewall
+  fi
   if ! render_firewall_compat; then
     nft -c -f "${FW_FILE}.tmp" >&2 || true
     rm -f "${FW_FILE}.tmp"
     die "防火墙规则语法校验失败（nft -c），未应用任何更改。"
+  fi
+  if grep -E 'flush ruleset|DOCKER|PODMAN|CNI-' "${FW_FILE}.tmp" >/dev/null 2>&1; then
+    rm -f "${FW_FILE}.tmp"
+    die "生成的防火墙规则碰到了其它组件的表，已中止且未加载。"
   fi
   backup_firewall
   mv -f "${FW_FILE}.tmp" "$FW_FILE"; chmod 600 "$FW_FILE"
@@ -3651,11 +4001,16 @@ UNIT
   nft delete table ip "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
   nft delete table ip6 "${NFT_TABLE}_nat" >/dev/null 2>&1 || true
   systemctl restart proxy-oneclick-fw || { nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true; die "加载防火墙规则失败，已回滚。"; }
-  ok "nftables 规则已加载（入站默认拒绝）。"
+  if [[ $FW_MODE == allow ]]; then
+    ok "nftables 规则已加载（只放行代理端口，入站策略仍为接受，没有默认拒绝）。"
+  else
+    ok "nftables 规则已加载（入站默认拒绝）。"
+  fi
   fw_print_allows
 }
 
 remove_firewall() {
+  # 只删本脚本的表和服务。不 flush ruleset，不碰 Docker / Podman / 系统其它链。
   if [[ $INIT_SYS == systemd ]]; then systemctl disable --now proxy-oneclick-fw >/dev/null 2>&1 || true; fi
   if have nft; then
     nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
@@ -3870,8 +4225,14 @@ fw_print_allows() {
     echo "本机防火墙：NAT 模式不设置。入站能不能进来，看服务商的端口映射。"
     return 0
   fi
-  if (( ${FW_ENABLED:-0} == 1 )); then
-    printf '%s本机防火墙：入站默认拒绝。%s下面没有的端口，新连接会被丢掉。\n' "$C_WARN" "$C_NONE"
+  if [[ ${FW_MODE:-} == allow ]]; then
+    echo "本机防火墙：只放行模式。没有把入站改成默认拒绝。"
+    echo "下面这些端口写了 accept。其它端口仍按系统原来的策略处理，本脚本不会丢掉它们，也不会改 Docker 的表。"
+    if have nft && ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+      echo "表 inet ${NFT_TABLE} 还没加载。下面是按配置应该放行的端口，重载后才生效。"
+    fi
+  elif (( ${FW_ENABLED:-0} == 1 )); then
+    printf '%s本机防火墙：严格模式，入站默认拒绝。%s下面没有的端口，新连接会被丢掉。\n' "$C_WARN" "$C_NONE"
     echo "已建立的连接、本机回环和 ICMP 仍然放行。"
     if have nft && ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
       echo "表 inet ${NFT_TABLE} 还没加载。下面是按配置应该放行的端口，重载后才生效。"
@@ -3893,7 +4254,7 @@ fw_print_allows() {
   if cert_is_public; then fw_allow_row "订阅" tcp "${SUB_PORT:-8447}"; fi
   if cert_http_open; then fw_allow_row "证书申请" tcp 80; fi
   if [[ -z ${SSH_PORTS// } ]]; then
-    if (( ${FW_ENABLED:-0} == 1 )); then
+    if [[ ${FW_MODE:-} == strict ]]; then
       printf '  %s  还没检测到。重载前先检测，避免把登录端口关在外面。\n' "$(ui_pad "SSH" 22)"
     else
       printf '  %s  未检测\n' "$(ui_pad "SSH" 22)"
@@ -3913,7 +4274,9 @@ fw_print_allows() {
   if (( ${HY2_ENABLED:-0} == 1 )) && [[ -n ${HOP_RANGE:-} ]]; then
     echo "端口跳跃的 UDP ${HOP_RANGE} 会转到 Hysteria2 的 UDP ${HY2_PORT}。"
   fi
-  if (( ${FW_ENABLED:-0} == 1 )); then
+  if [[ ${FW_MODE:-} == allow ]]; then
+    echo "云安全组若有限制，仍要放行上面这些端口。ufw、firewalld 或 Docker 自己的规则也要另行放行。本脚本没有改那些表。"
+  elif (( ${FW_ENABLED:-0} == 1 )); then
     echo "云安全组要另外放行上面这些端口。脚本改不到云上的防火墙。"
   fi
   return 0
@@ -8435,17 +8798,7 @@ do_install() {
   fi
   [[ -n $OPT_NAME ]] && NODE_NAME=$OPT_NAME
   [[ -n $NODE_NAME ]] || NODE_NAME=$(default_node_name)
-  if (( NAT_MODE )); then
-    if [[ -f $FW_FILE || -f $FW_UNIT ]]; then info "NAT 模式不管理防火墙，移除之前安装的本脚本 nftables 规则 ..."; remove_firewall; fi
-    FW_ENABLED=0
-  else
-    (( OPT_FIREWALL )) || FW_ENABLED=0
-    if (( OPT_FIREWALL )); then
-      FW_ENABLED=1
-      handle_other_firewalls
-      (( FW_ENABLED )) && ask_extra_ports
-    fi
-  fi
+  fw_decide_install
 
   install_xray
   if [[ -z $UUID || -z $PRIV_KEY || -z $PUB_KEY || -z $SHORT_ID ]]; then
@@ -9129,6 +9482,7 @@ do_install_land() {
   if [[ -f $FW_FILE || -f $FW_UNIT ]]; then info "移除节点模式的 nftables 规则 ..."; remove_firewall; fi
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; fi
   FW_ENABLED=0
+  FW_MODE=off
 
   install_xray
   INSTALLED=1
@@ -9550,6 +9904,7 @@ land_fwd_forwarding_restore() {
   if [[ $prev == 0 && -n $key ]]; then sysctl -w "${key}=0" >/dev/null 2>&1 || true; fi
   rm -f "$LAND_FWD_SYSCTL"
 }
+# shellcheck disable=SC2016  # 生成的脚本里 $1/$0 保持字面量
 land_fwd_write_script() {
   local bin src
   mkdir -p "$STATE_DIR"
@@ -9700,8 +10055,8 @@ land_fwd_show() {
   if [[ -f $LAND_FWD_FILE ]] && have nft; then
     nft list table inet "$LAND_FWD_TABLE" 2>/dev/null || nft list table ip "$LAND_FWD_TABLE" 2>/dev/null || nft list table ip6 "$LAND_FWD_TABLE" 2>/dev/null || true
   fi
-  have iptables && iptables -t nat -S PROXY_OC_FWD 2>/dev/null || true
-  have ip6tables && ip6tables -t nat -S PROXY_OC_FWD 2>/dev/null || true
+  if have iptables; then iptables -t nat -S PROXY_OC_FWD 2>/dev/null || true; fi
+  if have ip6tables; then ip6tables -t nat -S PROXY_OC_FWD 2>/dev/null || true; fi
   [[ -f $LAND_FWD_SCRIPT ]] || warn "未启用原样转发规则。"
 }
 
@@ -10088,7 +10443,7 @@ do_land_cli() {
       if (( LAND_MODE )); then
         if [[ ${FWD_ON:-0} == 1 ]] && fwd_load "$FWD_LINK"; then
           info "测试 TCP 连接 ${FWD_H}:${FWD_P} ..."
-          tcp_probe "$FWD_H" "$FWD_P" && ok "TCP 连接成功。" || die "无法建立 TCP 到 ${FWD_H}:${FWD_P}。"
+          if tcp_probe "$FWD_H" "$FWD_P"; then ok "TCP 连接成功。"; else die "无法建立 TCP 到 ${FWD_H}:${FWD_P}。"; fi
         elif [[ -n $RELAY_LINK ]] && ss_parse "$RELAY_LINK"; then relay_test
         else die "尚未设置下一跳或原样转发。"; fi
       else
@@ -10522,22 +10877,40 @@ TIP
 
 menu_firewall() {
   need_installed
-  if (( LAND_MODE )); then land_menu_allow; return; fi
+  if (( LAND_MODE )); then
+    if [[ -n $OPT_FW_MODE ]]; then
+      warn "落地机不用这套入站防火墙（严格 / 只放行 / 关闭）。来源白名单请用 proxy allow。"
+      return 0
+    fi
+    land_menu_allow
+    return
+  fi
   if (( NAT_MODE )); then warn "NAT 模式不管理防火墙（入站由服务商端口映射控制）。"; menu_nat; return; fi
-  echo; hr; _green "  防火墙管理"; hr
+  if [[ -n $OPT_FW_MODE ]]; then
+    fw_switch_mode "$OPT_FW_MODE"
+    return 0
+  fi
+  echo; hr; _green "  防火墙管理（当前：$(fw_mode_label)）"; hr
   fw_print_allows
   hr
-  echo "  1) 放行额外 TCP 端口  2) 放行额外 UDP 端口  3) 取消额外放行  4) 重新检测 SSH 端口并重载  5) 停用本脚本防火墙  6) 启用本脚本防火墙  0) 返回"
-  local c p; ask c "请选择" "0"
+  echo "  1) 放行额外 TCP 端口  2) 放行额外 UDP 端口  3) 取消额外放行  4) 重新检测 SSH 并重载"
+  echo "  5) 切换为严格（入站默认拒绝）  6) 切换为只放行  7) 关闭本脚本防火墙  0) 返回"
+  local c p x; ask c "请选择" "0"
   case $c in
     1) ask p "TCP 端口（空格分隔）" ""; for x in $p; do is_port "$x" && EXTRA_TCP="${EXTRA_TCP:+$EXTRA_TCP }$x"; done ;;
     2) ask p "UDP 端口（空格分隔）" ""; for x in $p; do is_port "$x" && EXTRA_UDP="${EXTRA_UDP:+$EXTRA_UDP }$x"; done ;;
     3) EXTRA_TCP="" EXTRA_UDP="" ;;
-    4) : ;;
-    5) remove_firewall; FW_ENABLED=0; save_state; ok "已停用本脚本防火墙（入站不再过滤）。"; return 0 ;;
-    6) FW_ENABLED=1; handle_other_firewalls ;;
+    4) ;;
+    5) fw_switch_mode strict; return 0 ;;
+    6) fw_switch_mode allow; return 0 ;;
+    7) fw_switch_mode off; return 0 ;;
     *) return 0 ;;
   esac
+  if [[ ${FW_MODE:-off} == off || ${FW_ENABLED:-0} == 0 ]]; then
+    save_state
+    warn "防火墙是关闭的，改动已记下，但还没写入 nftables。要生效请选严格或只放行。"
+    return 0
+  fi
   save_state
   apply_firewall
   save_state
@@ -11420,7 +11793,11 @@ usage() {
                       源站证书不会打开订阅
   --no-cert           关闭已申请的证书，Hysteria2 / TUIC / AnyTLS 改回自签
                       开着的 CDN 线路一并关掉（不能改用自签）
-  --no-firewall       不配置 nftables 防火墙
+  --firewall <模式>   strict 入站默认拒绝 | allow 只放行（不接管入站）| off 不写 nftables
+                      不写时：干净机器默认 strict；检测到 Docker/Podman、WireGuard、
+                      已有防火墙或多个非标准端口时，交互安装默认推荐 allow，
+                      非交互安装直接用 allow。--no-firewall 同 off
+  --no-firewall       不配置 nftables 防火墙（同 --firewall off）
   --no-upgrade        跳过系统软件包升级
   --no-tune           跳过 sysctl 网络调优
   --tune-preset <名>  安装/调优使用的预设（默认 bbr-fq，见下方「网络调优」）
@@ -11507,6 +11884,8 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
   proxy speed         测速 / 延迟提示
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
+  proxy firewall strict|allow|off
+                      切换防火墙模式，不重装。strict 默认拒绝，allow 只放行，off 关闭
   proxy nat           NAT 信息 / 修改映射端口 / 端口跳跃
   proxy tune          网络调优（见上）
   proxy route         回程线路检测（电信 / 联通 / 移动，北京 / 上海 / 广州；不改配置、不重启）
@@ -11665,7 +12044,15 @@ parse_args() {
         [[ $OPT_SUB_PORT == 80 ]] && die "--sub-port 不能是 80（80 只用于证书申请的 HTTP-01）" ;;
       --cert) OPT_CERT=1 ;;
       --no-cert) OPT_CERT=0 ;;
-      --no-firewall) OPT_FIREWALL=0 ;;
+      --firewall)
+        [[ -n ${2-} ]] || die "--firewall 需要参数：strict、allow 或 off"
+        OPT_FW_MODE=$(fw_norm_mode "$2") || die "--firewall 参数无效: $2（strict、allow 或 off）"
+        OPT_FW_SET=1
+        shift ;;
+      --firewall=*)
+        OPT_FW_MODE=$(fw_norm_mode "${1#*=}") || die "--firewall 参数无效: ${1#*=}（strict、allow 或 off）"
+        OPT_FW_SET=1 ;;
+      --no-firewall) OPT_FW_MODE=off ;;
       --no-upgrade) OPT_UPGRADE=0 ;;
       --no-tune) OPT_TUNE=0 ;;
       --tune) OPT_TUNE=1 ;;
@@ -11737,7 +12124,15 @@ parse_args() {
       update-script) OPT_ACTION=update-script ;;
       status|log|logs) OPT_ACTION=status ;;
       speed) OPT_ACTION=speed ;;
-      firewall|fw) OPT_ACTION=firewall ;;
+      firewall|fw)
+        OPT_ACTION=firewall
+        case ${2-} in
+          strict|allow|allow-only|allowonly|gentle|off|none|disable|drop|on|enable)
+            OPT_FW_MODE=$(fw_norm_mode "$2") || die "proxy firewall 的参数无效: $2（strict、allow 或 off）"
+            shift ;;
+          ""|-*) ;;
+          *) die "proxy firewall 的参数只能是 strict、allow 或 off: $2" ;;
+        esac ;;
       nat) OPT_ACTION=nat ;;
       route|routes)
         OPT_ACTION=route
@@ -11769,7 +12164,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert
