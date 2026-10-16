@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 本文件由 build.sh 从 src/ 拼接生成。请改 src/ 后执行 ./build.sh，不要直接改本文件。
 #
 # proxy.sh —— VLESS + REALITY + Vision、VLESS + XHTTP + REALITY、Hysteria2 一键安装 / 管理脚本
 # 可选（默认不装）：Trojan + REALITY、TUIC v5、AnyTLS，以及需要自有域名和公开证书的

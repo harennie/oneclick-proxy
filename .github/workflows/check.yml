@@ -1,0 +1,19 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Committed proxy.sh matches build
+        run: bash build.sh --check
+      - name: shellcheck
+        run: shellcheck -s bash proxy.sh
+      - name: bash -n
+        run: bash -n proxy.sh
