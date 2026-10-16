@@ -1,8 +1,43 @@
 # oneclick proxy
 
-单文件 Bash 脚本，一键在 VPS 上安装代理节点，不需要自己的域名。有已经解析到本机的自有域名时，可以另外申请证书；不申请时，安装方式和现在一样。默认是 Let's Encrypt 单域名。也可以改成通配符、多域名、ZeroSSL，或只给 CDN 用的 Cloudflare 源站证书。证书签好之后，还可以另开两条给 CDN 用的线路（XHTTP+TLS、WebSocket+TLS），默认关闭，不替换 REALITY。
+单文件 Bash 脚本，一键在 VPS 上安装代理节点，不需要自己的域名。
+
+- 默认装好 VLESS + REALITY + Vision、VLESS + XHTTP + REALITY 和 Hysteria2，可选 Trojan、TUIC、AnyTLS 与 CDN 线路
+- 自动优选 REALITY 伪装站点，Hysteria2 支持端口跳跃；有域名时可以另外申请证书
+- 防火墙可严格默认拒绝，也可只放行代理端口；检测到 Docker 等环境时默认用温和模式，避免挡住现有服务
+- 支持 Debian / Ubuntu / RHEL 系（systemd）和 Alpine NAT（OpenRC），装完用 `proxy` 菜单管理
+- 可安装为落地机（Shadowsocks 2022），并用 `proxy route` 检测回程线路
 
 ## 一键安装
+
+**交互安装**（推荐，先下载再运行，可以看到菜单）
+
+```bash
+curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh
+```
+
+**全自动**（全部使用默认值，无任何交互）
+
+```bash
+curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh --auto
+```
+
+**Alpine NAT**（Alpine 没有自带 bash，必须带 `--nat`）
+
+```bash
+apk add bash curl && curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh && bash proxy.sh --nat
+```
+
+装完后执行 `proxy` 打开管理菜单，`proxy info` 查看链接 / 二维码 / Clash 配置。节点信息同时保存在 `/root/proxy-info.txt`（权限 600）。
+
+下面各节是完整说明，默认折叠。
+
+<details>
+<summary>一键安装</summary>
+
+## 一键安装
+
+单文件 Bash 脚本，一键在 VPS 上安装代理节点，不需要自己的域名。有已经解析到本机的自有域名时，可以另外申请证书；不申请时，安装方式和现在一样。默认是 Let's Encrypt 单域名。也可以改成通配符、多域名、ZeroSSL，或只给 CDN 用的 Cloudflare 源站证书。证书签好之后，还可以另开两条给 CDN 用的线路（XHTTP+TLS、WebSocket+TLS），默认关闭，不替换 REALITY。
 
 **推荐**：先下载再运行（可以看到交互菜单）
 
@@ -72,7 +107,8 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--zerossl-kid <id>` / `--zerossl-hmac <key>` | ZeroSSL 的 EAB 凭据，必须成对。在 <https://app.zerossl.com/developer> 生成 |
 | `--sub-port <端口>` | 订阅 HTTPS 端口，默认 8447（不能是 80，也不能占用已开启协议的 TCP 端口）。源站证书不会打开订阅 |
 | `--no-cert` | 关闭已申请的证书，Hysteria2 / TUIC / AnyTLS 改回自签。开着的 CDN 线路一并关掉（不能改用自签） |
-| `--no-firewall` | 不配置 nftables 防火墙 |
+| `--firewall <模式>` | `strict` 入站默认拒绝；`allow` 只放行代理端口和端口跳跃，不把入站改成默认拒绝，也不改 Docker 的表；`off` 不写 nftables。不写时：干净机器默认 `strict`；检测到 Docker/Podman、WireGuard、已有防火墙或多个非标准端口时，交互安装默认推荐 `allow`，非交互安装直接用 `allow` |
+| `--no-firewall` | 不配置 nftables 防火墙（同 `--firewall off`） |
 | `--no-upgrade` | 跳过系统软件包升级 |
 | `--no-tune` | 跳过 sysctl 调优 |
 | `--tune-preset <名>` | 安装时使用的调优预设（默认 `bbr-fq`），见「网络调优」 |
@@ -114,6 +150,11 @@ proxy proto
 
 ---
 
+</details>
+
+<details>
+<summary>默认协议</summary>
+
 ## 默认协议
 
 默认一次装好三个，都不需要自己的域名：
@@ -125,6 +166,11 @@ proxy proto
 可选协议默认不装：Trojan + REALITY、TUIC v5、AnyTLS，以及两条 CDN 线路（VLESS + XHTTP + TLS、VLESS + WebSocket + TLS）。安装时加 `--trojan`、`--tuic`、`--anytls`、`--xhttp-tls`、`--ws-tls`，或装完后用上面的 `proxy proto`。CDN 这两条还要有已经解析到本机的自有域名和公开证书。Shadowsocks 2022 只出现在落地机模式里。
 
 ---
+
+</details>
+
+<details>
+<summary>功能</summary>
 
 ## 功能
 
@@ -141,7 +187,7 @@ proxy proto
   - **安装后 REALITY 自检**：用已安装的 xray 在 127.0.0.1 随机端口起一个临时客户端，按生成的链接参数连接本机节点并访问外网，打印通过 / 未通过（不影响安装；更换 SNI 后也会自动自检）。临时客户端限制 `GOMEMLIMIT`，128MB 的 NAT 小鸡也能跑。
 - **REALITY 目标网站自动优选**（见下文「为什么 SNI 规则很重要」）。
 - **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。Cloudflare 源站证书不会交给 Hysteria2。
-- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，入站默认拒绝；放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有 HTTP-01（Let's Encrypt / ZeroSSL 的单域名或多域名）才额外放行 TCP 80。只有公开证书才放行订阅 HTTPS 端口。通配符 DNS-01 和 Cloudflare 源站证书不放行 80，源站证书也不开订阅。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时询问是否停用（卸载时可恢复）。不会关闭 SELinux（写入文件后执行 `restorecon`）。防火墙菜单、运行状态和安装结束时会逐行列出已经放行的端口，以及每一条属于哪个协议（Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS、CDN 的 XHTTP 与 WebSocket、订阅、证书申请的 TCP 80、SSH、端口跳跃，以及额外放行）。没写出来的新连接仍然拒绝。
+- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，不改 Docker / Podman 自己的表。模式为 `strict`（入站默认拒绝，干净机器的默认）、`allow`（只放行代理端口和端口跳跃，不接管入站策略；检测到 Docker/Podman、WireGuard 或其它 UDP、已有 nftables/iptables/ufw/firewalld，或多个非标准监听端口时，交互安装默认推荐它，非交互且未指定 `--firewall` 时直接用它）或 `off`（`--no-firewall`，不写规则）。严格模式放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有 HTTP-01（Let's Encrypt / ZeroSSL 的单域名或多域名）才额外放行 TCP 80。只有公开证书才放行订阅 HTTPS 端口。通配符 DNS-01 和 Cloudflare 源站证书不放行 80，源站证书也不开订阅。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时询问是否停用（卸载时可恢复）。不会关闭 SELinux（写入文件后执行 `restorecon`）。防火墙菜单、运行状态和安装结束时会逐行列出已经放行的端口，以及每一条属于哪个协议（Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS、CDN 的 XHTTP 与 WebSocket、订阅、证书申请的 TCP 80、SSH、端口跳跃，以及额外放行）。严格模式下，没写出来的新连接仍然拒绝；只放行模式不会丢掉其它端口。装好后可用 `proxy firewall strict`、`proxy firewall allow`、`proxy firewall off` 切换。
 - **fail2ban**：sshd 监狱，10 分钟内失败 5 次封禁 1 小时（systemd 日志后端 + nftables 动作）。
 - **XHTTP（默认开启）**：VLESS + XHTTP + REALITY。与 Vision 共用同一把 x25519、ShortId、SNI 和 ML-DSA-65 种子，单独监听 TCP 8443，`flow` 必须为空，路径为随机 `/` + 十六进制。服务端和客户端链接的 `mode` 都是 `stream-one`（REALITY 直连；客户端用 `auto` 时有已知握手失败）。不需要自己的域名，也不把自己的证书挂到 XHTTP 上。这条和下面的「XHTTP + TLS（CDN）」是两条入站，互不替换。
 - **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。Cloudflare 源站证书不会交给它们。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
@@ -153,6 +199,11 @@ proxy proto
 - **健壮性**：`set -o errexit -o pipefail -o errtrace` + 错误陷阱提示出错行；可重复运行（保留已有密钥，只更新组件与配置）；安装前检查端口占用；没有 IPv6 也能正常工作（链接使用 IPv4）；通过 shellcheck 检查。
 
 ---
+
+</details>
+
+<details>
+<summary>支持的系统</summary>
 
 ## 支持的系统
 
@@ -176,6 +227,11 @@ curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh 
 > ⚠️ 重装会**清空整块硬盘**；重装过程出现问题时需要通过服务商的 **VNC / 串口控制台** 处理，请提前确认能登录控制台并备份数据。
 
 ---
+
+</details>
+
+<details>
+<summary>NAT 小鸡模式（`--nat`）</summary>
 
 ## NAT 小鸡模式（`--nat`）
 
@@ -241,6 +297,11 @@ XHTTP 还需要第二条外部 TCP 端口（默认 8443，不能和 Vision 共�
 - **申请证书不可用，CDN 上的两条线路也不可用**。不管是 Let's Encrypt、ZeroSSL、通配符还是 Cloudflare 源站证书，都要求公网能访问到这台机器；NAT 小鸡通常没有这些映射。Alpine 在本脚本里始终是 NAT，因此也不能申请、也不能开这两条。已经申请过证书再切到 NAT 时，证书会关掉，CDN 线路停止，Hysteria2 / TUIC / AnyTLS 改回自签。不带证书参数、`--xhttp-tls`、`--ws-tls` 时不会询问，安装输出与现在相同。
 
 ---
+
+</details>
+
+<details>
+<summary>网络调优（`proxy tune`）</summary>
 
 ## 网络调优（`proxy tune`）
 
@@ -322,6 +383,11 @@ proxy tune apply --tune-cc bbr --tune-qdisc cake --tune-bw 1000 --tune-rtt 180
 - 首次应用前把所有相关参数的原值备份到 `/root/.proxy-oneclick/tune/backup.env`（之后换预设不会覆盖备份）；`proxy tune restore` 还原原值、网卡队列，删除配置文件与开机服务。卸载时自动执行同样的恢复。没有备份时，恢复会删掉该配置文件并重新加载系统 sysctl，其余参数回到内核默认值。
 
 ---
+
+</details>
+
+<details>
+<summary>落地机 / 落地转发</summary>
 
 ## 落地机 / 落地转发
 
@@ -468,6 +534,11 @@ proxy land-del
 
 ---
 
+</details>
+
+<details>
+<summary>为什么 SNI（REALITY 目标网站）规则很重要</summary>
+
 ## 为什么 SNI（REALITY 目标网站）规则很重要
 
 REALITY 会把未通过认证的连接原样转发给「目标网站」，同时借用它的 TLS 特征。选错目标会让节点更容易被识别或者干脆不可用。脚本按以下规则在 **VPS 上实时检测** 每个候选：
@@ -484,6 +555,11 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 检测通过的候选会列出前几名（TCP 延迟、TLS 握手时间、IP 归属），默认选第一名，也可以手动输入域名（同样会检测，不合格时需二次确认）。高级选项 `--scan` 会下载官方 RealiTLScanner，对 VPS 附近 IP 做 60 秒低并发扫描，找出同机房的 TLS1.3 + h2 站点后再走同样的检测流程；扫描可能被少数服务商视为端口扫描，请自行权衡。
 
 ---
+
+</details>
+
+<details>
+<summary>客户端配置</summary>
 
 ## 客户端配置
 
@@ -523,6 +599,11 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 没有自有域名时，Hysteria2 / TUIC / AnyTLS 仍是上面的自签证书（`insecure`、`pinSHA256`、`skip-cert-verify`）。申请公开证书之后，这三条的地址和 SNI 改为你的域名，按正常证书校验，不要再开允许不安全。Cloudflare 源站证书不会交给这三条，它们仍用自签。REALITY / XHTTP / Trojan 始终借用伪装站点，不使用这张证书。CDN 上的 XHTTP+TLS / WebSocket+TLS 使用公开证书或源站证书。见下文「申请证书」和「经过 CDN 的两条线路」。
 
 ---
+
+</details>
+
+<details>
+<summary>申请证书</summary>
 
 ## 申请证书
 
@@ -620,6 +701,11 @@ NAT 模式和落地机不能申请任何一种。不带证书参数时，这些�
 
 ---
 
+</details>
+
+<details>
+<summary>经过 CDN 的两条线路</summary>
+
 ## 经过 CDN 的两条线路
 
 默认关闭，也不替换 REALITY、XHTTP+REALITY、Hysteria2、Trojan、TUIC、AnyTLS。两条都不是 REALITY：客户端连你自己的域名，CDN 再回源到本机的独立端口，本机用已经签好的证书终止 TLS。默认是公开证书。只给这两条用、并且开着橙色云朵时，可以改成 Cloudflare 源站证书；那张证书不能给 Hysteria2、TUIC、AnyTLS 或订阅。
@@ -673,6 +759,49 @@ NAT 模式和落地机不能开。没有证书（公开证书或源站证书）�
 
 ---
 
+</details>
+
+<details>
+<summary>防火墙模式</summary>
+
+## 防火墙模式
+
+普通模式会配置 nftables，表名固定为 `inet proxy_oneclick`。只删除和重写这张表，以及旧内核上端口跳跃用的 `ip` / `ip6` `proxy_oneclick_nat`。不会 `flush` 整个规则集，也不会改 Docker、Podman 自己的表和链。
+
+| 模式 | 行为 |
+|---|---|
+| `strict` | 入站默认拒绝。放行回环、已建立连接、ICMP、探测到的 SSH 端口、当前协议端口和 Hysteria2 端口跳跃。干净机器上的默认，也是原来的行为。 |
+| `allow` | 只放行。给代理端口、SSH 和端口跳跃写 accept，链策略保持 accept，优先级放在常见 filter 之后，不把入站改成默认拒绝。Docker 发布端口、WireGuard、其它 UDP 和已经存在的防火墙不会被这张表丢掉。 |
+| `off` | 不写 nftables。`--no-firewall` 与此相同。 |
+
+```bash
+bash proxy.sh --auto --firewall strict
+bash proxy.sh --auto --firewall allow
+bash proxy.sh --firewall off
+```
+
+不写 `--firewall` 时，安装会先看这台机器：Docker 或 Podman（含 iptables-nft 里的转发链和发布端口）、WireGuard 或其它 UDP 监听、已经存在的 nftables / iptables / ufw / firewalld，以及多个非标准对外端口。有这些情况时，交互安装默认推荐「只放行」，并写明原因；干净机器默认仍是「严格」。`--auto` 且没有写 `--firewall` 时，发现上述情况就直接用 `allow`，否则用 `strict`。显式写了 `--firewall strict` 时按严格模式执行，并提示可能受影响的服务。
+
+SSH：严格模式在加载前探测 SSH 端口（`sshd -T`、配置文件、正在监听的 sshd、ssh.socket、当前会话端口）。探测不到时至少放行 22，并且先放行已建立连接。规则里如果缺了当前 SSH 端口，会改成只放行而不是加载默认拒绝。`allow` 和 `off` 不改入站策略，本来就不会把 SSH 关在外面。
+
+检测到 firewalld / ufw 时，只有选择严格模式才会询问是否停用（卸载时可恢复）。只放行模式留着它们，需要的端口还要在那边放行。
+
+装好之后切换，不重装：
+
+```bash
+proxy firewall
+proxy firewall strict
+proxy firewall allow
+proxy firewall off
+```
+
+菜单「防火墙管理」里是同样的三项。卸载会删掉本脚本的表和 `proxy-oneclick-fw` 服务。NAT 模式不使用这套入站防火墙。落地机的来源白名单仍是单独的表 `inet proxy_oneclick_land`，只限制落地端口的来源，不是默认拒绝。
+
+</details>
+
+<details>
+<summary>⚠️ 云服务商防火墙</summary>
+
 ## ⚠️ 云服务商防火墙
 
 脚本只能管理系统内的 nftables。安装结束、修改端口、`proxy firewall` 和 `proxy status` 会列出本机已经放行的端口，以及每一条属于哪个协议。云安全组要放行同一份。**AWS EC2 / Lightsail、Google Cloud、Oracle Cloud、Azure、阿里云、腾讯云** 等还有控制台层面的安全组 / 防火墙，请手动放行：
@@ -689,6 +818,11 @@ Oracle Cloud 的官方镜像还自带 iptables 规则，如仍不通请一并检
 NAT 小鸡不需要放行这些端口：只要在服务商面板里建好对应的端口映射（Reality + Hysteria2 共用端口时协议选「全部 / TCP+UDP」），脚本结束时会列出「公网端口 → 本机端口」对照表。
 
 ---
+
+</details>
+
+<details>
+<summary>回程线路检测</summary>
 
 ## 回程线路检测
 
@@ -708,6 +842,11 @@ proxy route verbose    # 额外打印每一跳。可以和上面几项写在一�
 
 ---
 
+</details>
+
+<details>
+<summary>常用维护</summary>
+
 ## 常用维护
 
 **菜单**
@@ -720,7 +859,7 @@ proxy
 █▀▀▀█ █▀▀▀█
 █ 哈 █ █ 人 █
 █▄▄▄█ █▄▄▄█
-oneclick proxy  ·····  v1.4.0
+oneclick proxy  ·····  v1.5.0
 
 IP        ▶ …              Xray      ▶ …
 Hysteria2 ▶ …              sing-box  ▶ 未安装
@@ -790,7 +929,15 @@ proxy status
 proxy firewall
 ```
 
-`proxy firewall` 先列出每个已放行端口和它的协议，再提供放行、重载或停用。`proxy status` 里是同一份列表；选「查看 nftables 原文」才是规则原文。入站仍然默认拒绝。
+`proxy firewall` 先列出每个已放行端口和它的协议，再提供放行、重载，或在严格 / 只放行 / 关闭之间切换。也可以直接：
+
+```bash
+proxy firewall strict
+proxy firewall allow
+proxy firewall off
+```
+
+`proxy status` 里是同一份列表；选「查看 nftables 原文」才是规则原文。严格模式入站默认拒绝。只放行模式只添加 accept，不把入站改成默认拒绝。
 
 **BBR 状态、到 SNI 的延迟、下载测速**（Cloudflare / CacheFly / OVH 自动切换）
 
@@ -876,6 +1023,11 @@ proxy allow
 
 ---
 
+</details>
+
+<details>
+<summary>卸载</summary>
+
 ## 卸载
 
 **交互确认**
@@ -893,6 +1045,11 @@ proxy uninstall --auto
 会移除：Xray、Hysteria2（含 hysteria 用户）、sing-box（若装过 TUIC / AnyTLS）、nftables 表与 systemd 单元、sysctl / limits / journald 配置（并恢复调优前的参数值）、fail2ban 规则、`proxy` 命令、节点信息；可选择是否删除密钥与备份目录；安装时被停用的 firewalld / ufw 会询问是否恢复。安装时创建的 `/swapfile` 会保留（附删除方法）。NAT 模式还会移除 OpenRC 服务脚本、日志目录、端口跳跃规则，并恢复 `--dns64` 修改前的 `/etc/resolv.conf`。落地机还会移除白名单规则表、原样转发 DNAT 与对应开机服务，并恢复原样转发改过的 IP 转发开关。若申请过证书，还会停掉订阅和续期、删除证书副本与订阅文件、CDN 标记和交给 Xray 的那份证书副本，并删除 certbot 里名为 `proxy-oneclick` 的那张证书；不卸载 certbot 软件包。最后别忘了在云控制台关闭不再需要的端口。
 
 ---
+
+</details>
+
+<details>
+<summary>已知限制</summary>
 
 ## 已知限制
 
@@ -917,8 +1074,14 @@ proxy uninstall --auto
 - CDN 上的 XHTTP+TLS / WebSocket+TLS 需要自有域名，以及公开证书或 Cloudflare 源站证书，还有 Cloudflare 允许代理的回源端口。源站证书只有 Cloudflare 信任，不能给浏览器和直连客户端。NAT / Alpine / 落地机不能开。域名开了橙色云朵后，不要再用这个名字连接 Hysteria2、TUIC 或订阅。
 - XHTTP 走 CDN 时用 `packet-up`。`stream-one` 只用于直连的 XHTTP+REALITY。WebSocket 需要 CDN 打开 WebSockets，路径必须和链接里逐字相同。
 - `proxy route` 只测从本机发向大陆运营商的回程。它不能代替在自己电脑上做的去程。测试节点和骨干地址特征会变，线路名称只供参考。
+- 严格防火墙会挡住没有写进放行列表的端口，包括 Docker / Podman 发布端口、WireGuard 和其它 UDP。这类机器用 `allow`（只放行）。只放行不修改入站默认策略，也不改 Docker / Podman 自己的表和链。卸载会删掉本脚本的表 `inet proxy_oneclick`，不会清空整个规则集。
 
 ---
+
+</details>
+
+<details>
+<summary>更新日志</summary>
 
 ## 更新日志
 
@@ -928,3 +1091,6 @@ proxy uninstall --auto
 - 加密转发（落地机上的 `proxy land-add 'ss://...'`，以及 `land-on` / `land-off` / `land-del`）：本机仍用自己的 SS2022 接上一跳，白名单来源再拨到下一跳的 SS2022，不装 hy2-relay。交给上一台的是本机自己的 `ss://`；下一跳链接单独打印。中转机上的 `land-add` 行为不变。从中转机改装成落地机时不会沿用原来的中转链接；已经是落地机时重新安装会保留下一跳。
 - 原样转发（`proxy land-forward 'ss://...'` / `land-raw`）：不解密、不再加密。把本机落地端口的 TCP 和 UDP DNAT 到链接里的主机和端口，回程做 masquerade。上一跳链接用本机地址和对外端口，加上最终落地的加密方式与密钥；最终机器的地址单独标出。白名单为空，或没有与目标同族的地址时拒绝安装，不会留下开放的 DNAT。Xray 不监听该端口。`land-forward-off` / `land-forward-del`（以及 `land-raw-off` / `land-raw-del`）只动这一项。出站策略（`--outbound`）同样约束目标地址族。
 - `proxy land-off` 在落地机上停用当前的加密转发或原样转发，并保留链接。切回本机直连或另一种出口时，会拆掉当前这一种。
+
+</details>
+
