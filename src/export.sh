@@ -35,7 +35,9 @@ export_put() { # $1 源文件 $2 包内相对路径
 export_have_tty() { # /dev/tty 打得开、并且真是终端
   local fd
   [[ -r /dev/tty && -w /dev/tty ]] || return 1
-  exec {fd}</dev/tty || return 1
+  # 打开失败时 bash 会写「/dev/tty: No such device or address」。
+  # 重定向从左到右生效，所以不能写成 exec {fd}</dev/tty 2>/dev/null。
+  { exec {fd}</dev/tty; } 2>/dev/null || return 1
   if [[ -t $fd ]]; then
     exec {fd}<&-
     return 0
