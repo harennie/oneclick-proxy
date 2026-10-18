@@ -24,6 +24,9 @@
 #                                 # 这两条默认带 VLESS Encryption；--no-vless-enc 不加，proxy vless-enc on|off|rotate
 #   bash proxy.sh route           # 回程线路检测（不改配置）
 #   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
+#   bash proxy.sh proto           # 协议开关（菜单第 16 项「协议开关」）
+#                                 # 默认 Vision、XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC / AnyTLS
+#   proxy proto xhttp-443 on|off  # Vision 与 XHTTP 共用 / 分开 TCP 端口
 #   bash proxy.sh --help          # 查看全部参数
 #   bash proxy.sh --xray-ver v26.3.27 --hy2-ver v2.6.1 --singbox-ver v1.11.0
 #                                 # 安装指定的已发布版本

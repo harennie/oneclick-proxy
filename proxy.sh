@@ -25,6 +25,9 @@
 #                                 # 这两条默认带 VLESS Encryption；--no-vless-enc 不加，proxy vless-enc on|off|rotate
 #   bash proxy.sh route           # 回程线路检测（不改配置）
 #   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
+#   bash proxy.sh proto           # 协议开关（菜单第 16 项「协议开关」）
+#                                 # 默认 Vision、XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC / AnyTLS
+#   proxy proto xhttp-443 on|off  # Vision 与 XHTTP 共用 / 分开 TCP 端口
 #   bash proxy.sh --help          # 查看全部参数
 #   bash proxy.sh --xray-ver v26.3.27 --hy2-ver v2.6.1 --singbox-ver v1.11.0
 #                                 # 安装指定的已发布版本
@@ -369,7 +372,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;719:src/os.sh:1;1228:src/tune.sh:1;2028:src/xray.sh:1;4051:src/hy2.sh:1;4190:src/firewall.sh:1;5448:src/cert.sh:1;7480:src/cdn.sh:1;8465:src/link.sh:1;8854:src/singbox.sh:1;9432:src/nat.sh:1;10070:src/selftest.sh:1;10215:src/land.sh:1;11661:src/menu.sh:1;12234:src/route.sh:1;12749:src/export.sh:1;12965:src/doctor.sh:1;13300:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;722:src/os.sh:1;1231:src/tune.sh:1;2031:src/xray.sh:1;4054:src/hy2.sh:1;4193:src/firewall.sh:1;5451:src/cert.sh:1;7483:src/cdn.sh:1;8468:src/link.sh:1;8857:src/singbox.sh:1;9435:src/nat.sh:1;10073:src/selftest.sh:1;10218:src/land.sh:1;11664:src/menu.sh:1;12237:src/route.sh:1;12752:src/export.sh:1;12968:src/doctor.sh:1;13303:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -13613,10 +13616,12 @@ usage() {
   --force-sni         与 --sni 一起使用：检测不通过也强制使用
   --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
-  --no-hy2            不安装 Hysteria2
+  --hy2 / --no-hy2    安装 / 不安装 Hysteria2（默认安装）
   --hy2-port <端口>   Hysteria2 UDP 端口（默认 443）
-  --no-reality        不启用 VLESS + REALITY + Vision（默认启用）
-  --no-xhttp          不启用 VLESS + XHTTP + REALITY（默认启用，免自己的域名）
+  --reality / --no-reality
+                      开启 / 关闭 VLESS + REALITY + Vision（默认开启）
+  --xhttp / --no-xhttp
+                      开启 / 关闭 VLESS + XHTTP + REALITY（默认开启，免自己的域名）
   --xhttp-port <端口> XHTTP 的 TCP 端口（默认 8443；NAT 模式为外部端口）
   --xhttp-on-443      XHTTP 与 Vision 共用同一个 TCP 端口（默认仍是分开的 8443）
   --no-xhttp-on-443   XHTTP 使用单独端口
@@ -13633,12 +13638,14 @@ usage() {
                       需要 --cert-domain。不替换 REALITY，也不要把 REALITY 放进 CDN
   --no-xhttp-tls      关闭这条 CDN 线路
   --xhttp-tls-port <端口>  回源端口（默认 2083，须是 Cloudflare 允许的 HTTPS 端口）
-  --ws-tls            额外启用 VLESS + WebSocket + TLS（放在 CDN 后面，默认不装）
-  --no-ws-tls         关闭这条 CDN 线路
+  --ws-tls / --ws     额外启用 VLESS + WebSocket + TLS（放在 CDN 后面，默认不装）
+  --no-ws-tls / --no-ws
+                      关闭这条 CDN 线路
   --ws-port <端口>    回源端口（默认 2087）
-  --no-vless-enc      两条 CDN 线路不加 VLESS Encryption（默认加，ML-KEM-768 + X25519，
-                      Cloudflare 只看到密文）。sing-box 内核的客户端可能不支持时用它
+  --vless-enc         两条 CDN 线路加 VLESS Encryption（默认就是加，ML-KEM-768 + X25519）
+  --no-vless-enc      不加。sing-box 内核的客户端可能不支持时用它；不加时 Cloudflare 能看到明文 VLESS
   --hop <a-b|none>    Hysteria2 端口跳跃范围（默认 20000-50000，none 关闭）
+  --no-hop            关闭端口跳跃（同 --hop none）
   --name <名称>       节点名称（默认 国家-城市）
   --cert-domain <域名>  可选：为自有域名申请证书。不写 --cert-kind 时是
                       Let's Encrypt 单域名 HTTP-01（默认）。订阅只走 HTTPS；
@@ -13745,7 +13752,10 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy cdn           查看 CDN 线路教程并复查（XHTTP+TLS / WebSocket+TLS）
   proxy vless-enc     查看 CDN 线路的 VLESS Encryption。on / off 开关，rotate 换新钥匙
                       只重写 Xray 并刷新链接和订阅，不重装；REALITY 等不变
-  proxy proto         单独打开或关闭协议（不删除已有密钥）
+  proxy proto         协议开关（菜单第 16 项）。逐个开/关，不删除已有密钥
+                      默认开：Vision、XHTTP+REALITY、Hysteria2
+                      默认关：Trojan、TUIC、AnyTLS，以及 CDN 的 XHTTP+TLS / WebSocket+TLS
+                      Vision 和 XHTTP 都开着时，菜单里的 s 切换是否共用 TCP 端口
   proxy proto xhttp-443 on|off
                       XHTTP 与 Vision 共用 / 分开 TCP 端口
   proxy sni           重新优选 / 更换 SNI
