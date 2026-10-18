@@ -38,7 +38,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.6.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -67,6 +67,8 @@ readonly SB_RC="/etc/init.d/sing-box"
 readonly SB_LOG="/var/log/sing-box/sing-box.log"
 readonly FW_FILE="${STATE_DIR}/firewall.nft"
 readonly FW_UNIT="/etc/systemd/system/proxy-oneclick-fw.service"
+# 写进 ufw / firewalld 的条目。只删除这份清单里的规则，不动用户原来就有的放行。
+readonly FW_HOST_FILE="${STATE_DIR}/fw-host.list"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-proxy-tune.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-proxy-tune.conf"
 readonly SYSTEMD_LIMITS_FILE="/etc/systemd/system.conf.d/99-proxy-tune.conf"
@@ -534,7 +536,7 @@ take_lock() {
 # ----------------------------- 状态持久化 -----------------------------
 # 持久化的键
 STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY MLDSA_ON SNI SNI_TARGET
-            HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED FW_MODE SSH_PORTS
+            HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED FW_MODE FW_HOST_SYNC SSH_PORTS
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
             HOP_BACKEND VIRT DNS64_SET
@@ -550,7 +552,7 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
             CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
-HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" SSH_PORTS=""
+HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" FW_HOST_SYNC=0 SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
 # 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。
 REALITY_ENABLED=1
@@ -3750,13 +3752,20 @@ fw_decide_install() {
   case $FW_MODE in
     off)
       FW_ENABLED=0
-      if [[ -f $FW_FILE || -f $FW_UNIT ]] || fw_table_loaded; then
+      FW_HOST_SYNC=0
+      if [[ -f $FW_FILE || -f $FW_UNIT || -s ${FW_HOST_FILE:-} ]] || fw_table_loaded; then
         info "不配置防火墙，移除本脚本已有的 nftables 规则 ..."
         remove_firewall
       fi
       ;;
     allow)
       FW_ENABLED=1
+      if fw_ufw_active || fw_firewalld_active; then
+        FW_HOST_SYNC=1
+        info "检测到 ufw 或 firewalld。只放行模式会把代理端口写进去，否则它们的默认拒绝仍会挡住这些端口。"
+      else
+        FW_HOST_SYNC=0
+      fi
       ;;
     *)
       FW_MODE=strict
@@ -3774,15 +3783,17 @@ fw_decide_install() {
 fw_switch_mode() { # strict|allow|off。已安装后从菜单或 proxy firewall 调用
   case $1 in
     off)
+      FW_HOST_SYNC=0
       remove_firewall
       FW_MODE=off
       FW_ENABLED=0
       save_state
-      ok "已关闭本脚本防火墙（没有改系统其它规则）。"
+      ok "已关闭本脚本防火墙（没有改系统其它规则，写入 ufw / firewalld 的放行也已去掉）。"
       ;;
     allow)
       FW_MODE=allow
       FW_ENABLED=1
+      if fw_ufw_active || fw_firewalld_active; then FW_HOST_SYNC=1; else FW_HOST_SYNC=0; fi
       save_state
       apply_firewall
       save_state
@@ -3794,8 +3805,12 @@ fw_switch_mode() { # strict|allow|off。已安装后从菜单或 proxy firewall 
       if (( ! FW_ENABLED )); then
         FW_MODE=off
         save_state
+        fw_host_sync
+        fw_print_allows
+        save_state
         return 0
       fi
+      FW_HOST_SYNC=0
       ask_extra_ports
       save_state
       apply_firewall
@@ -3825,18 +3840,22 @@ fw_rules_cover_ssh() { # $1 nft 文件
 
 handle_other_firewalls() {
   local fw
+  FW_HOST_SYNC=0
   for fw in firewalld ufw; do
     if svc_active "$fw" || { [[ $fw == ufw ]] && have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; }; then
       warn "检测到 ${fw} 正在运行。严格模式会把入站改成默认拒绝，和它叠在一起容易互相挡住。"
       if confirm "是否停用 ${fw}（严格模式由本脚本放行 SSH 和现有端口；卸载时可恢复）？" y; then
+        fw_host_clear
         [[ $fw == ufw ]] && { ufw --force disable >/dev/null 2>&1 || true; }
         systemctl disable --now "$fw" >/dev/null 2>&1 || true
         [[ " $DISABLED_FW " == *" $fw "* ]] || DISABLED_FW="${DISABLED_FW:+$DISABLED_FW }$fw"
         ok "已停用 ${fw}（卸载本脚本时可恢复）。"
       else
-        warn "保留 ${fw}，已取消严格模式。可改用「只放行」（proxy firewall allow），或在 ${fw} 里自行放行代理端口。"
+        warn "保留 ${fw}，已取消严格模式。代理端口会写入 ${fw}，否则它的默认拒绝会一直挡住这些端口。"
+        remove_nft_rules
         FW_ENABLED=0
         FW_MODE=off
+        FW_HOST_SYNC=1
         return 0
       fi
     fi
@@ -3948,7 +3967,16 @@ apply_firewall() {
     off) FW_ENABLED=0 ;;
     allow|strict) FW_ENABLED=1 ;;
   esac
-  (( FW_ENABLED )) || { warn "已跳过防火墙配置（--no-firewall、--firewall off，或保留了其它防火墙）。"; return 0; }
+  if (( ! FW_ENABLED )); then
+    if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+      fw_host_sync
+      fw_print_allows
+      return 0
+    fi
+    fw_host_clear
+    warn "已跳过防火墙配置（--no-firewall、--firewall off，或保留了其它防火墙）。"
+    return 0
+  fi
   [[ ${FW_MODE:-strict} == allow ]] || FW_MODE=strict
   step "配置 nftables 防火墙（$(fw_mode_label)）"
   have nft || die "未安装 nftables。"
@@ -3956,6 +3984,7 @@ apply_firewall() {
   if [[ $FW_MODE == strict && -z ${SSH_PORTS// } ]]; then
     warn "没有检测到 SSH 端口，已改为只放行模式，避免把登录关在外面。"
     FW_MODE=allow
+    if fw_ufw_active || fw_firewalld_active; then FW_HOST_SYNC=1; fi
   fi
   mkdir -p "$STATE_DIR"
   render_firewall
@@ -3963,6 +3992,7 @@ apply_firewall() {
     warn "严格模式的规则没有包含全部 SSH 端口，已改为只放行模式，避免把登录关在外面。"
     FW_MODE=allow
     FW_ENABLED=1
+    if fw_ufw_active || fw_firewalld_active; then FW_HOST_SYNC=1; fi
     render_firewall
   fi
   if ! render_firewall_compat; then
@@ -4007,11 +4037,12 @@ UNIT
   else
     ok "nftables 规则已加载（入站默认拒绝）。"
   fi
+  if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then fw_host_sync; else fw_host_clear; fi
   fw_print_allows
 }
 
-remove_firewall() {
-  # 只删本脚本的表和服务。不 flush ruleset，不碰 Docker / Podman / 系统其它链。
+# 只卸 nftables 表和服务，不动 ufw / firewalld 里已经同步的放行
+remove_nft_rules() {
   if [[ $INIT_SYS == systemd ]]; then systemctl disable --now proxy-oneclick-fw >/dev/null 2>&1 || true; fi
   if have nft; then
     nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
@@ -4020,6 +4051,13 @@ remove_firewall() {
   fi
   rm -f "$FW_UNIT" "$FW_FILE"
   sd_reload
+}
+remove_firewall() {
+  # 只删本脚本的表和服务。不 flush ruleset，不碰 Docker / Podman / 系统其它链。
+  # 同时删掉曾经写入 ufw / firewalld 的放行（只删清单里的条目）。
+  fw_host_clear
+  FW_HOST_SYNC=0
+  remove_nft_rules
 }
 
 # ============================================================
@@ -4215,6 +4253,166 @@ fw_allow_row() { # $1 协议名 $2 tcp|udp $3 端口或范围
   FW_ALLOW_SEEN+=" ${fam,,}/${port}"
   printf '  %s  %s  %s\n' "$(ui_pad "$name" 22)" "$(ui_pad "${fam^^}" 4)" "$port"
 }
+# 收集当前要放行的端口。范围用短横线，后面按防火墙自己的写法转换。
+fw_want_has() { printf '%s\n' "$FW_WANT" | grep -Fxq -- "$1"; }
+fw_want_add() {
+  local fam=$1 port=$2 key
+  [[ -n $port && $port != 0 ]] || return 0
+  fam=${fam,,}
+  key="${fam} ${port}"
+  fw_want_has "$key" && return 0
+  if [[ -n $FW_WANT ]]; then FW_WANT+=$'\n'"$key"; else FW_WANT=$key; fi
+}
+fw_collect_want() {
+  local p seg
+  FW_WANT=""
+  (( ${REALITY_ENABLED:-0} == 1 )) && fw_want_add tcp "$XRAY_PORT"
+  (( ${XHTTP_ENABLED:-0} == 1 )) && fw_want_add tcp "$XHTTP_PORT"
+  (( ${HY2_ENABLED:-0} == 1 )) && fw_want_add udp "$HY2_PORT"
+  (( ${TROJAN_ENABLED:-0} == 1 )) && fw_want_add tcp "$TROJAN_PORT"
+  (( ${TUIC_ENABLED:-0} == 1 )) && fw_want_add udp "$TUIC_PORT"
+  (( ${ANYTLS_ENABLED:-0} == 1 )) && fw_want_add tcp "$ANYTLS_PORT"
+  (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && fw_want_add tcp "$XHTTP_TLS_PORT"
+  (( ${WS_ENABLED:-0} == 1 )) && fw_want_add tcp "$WS_PORT"
+  cert_is_public && fw_want_add tcp "$SUB_PORT"
+  for p in $SSH_PORTS; do fw_want_add tcp "$p"; done
+  if (( ${HY2_ENABLED:-0} == 1 )) && [[ -n ${HOP_RANGE:-} ]]; then
+    for seg in ${HOP_RANGE//,/ }; do fw_want_add udp "$seg"; done
+  fi
+  for p in ${EXTRA_TCP-}; do fw_want_add tcp "$p"; done
+  for p in ${EXTRA_UDP-}; do fw_want_add udp "$p"; done
+}
+# ufw 编号规则里，只删带本脚本注释的那一条
+# 按整条端口匹配，避免 443 命中 8443
+fw_ufw_line_ours() { # $1 = 443/tcp 或 20000:50000/udp
+  grep -E "(^|[^0-9:])${1}([^0-9:]|$)" | grep -F 'proxy-oneclick'
+}
+fw_ufw_delete_ours() {
+  local spec=$1 n i
+  have ufw || return 0
+  for i in 1 2 3 4 5 6 7 8; do
+    n=$(ufw status numbered 2>/dev/null | fw_ufw_line_ours "$spec" | head -n1 | sed -n 's/^[[:space:]]*\[ *\([0-9][0-9]*\)\].*/\1/p') || true
+    [[ -n $n ]] || return 0
+    ufw --force delete "$n" >/dev/null 2>&1 || return 0
+  done
+}
+fw_ufw_ours_present() {
+  ufw status 2>/dev/null | fw_ufw_line_ours "$1" >/dev/null
+}
+fw_fwd_zone() {
+  local z
+  z=$(firewall-cmd --get-default-zone 2>/dev/null) || z=""
+  [[ -n $z ]] || z=public
+  printf '%s' "$z"
+}
+fw_fwd_reload() {
+  firewall-cmd --reload >/dev/null 2>&1 || warn "firewalld 重载失败，刚写入的端口可能还没生效。"
+}
+fw_line_has() { printf '%s\n' "$1" | grep -Fxq -- "$2"; }
+# 按记录文件删掉以前写进去的 ufw / firewalld 规则
+fw_host_clear() {
+  [[ -s ${FW_HOST_FILE:-} ]] || return 0
+  local kind a b c reload=0
+  while read -r kind a b c _; do
+    [[ -n $kind ]] || continue
+    case $kind in
+      ufw) fw_ufw_delete_ours "${b}/${a}" ;;
+      firewalld)
+        have firewall-cmd || continue
+        firewall-cmd --permanent --zone="$a" --remove-port="${c}/${b}" >/dev/null 2>&1 || true
+        reload=1
+        ;;
+    esac
+  done <"$FW_HOST_FILE"
+  (( reload )) && fw_fwd_reload
+  rm -f "$FW_HOST_FILE"
+  return 0
+}
+# allow，或用户选择保留 ufw/firewalld 时，把代理端口写进正在运行的防火墙
+fw_host_sync() {
+  if ! fw_ufw_active && ! fw_firewalld_active; then
+    [[ -s ${FW_HOST_FILE:-} ]] && fw_host_clear
+    return 0
+  fi
+  if [[ ${FW_HOST_SYNC:-0} != 1 ]]; then
+    fw_host_clear
+    return 0
+  fi
+  fw_collect_want
+  local old="" kind a b c key spec proto port uport line
+  local new="" reload=0 ufw_on=0 fwd_on=0 zone=""
+  [[ -f $FW_HOST_FILE ]] && old=$(cat "$FW_HOST_FILE")
+  fw_ufw_active && ufw_on=1
+  if fw_firewalld_active; then fwd_on=1; zone=$(fw_fwd_zone); fi
+  if [[ -n $old ]]; then
+    while read -r kind a b c _; do
+      [[ -n $kind ]] || continue
+      case $kind in
+        ufw)
+          key="${a} ${b//:/-}"
+          if (( ! ufw_on )) || ! fw_want_has "$key"; then fw_ufw_delete_ours "${b}/${a}"; fi
+          ;;
+        firewalld)
+          key="${b} ${c}"
+          if (( ! fwd_on )) || [[ $a != "$zone" ]] || ! fw_want_has "$key"; then
+            firewall-cmd --permanent --zone="$a" --remove-port="${c}/${b}" >/dev/null 2>&1 || true
+            reload=1
+          fi
+          ;;
+      esac
+    done <<<"$old"
+  fi
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    proto=${line%% *}
+    port=${line#* }
+    if (( ufw_on )); then
+      uport=${port//-/:}
+      spec="${uport}/${proto}"
+      if fw_ufw_ours_present "$spec"; then
+        new+="ufw ${proto} ${uport}"$'\n'
+      elif ufw allow "$spec" comment proxy-oneclick >/dev/null 2>&1; then
+        new+="ufw ${proto} ${uport}"$'\n'
+      else
+        warn "写入 ufw 失败：${spec}"
+      fi
+    fi
+    if (( fwd_on )); then
+      if firewall-cmd --permanent --zone="$zone" --query-port="${port}/${proto}" >/dev/null 2>&1; then
+        fw_line_has "$old" "firewalld ${zone} ${proto} ${port}" && new+="firewalld ${zone} ${proto} ${port}"$'\n'
+      elif firewall-cmd --permanent --zone="$zone" --add-port="${port}/${proto}" >/dev/null 2>&1; then
+        new+="firewalld ${zone} ${proto} ${port}"$'\n'
+        reload=1
+      else
+        warn "写入 firewalld 失败：${port}/${proto}"
+      fi
+    fi
+  done <<<"$FW_WANT"
+  (( reload )) && fw_fwd_reload
+  mkdir -p "$STATE_DIR"
+  if [[ -n $new ]]; then
+    printf '%s' "$new" >"$FW_HOST_FILE"
+    chmod 600 "$FW_HOST_FILE"
+    ok "已把代理端口同步到正在运行的 ufw / firewalld。"
+  else
+    rm -f "$FW_HOST_FILE"
+  fi
+  return 0
+}
+fw_print_host_sync() {
+  [[ -s ${FW_HOST_FILE:-} ]] || return 0
+  local kind a b c ufw_s="" fwd_s="" zone=""
+  while read -r kind a b c _; do
+    case $kind in
+      ufw) ufw_s+="${a^^} ${b}、" ;;
+      firewalld) zone=$a; fwd_s+="${b^^} ${c}、" ;;
+    esac
+  done <"$FW_HOST_FILE"
+  [[ -n $ufw_s ]] && printf '已同步到 ufw（注释 proxy-oneclick）：%s\n' "${ufw_s%、}"
+  [[ -n $fwd_s ]] && printf '已同步到 firewalld（区域 %s）：%s\n' "$zone" "${fwd_s%、}"
+  return 0
+}
+
 fw_print_allows() {
   local p
   FW_ALLOW_SEEN=""
@@ -4238,6 +4436,8 @@ fw_print_allows() {
     if have nft && ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
       echo "表 inet ${NFT_TABLE} 还没加载。下面是按配置应该放行的端口，重载后才生效。"
     fi
+  elif [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+    echo "本机防火墙：没有写入 nftables 默认拒绝。代理端口写在正在运行的 ufw / firewalld 里。"
   else
     echo "本机防火墙：没有由本脚本接管，也没有做默认拒绝。"
     echo "下面是各协议要用的端口。系统防火墙和云安全组需要自己放行。"
@@ -4276,10 +4476,16 @@ fw_print_allows() {
     echo "端口跳跃的 UDP ${HOP_RANGE} 会转到 Hysteria2 的 UDP ${HY2_PORT}。"
   fi
   if [[ ${FW_MODE:-} == allow ]]; then
-    echo "云安全组若有限制，仍要放行上面这些端口。ufw、firewalld 或 Docker 自己的规则也要另行放行。本脚本没有改那些表。"
+    echo "云安全组若有限制，仍要放行上面这些端口。Docker 自己的表没有改。"
+    if ! fw_ufw_active && ! fw_firewalld_active; then
+      echo "本机没有正在运行的 ufw 或 firewalld，不需要再同步端口。"
+    fi
+  elif [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+    echo "云安全组若有限制，仍要放行上面这些端口。"
   elif (( ${FW_ENABLED:-0} == 1 )); then
     echo "云安全组要另外放行上面这些端口。脚本改不到云上的防火墙。"
   fi
+  fw_print_host_sync
   return 0
 }
 
@@ -9480,10 +9686,11 @@ do_install_land() {
   [[ -x $HY_BIN || -f $HY_UNIT || -f $HY_RC ]] && { info "移除 Hysteria2 ..."; remove_hysteria purge; }
   [[ -x $SB_BIN || -f $SB_UNIT || -f $SB_RC ]] && { info "移除 sing-box（TUIC / AnyTLS）..."; remove_singbox; }
   remove_nat_hop
-  if [[ -f $FW_FILE || -f $FW_UNIT ]]; then info "移除节点模式的 nftables 规则 ..."; remove_firewall; fi
+  if [[ -f $FW_FILE || -f $FW_UNIT || -s ${FW_HOST_FILE:-} ]]; then info "移除节点模式的 nftables 规则 ..."; remove_firewall; fi
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; fi
   FW_ENABLED=0
   FW_MODE=off
+  FW_HOST_SYNC=0
 
   install_xray
   INSTALLED=1
@@ -10909,6 +11116,12 @@ menu_firewall() {
   esac
   if [[ ${FW_MODE:-off} == off || ${FW_ENABLED:-0} == 0 ]]; then
     save_state
+    if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+      fw_host_sync
+      save_state
+      fw_print_allows
+      return 0
+    fi
     warn "防火墙是关闭的，改动已记下，但还没写入 nftables。要生效请选严格或只放行。"
     return 0
   fi
@@ -11797,7 +12010,8 @@ usage() {
   --firewall <模式>   strict 入站默认拒绝 | allow 只放行（不接管入站）| off 不写 nftables
                       不写时：干净机器默认 strict；检测到 Docker/Podman、WireGuard、
                       已有防火墙或多个非标准端口时，交互安装默认推荐 allow，
-                      非交互安装直接用 allow。--no-firewall 同 off
+                      非交互安装直接用 allow。allow 时若 ufw 或 firewalld 正在运行，
+                      会把代理端口写进它们。--no-firewall 同 off
   --no-firewall       不配置 nftables 防火墙（同 --firewall off）
   --no-upgrade        跳过系统软件包升级
   --no-tune           跳过 sysctl 网络调优

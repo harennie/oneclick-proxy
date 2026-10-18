@@ -312,7 +312,8 @@ usage() {
   --firewall <模式>   strict 入站默认拒绝 | allow 只放行（不接管入站）| off 不写 nftables
                       不写时：干净机器默认 strict；检测到 Docker/Podman、WireGuard、
                       已有防火墙或多个非标准端口时，交互安装默认推荐 allow，
-                      非交互安装直接用 allow。--no-firewall 同 off
+                      非交互安装直接用 allow。allow 时若 ufw 或 firewalld 正在运行，
+                      会把代理端口写进它们。--no-firewall 同 off
   --no-firewall       不配置 nftables 防火墙（同 --firewall off）
   --no-upgrade        跳过系统软件包升级
   --no-tune           跳过 sysctl 网络调优

@@ -107,7 +107,7 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--zerossl-kid <id>` / `--zerossl-hmac <key>` | ZeroSSL 的 EAB 凭据，必须成对。在 <https://app.zerossl.com/developer> 生成 |
 | `--sub-port <端口>` | 订阅 HTTPS 端口，默认 8447（不能是 80，也不能占用已开启协议的 TCP 端口）。源站证书不会打开订阅 |
 | `--no-cert` | 关闭已申请的证书，Hysteria2 / TUIC / AnyTLS 改回自签。开着的 CDN 线路一并关掉（不能改用自签） |
-| `--firewall <模式>` | `strict` 入站默认拒绝；`allow` 只放行代理端口和端口跳跃，不把入站改成默认拒绝，也不改 Docker 的表；`off` 不写 nftables。不写时：干净机器默认 `strict`；检测到 Docker/Podman、WireGuard、已有防火墙或多个非标准端口时，交互安装默认推荐 `allow`，非交互安装直接用 `allow` |
+| `--firewall <模式>` | `strict` 入站默认拒绝；`allow` 只放行代理端口和端口跳跃，不把入站改成默认拒绝，也不改 Docker 的表；`off` 不写 nftables。不写时：干净机器默认 `strict`；检测到 Docker/Podman、WireGuard、已有防火墙或多个非标准端口时，交互安装默认推荐 `allow`，非交互安装直接用 `allow`。`allow` 时若 ufw 或 firewalld 正在运行，会把同样的端口写进去 |
 | `--no-firewall` | 不配置 nftables 防火墙（同 `--firewall off`） |
 | `--no-upgrade` | 跳过系统软件包升级 |
 | `--no-tune` | 跳过 sysctl 调优 |
@@ -187,7 +187,7 @@ proxy proto
   - **安装后 REALITY 自检**：用已安装的 xray 在 127.0.0.1 随机端口起一个临时客户端，按生成的链接参数连接本机节点并访问外网，打印通过 / 未通过（不影响安装；更换 SNI 后也会自动自检）。临时客户端限制 `GOMEMLIMIT`，128MB 的 NAT 小鸡也能跑。
 - **REALITY 目标网站自动优选**（见下文「为什么 SNI 规则很重要」）。
 - **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。Cloudflare 源站证书不会交给 Hysteria2。
-- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，不改 Docker / Podman 自己的表。模式为 `strict`（入站默认拒绝，干净机器的默认）、`allow`（只放行代理端口和端口跳跃，不接管入站策略；检测到 Docker/Podman、WireGuard 或其它 UDP、已有 nftables/iptables/ufw/firewalld，或多个非标准监听端口时，交互安装默认推荐它，非交互且未指定 `--firewall` 时直接用它）或 `off`（`--no-firewall`，不写规则）。严格模式放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有 HTTP-01（Let's Encrypt / ZeroSSL 的单域名或多域名）才额外放行 TCP 80。只有公开证书才放行订阅 HTTPS 端口。通配符 DNS-01 和 Cloudflare 源站证书不放行 80，源站证书也不开订阅。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时询问是否停用（卸载时可恢复）。不会关闭 SELinux（写入文件后执行 `restorecon`）。防火墙菜单、运行状态和安装结束时会逐行列出已经放行的端口，以及每一条属于哪个协议（Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS、CDN 的 XHTTP 与 WebSocket、订阅、证书申请的 TCP 80、SSH、端口跳跃，以及额外放行）。严格模式下，没写出来的新连接仍然拒绝；只放行模式不会丢掉其它端口。装好后可用 `proxy firewall strict`、`proxy firewall allow`、`proxy firewall off` 切换。
+- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，不改 Docker / Podman 自己的表。模式为 `strict`（入站默认拒绝，干净机器的默认）、`allow`（只放行代理端口和端口跳跃，不接管入站策略；检测到 Docker/Podman、WireGuard 或其它 UDP、已有 nftables/iptables/ufw/firewalld，或多个非标准监听端口时，交互安装默认推荐它，非交互且未指定 `--firewall` 时直接用它）或 `off`（`--no-firewall`，不写规则）。严格模式放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有 HTTP-01（Let's Encrypt / ZeroSSL 的单域名或多域名）才额外放行 TCP 80。只有公开证书才放行订阅 HTTPS 端口。通配符 DNS-01 和 Cloudflare 源站证书不放行 80，源站证书也不开订阅。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时，严格模式会询问是否停用（卸载时可恢复）；只放行模式，或选择保留它们时，会把当前代理端口、SSH 和 Hysteria2 跳跃范围写进正在运行的 ufw（注释 `proxy-oneclick`）或 firewalld 默认区域，并记在 `/root/.proxy-oneclick/fw-host.list`，改端口、关协议、切换模式和卸载时按这份记录删掉，不碰用户自己加的规则。本机没有 ufw 也没有 firewalld 时这一步不做。不会关闭 SELinux（写入文件后执行 `restorecon`）。防火墙菜单、运行状态和安装结束时会逐行列出已经放行的端口，以及每一条属于哪个协议（Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS、CDN 的 XHTTP 与 WebSocket、订阅、证书申请的 TCP 80、SSH、端口跳跃，以及额外放行），并写出已经同步到 ufw / firewalld 的条目。严格模式下，没写出来的新连接仍然拒绝；只放行模式不会丢掉其它端口。装好后可用 `proxy firewall strict`、`proxy firewall allow`、`proxy firewall off` 切换。
 - **fail2ban**：sshd 监狱，10 分钟内失败 5 次封禁 1 小时（systemd 日志后端 + nftables 动作）。
 - **XHTTP（默认开启）**：VLESS + XHTTP + REALITY。与 Vision 共用同一把 x25519、ShortId、SNI 和 ML-DSA-65 种子，单独监听 TCP 8443，`flow` 必须为空，路径为随机 `/` + 十六进制。服务端和客户端链接的 `mode` 都是 `stream-one`（REALITY 直连；客户端用 `auto` 时有已知握手失败）。不需要自己的域名，也不把自己的证书挂到 XHTTP 上。这条和下面的「XHTTP + TLS（CDN）」是两条入站，互不替换。
 - **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。Cloudflare 源站证书不会交给它们。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
@@ -784,7 +784,7 @@ bash proxy.sh --firewall off
 
 SSH：严格模式在加载前探测 SSH 端口（`sshd -T`、配置文件、正在监听的 sshd、ssh.socket、当前会话端口）。探测不到时至少放行 22，并且先放行已建立连接。规则里如果缺了当前 SSH 端口，会改成只放行而不是加载默认拒绝。`allow` 和 `off` 不改入站策略，本来就不会把 SSH 关在外面。
 
-检测到 firewalld / ufw 时，只有选择严格模式才会询问是否停用（卸载时可恢复）。只放行模式留着它们，需要的端口还要在那边放行。
+检测到 firewalld / ufw 时，只有选择严格模式才会询问是否停用（卸载时可恢复）。只放行模式留着它们，并把当前代理端口、SSH 和端口跳跃写进去：ufw 用 `ufw allow`，注释是 `proxy-oneclick`（范围写成 `20000:50000/udp`）；firewalld 用 `--permanent --add-port`，范围写成 `20000-50000/udp`，写完重载一次。记录在 `/root/.proxy-oneclick/fw-host.list`。改端口、关协议、切到严格或关闭、卸载时，只按这份记录删除，不删用户自己加的规则。选严格但选择保留 ufw / firewalld 时也走同一套同步。本机没有正在运行的 ufw 或 firewalld（例如 Alpine）时，这一步不做。安装结束、`proxy firewall` 和 `proxy status` 会列出已经同步的条目。
 
 装好之后切换，不重装：
 
@@ -937,7 +937,7 @@ proxy firewall allow
 proxy firewall off
 ```
 
-`proxy status` 里是同一份列表；选「查看 nftables 原文」才是规则原文。严格模式入站默认拒绝。只放行模式只添加 accept，不把入站改成默认拒绝。
+`proxy status` 里是同一份列表；选「查看 nftables 原文」才是规则原文。严格模式入站默认拒绝。只放行模式只添加 accept，不把入站改成默认拒绝；ufw 或 firewalld 正在运行时，同一份端口会写进它们，并在列表下面标出已同步的条目。
 
 **BBR 状态、到 SNI 的延迟、下载测速**（Cloudflare / CacheFly / OVH 自动切换）
 
@@ -1074,7 +1074,7 @@ proxy uninstall --auto
 - CDN 上的 XHTTP+TLS / WebSocket+TLS 需要自有域名，以及公开证书或 Cloudflare 源站证书，还有 Cloudflare 允许代理的回源端口。源站证书只有 Cloudflare 信任，不能给浏览器和直连客户端。NAT / Alpine / 落地机不能开。域名开了橙色云朵后，不要再用这个名字连接 Hysteria2、TUIC 或订阅。
 - XHTTP 走 CDN 时用 `packet-up`。`stream-one` 只用于直连的 XHTTP+REALITY。WebSocket 需要 CDN 打开 WebSockets，路径必须和链接里逐字相同。
 - `proxy route` 只测从本机发向大陆运营商的回程。它不能代替在自己电脑上做的去程。测试节点和骨干地址特征会变，线路名称只供参考。
-- 严格防火墙会挡住没有写进放行列表的端口，包括 Docker / Podman 发布端口、WireGuard 和其它 UDP。这类机器用 `allow`（只放行）。只放行不修改入站默认策略，也不改 Docker / Podman 自己的表和链。卸载会删掉本脚本的表 `inet proxy_oneclick`，不会清空整个规则集。
+- 严格防火墙会挡住没有写进放行列表的端口，包括 Docker / Podman 发布端口、WireGuard 和其它 UDP。这类机器用 `allow`（只放行）。只放行不修改入站默认策略，也不改 Docker / Podman 自己的表和链。ufw 或 firewalld 若正在运行，只放行模式会把代理端口写进它们；nftables 里的 accept 绕不过它们的默认拒绝。卸载会删掉本脚本的表 `inet proxy_oneclick`，并按记录删掉写进 ufw / firewalld 的条目，不会清空整个规则集。
 
 ---
 

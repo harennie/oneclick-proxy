@@ -451,6 +451,12 @@ menu_firewall() {
   esac
   if [[ ${FW_MODE:-off} == off || ${FW_ENABLED:-0} == 0 ]]; then
     save_state
+    if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+      fw_host_sync
+      save_state
+      fw_print_allows
+      return 0
+    fi
     warn "防火墙是关闭的，改动已记下，但还没写入 nftables。要生效请选严格或只放行。"
     return 0
   fi
