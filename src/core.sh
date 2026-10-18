@@ -204,6 +204,10 @@ OPT_LAND_ALLOW=""   # 落地机来源 IP 白名单（逗号分隔，none 清空�
 OPT_LAND_LINK=""    # 中转机 land-add 的 ss:// 链接
 OPT_LAND_ACT=""     # 中转机落地转发子命令: add | on | off | del | test
 OPT_FORCE=0         # land-add 测试不通过也强制启用
+OPT_IMPORT=""       # --import / proxy import 的文件
+OPT_EXPORT_PATH=""  # proxy export 的输出路径，空则用默认
+OPT_EXPORT_ENC=0    # 1 = 导出时用 openssl 加密
+IMPORT_MODE=0       # 1 = 本次安装来自导入，要重新检测 IP / NAT / SNI / 防火墙
 OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
 OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）
 OPT_CERT_EMAIL=""   # 可选，交给 Let's Encrypt；空则不登记邮箱
@@ -412,6 +416,7 @@ on_error() {
   local rc=$? line=$1 cmd=$2 where
   trap - ERR
   if [[ -n ${GITHUB_TOKEN:-} ]]; then cmd=${cmd//${GITHUB_TOKEN}/***}; fi
+  if [[ -n ${PROXY_EXPORT_PASS:-} ]]; then cmd=${cmd//${PROXY_EXPORT_PASS}/***}; fi
   cmd=${cmd//Authorization: Bearer */Authorization: Bearer ***}
   where=$(err_loc "$line")
   printf '\n%s[错误]%s 脚本在 %s 执行失败 (退出码 %s)：\n    %s\n' "$C_RED" "$C_NONE" "$where" "$rc" "$cmd" >&2

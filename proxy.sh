@@ -205,6 +205,10 @@ OPT_LAND_ALLOW=""   # 落地机来源 IP 白名单（逗号分隔，none 清空�
 OPT_LAND_LINK=""    # 中转机 land-add 的 ss:// 链接
 OPT_LAND_ACT=""     # 中转机落地转发子命令: add | on | off | del | test
 OPT_FORCE=0         # land-add 测试不通过也强制启用
+OPT_IMPORT=""       # --import / proxy import 的文件
+OPT_EXPORT_PATH=""  # proxy export 的输出路径，空则用默认
+OPT_EXPORT_ENC=0    # 1 = 导出时用 openssl 加密
+IMPORT_MODE=0       # 1 = 本次安装来自导入，要重新检测 IP / NAT / SNI / 防火墙
 OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
 OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）
 OPT_CERT_EMAIL=""   # 可选，交给 Let's Encrypt；空则不登记邮箱
@@ -355,7 +359,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;699:src/os.sh:1;1208:src/tune.sh:1;2008:src/xray.sh:1;3481:src/hy2.sh:1;3587:src/firewall.sh:1;4625:src/cert.sh:1;6657:src/cdn.sh:1;7642:src/link.sh:1;8028:src/singbox.sh:1;8545:src/nat.sh:1;9173:src/selftest.sh:1;9305:src/land.sh:1;10751:src/menu.sh:1;11271:src/route.sh:1;11786:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;704:src/os.sh:1;1213:src/tune.sh:1;2013:src/xray.sh:1;3486:src/hy2.sh:1;3592:src/firewall.sh:1;4630:src/cert.sh:1;6662:src/cdn.sh:1;7647:src/link.sh:1;8033:src/singbox.sh:1;8550:src/nat.sh:1;9188:src/selftest.sh:1;9320:src/land.sh:1;10766:src/menu.sh:1;11286:src/route.sh:1;11801:src/export.sh:1;11999:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -413,6 +417,7 @@ on_error() {
   local rc=$? line=$1 cmd=$2 where
   trap - ERR
   if [[ -n ${GITHUB_TOKEN:-} ]]; then cmd=${cmd//${GITHUB_TOKEN}/***}; fi
+  if [[ -n ${PROXY_EXPORT_PASS:-} ]]; then cmd=${cmd//${PROXY_EXPORT_PASS}/***}; fi
   cmd=${cmd//Authorization: Bearer */Authorization: Bearer ***}
   where=$(err_loc "$line")
   printf '\n%s[错误]%s 脚本在 %s 执行失败 (退出码 %s)：\n    %s\n' "$C_RED" "$C_NONE" "$where" "$rc" "$cmd" >&2
@@ -9103,6 +9108,16 @@ do_install() {
   save_state
 
   local pqrc=0 redo=n
+  if (( IMPORT_MODE )) && [[ -n $SNI && -z $OPT_SNI ]]; then
+    local sni_res=""
+    sni_res=$(sni_probe "$SNI") || true
+    if [[ $sni_res == FAIL* ]]; then
+      warn "导入的 SNI ${SNI} 现在不可用（${sni_res##*|}）。将重新优选。"
+      SNI=""
+    else
+      info "导入的 SNI ${SNI} 仍然可用。"
+    fi
+  fi
   [[ -n $SNI && -z $OPT_SNI ]] && { sni_pq_check "$SNI" || pqrc=$?; }
   if (( pqrc == 1 )); then
     # 不支持 MLKEM 只是偏好问题：给出警告，交互模式默认建议重新优选，自动模式保留原 SNI
@@ -11782,6 +11797,204 @@ do_route() {
   fi
   return 0
 }
+# @module src/export.sh
+# ============================================================
+#                 导出 / 导入（换机器时带走密钥）
+# ============================================================
+# 导出的是重建同一批节点需要的密钥和证书。公网地址、网卡、NAT 映射、
+# 虚拟化类型和内存档位不放进去，导入时在新机器上重新检测。
+export_host_key() {
+  case $1 in
+    SERVER_ADDR|PUBLIC_IP4|PUBLIC_IP6|NAT_PORTS|NAT_EXCLUDE|XRAY_EXT_PORT|HY2_EXT_PORT|HOP_EXT_RANGE|HOP_BACKEND|\
+    XHTTP_EXT_PORT|TROJAN_EXT_PORT|TUIC_EXT_PORT|ANYTLS_EXT_PORT|VIRT|SSH_PORTS|FW_HOST_SYNC|DISABLED_FW|\
+    SWAP_CREATED|DNS64_SET) return 0 ;;
+  esac
+  return 1
+}
+export_stage_state() {
+  local dest=$1 k v
+  : >"$dest"
+  chmod 600 "$dest"
+  for k in "${STATE_KEYS[@]}"; do
+    v=${!k-}
+    if export_host_key "$k"; then v=""
+    elif [[ $k == NAT_MODE ]]; then v=0
+    elif [[ $k == NAT_PREF ]]; then v=auto
+    elif [[ $k == INSTALLED ]]; then v=0
+    fi
+    [[ $v == *$'\n'* || $v == *"'"* ]] && die "内部错误: 状态值 $k 含非法字符"
+    printf "%s='%s'\n" "$k" "$v" >>"$dest"
+  done
+}
+export_put() { # $1 源文件 $2 包内相对路径
+  [[ -s $1 ]] || return 0
+  local dest="${EXPORT_STAGE}/$2"
+  mkdir -p "$(dirname "$dest")"
+  install -m 600 "$1" "$dest"
+}
+export_read_pass() { # $1 变量名 $2 提示。优先用环境变量，不回显。
+  local __p=""
+  if [[ -n ${PROXY_EXPORT_PASS:-} ]]; then
+    printf -v "$1" '%s' "$PROXY_EXPORT_PASS"
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    read -r -s -p "$2" __p || true
+    echo
+  elif [[ -r /dev/tty ]]; then
+    read -r -s -p "$2" __p </dev/tty || true
+    echo
+  else
+    die "需要密码。请设置环境变量 PROXY_EXPORT_PASS，或在终端里运行。"
+  fi
+  [[ -n $__p ]] || die "密码不能为空。"
+  printf -v "$1" '%s' "$__p"
+}
+export_is_enc() {
+  local magic
+  magic=$(head -c 8 "$1" 2>/dev/null || true)
+  [[ $magic == "Salted__" ]]
+}
+export_default_path() {
+  local host
+  host=$(hostname -s 2>/dev/null || true)
+  host=$(tr -cd 'A-Za-z0-9_.-' <<<"$host")
+  [[ -n $host ]] || host=host
+  local p
+  p="/root/proxy-export-${host}-$(date +%Y%m%d).tar.gz"
+  if (( OPT_EXPORT_ENC )); then p="${p}.enc"; fi
+  if [[ -e $p ]]; then
+    p="/root/proxy-export-${host}-$(date +%Y%m%d-%H%M%S).tar.gz"
+    (( OPT_EXPORT_ENC )) && p="${p}.enc"
+  fi
+  printf '%s' "$p"
+}
+do_export() {
+  load_state
+  (( INSTALLED )) || die "还没有安装，不能导出。"
+  require_root
+  mktmp
+  local stage="${TMP_DIR}/export" tar="${TMP_DIR}/export.tar.gz" out pass
+  mkdir -p "$stage"
+  chmod 700 "$stage"
+  EXPORT_STAGE=$stage
+  export_stage_state "${stage}/state.env"
+  export_put "$USERS_FILE" "users.txt"
+  export_put "$HY_CRT" "hysteria/server.crt"
+  export_put "$HY_KEY" "hysteria/server.key"
+  export_put "$SB_CRT" "singbox/server.crt"
+  export_put "$SB_KEY" "singbox/server.key"
+  export_put "$CERT_FULLCHAIN" "certs/fullchain.pem"
+  export_put "$CERT_PRIVKEY" "certs/privkey.pem"
+  export_put "$CERT_DNS_TOKEN" "certs/cf-dns.token"
+  export_put "$CERT_ZEROSSL_EAB" "certs/zerossl.eab"
+  export_put "$CERT_ORIGIN_KEY" "certs/cf-origin.key"
+  if [[ -s $TUNE_CUR ]]; then
+    mkdir -p "${stage}/tune"
+    grep -Ev '^(IFACE|TIME)=' "$TUNE_CUR" >"${stage}/tune/current.env" || true
+    chmod 600 "${stage}/tune/current.env"
+  fi
+  tar -C "$stage" -czf "$tar" .
+  out=${OPT_EXPORT_PATH:-$(export_default_path)}
+  mkdir -p "$(dirname "$out")"
+  if (( OPT_EXPORT_ENC )); then
+    export_read_pass pass "导出密码（不会回显）: "
+    PROXY_EXPORT_PASS=$pass
+    export PROXY_EXPORT_PASS
+    openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:PROXY_EXPORT_PASS -in "$tar" -out "$out" \
+      || die "加密失败。"
+  else
+    install -m 600 "$tar" "$out"
+  fi
+  chmod 600 "$out"
+  ok "已导出到 ${out}（权限 600）。"
+  info "包里有 UUID、Reality 私钥、ShortId、ML-DSA 种子、SNI、端口、XHTTP 路径、各协议密码、落地 / 中转配置、调优参数和证书。"
+  info "没有放公网 IP、网卡、NAT 映射和虚拟化类型。导入时会在新机器上重新检测。"
+  (( OPT_EXPORT_ENC )) && info "文件已用 AES-256-CBC 加密。导入时会询问密码，或读取环境变量 PROXY_EXPORT_PASS。"
+}
+export_restore_file() { # $1 包内路径 $2 目标
+  [[ -s $1 ]] || return 0
+  mkdir -p "$(dirname "$2")"
+  install -m 600 "$1" "$2"
+}
+do_import() {
+  local file=${OPT_IMPORT:-}
+  [[ -n $file && -f $file ]] || die "找不到要导入的文件: ${file:-（未指定）}"
+  require_root
+  load_state
+  if (( INSTALLED )) && (( ! OPT_AUTO )); then
+    confirm "本机已有安装。导入会改用文件里的密钥并重新安装。继续？" n || return 0
+  fi
+  mktmp
+  local tar="$file" work="${TMP_DIR}/import" pass
+  mkdir -p "$work"
+  if export_is_enc "$file"; then
+    export_read_pass pass "导入密码（不会回显）: "
+    PROXY_EXPORT_PASS=$pass
+    export PROXY_EXPORT_PASS
+    tar="${TMP_DIR}/import.tar.gz"
+    openssl enc -d -aes-256-cbc -pbkdf2 -pass env:PROXY_EXPORT_PASS -in "$file" -out "$tar" \
+      || die "解密失败。请核对密码。"
+  fi
+  tar -tzf "$tar" >/dev/null 2>&1 || die "不是有效的导出文件。"
+  tar -xzf "$tar" -C "$work"
+  [[ -s ${work}/state.env ]] || die "导出文件里没有 state.env。"
+  mkdir -p "$STATE_DIR" "$HY_DIR" "$SB_DIR" "$CERT_DIR" "$TUNE_DIR"
+  chmod 700 "$STATE_DIR"
+  install -m 600 "${work}/state.env" "$STATE_FILE"
+  export_restore_file "${work}/users.txt" "$USERS_FILE"
+  export_restore_file "${work}/hysteria/server.crt" "$HY_CRT"
+  export_restore_file "${work}/hysteria/server.key" "$HY_KEY"
+  export_restore_file "${work}/singbox/server.crt" "$SB_CRT"
+  export_restore_file "${work}/singbox/server.key" "$SB_KEY"
+  export_restore_file "${work}/certs/fullchain.pem" "$CERT_FULLCHAIN"
+  export_restore_file "${work}/certs/privkey.pem" "$CERT_PRIVKEY"
+  export_restore_file "${work}/certs/cf-dns.token" "$CERT_DNS_TOKEN"
+  export_restore_file "${work}/certs/zerossl.eab" "$CERT_ZEROSSL_EAB"
+  export_restore_file "${work}/certs/cf-origin.key" "$CERT_ORIGIN_KEY"
+  if [[ -s ${work}/tune/current.env && -z $OPT_TUNE_PRESET ]]; then
+    install -m 600 "${work}/tune/current.env" "$TUNE_CUR"
+    local preset buf cc qd
+    preset=$(sed -n 's/^PRESET=//p' "$TUNE_CUR" | head -n1)
+    buf=$(sed -n 's/^BUFFER=//p' "$TUNE_CUR" | head -n1)
+    cc=$(sed -n 's/^CC=//p' "$TUNE_CUR" | head -n1)
+    qd=$(sed -n 's/^QDISC=//p' "$TUNE_CUR" | head -n1)
+    [[ -n $preset ]] && OPT_TUNE_PRESET=$preset
+    [[ -n $buf ]] && OPT_TUNE_BUF=$buf
+    [[ -n $cc && $cc != keep && -z $OPT_TUNE_CC ]] && OPT_TUNE_CC=$cc
+    [[ -n $qd && $qd != keep && -z $OPT_TUNE_QDISC ]] && OPT_TUNE_QDISC=$qd
+  fi
+  if [[ -s $CERT_FULLCHAIN ]]; then
+    if ! openssl x509 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+      warn "导入的公开证书无法读取，安装时会重新申请。"
+      rm -f "$CERT_FULLCHAIN" "$CERT_PRIVKEY"
+    elif ! openssl x509 -checkend 0 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+      warn "导入的公开证书已经过期，安装时会重新申请。"
+      rm -f "$CERT_FULLCHAIN" "$CERT_PRIVKEY"
+    else
+      info "导入的公开证书可以读取，到期 $(openssl x509 -enddate -noout -in "$CERT_FULLCHAIN" | cut -d= -f2)。"
+    fi
+  fi
+  info "已读入密钥。接下来重新检测 IP、NAT、SNI 和防火墙，并按原端口和协议装回去。"
+  IMPORT_MODE=1
+  do_install
+}
+menu_export() {
+  need_installed
+  local p
+  ask p "导出文件路径（直接回车用默认路径）" ""
+  OPT_EXPORT_PATH=$p
+  if confirm "用密码加密这个文件？" n; then OPT_EXPORT_ENC=1; else OPT_EXPORT_ENC=0; fi
+  do_export
+}
+menu_import() {
+  local p
+  ask p "导入文件路径" ""
+  [[ -n $p ]] || { warn "没有填写路径。"; return 0; }
+  OPT_IMPORT=$p
+  confirm "导入会用文件里的密钥重新安装，并重新检测 IP、NAT 和防火墙。继续？" y || return 0
+  do_import
+}
 # @module src/cli.sh
 # ============================================================
 #                        菜单 / 参数
@@ -11941,7 +12154,9 @@ show_menu() {
     "切换 NAT 模式（当前: $(nat_pref_text)）" \
     "协议开关" \
     "申请证书" \
-    "回程线路检测"
+    "回程线路检测" \
+    "导出配置（迁到另一台机器）" \
+    "导入配置"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -11963,6 +12178,8 @@ show_menu() {
     16) act=menu_proto ;;
     17) act=menu_cert ;;
     18) act=do_route ;;
+    19) act=menu_export ;;
+    20) act=menu_import ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -12010,7 +12227,9 @@ show_land_menu() {
     "回程线路检测" \
     "出口：本机直连（清除下一跳与原样转发）" \
     "出口：加密转发（SS2022 再加密到下一跳）" \
-    "出口：原样转发（不解密，DNAT 到最终落地）"
+    "出口：原样转发（不解密，DNAT 到最终落地）" \
+    "导出配置（迁到另一台机器）" \
+    "导入配置"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -12029,6 +12248,8 @@ show_land_menu() {
     13) act=menu_land_direct ;;
     14) act=menu_land_relay ;;
     15) act=menu_land_raw ;;
+    16) act=menu_export ;;
+    17) act=menu_import ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -12183,6 +12404,9 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy user          用户管理
   proxy update        更新组件
   proxy update-script 只更新本脚本
+  proxy export [文件]  导出密钥和证书（权限 600）。--password 加密，密码不回显
+  proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
+  bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
   proxy speed         测速 / 延迟提示
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
@@ -12393,6 +12617,13 @@ parse_args() {
         [[ -n ${2-} ]] || die "--land-allow 需要参数（例如 1.2.3.4,2001:db8::/64，或 none）"
         if [[ ${2,,} == none ]]; then OPT_LAND_ALLOW=none; else land_norm_allow "$2" || die "--land-allow 中有无效地址: ${LAND_BAD}"; OPT_LAND_ALLOW=$2; fi
         shift ;;
+          --import)
+        [[ -n ${2-} && -f ${2-} ]] || die "--import 需要已存在的导出文件"
+        OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
+      --import=*)
+        OPT_IMPORT=${1#*=}; [[ -f $OPT_IMPORT ]] || die "--import 需要已存在的导出文件"
+        OPT_ACTION=import ;;
+      --password) OPT_EXPORT_ENC=1 ;;
       --force) OPT_FORCE=1 ;;
       land-add|relay-add)
         OPT_ACTION=land; OPT_LAND_ACT=add
@@ -12423,6 +12654,13 @@ parse_args() {
       port|ports) OPT_ACTION=port ;;
       user|users) OPT_ACTION=user ;;
       update|upgrade) OPT_ACTION=update ;;
+      export)
+        OPT_ACTION="export"
+        if [[ ${2-} == --password ]]; then OPT_EXPORT_ENC=1; shift; fi
+        if [[ -n ${2-} && ${2} != -* ]]; then OPT_EXPORT_PATH=$2; shift; fi ;;
+      import)
+        [[ -n ${2-} ]] || die "用法: proxy import 文件"
+        OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
       update-script) OPT_ACTION=update-script ;;
       status|log|logs) OPT_ACTION=status ;;
       speed) OPT_ACTION=speed ;;
@@ -12535,6 +12773,8 @@ main() {
     land) do_land_cli ;;
     allow) land_menu_allow ;;
     uninstall) do_uninstall ;;
+    export) do_export ;;
+    import) do_import ;;
     "")
       if [[ ! -t 0 && ! -r /dev/tty ]]; then usage; die "非交互环境请使用 --auto。"; fi
       while :; do show_menu; pause; done ;;

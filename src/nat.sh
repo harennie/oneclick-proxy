@@ -559,6 +559,16 @@ do_install() {
   save_state
 
   local pqrc=0 redo=n
+  if (( IMPORT_MODE )) && [[ -n $SNI && -z $OPT_SNI ]]; then
+    local sni_res=""
+    sni_res=$(sni_probe "$SNI") || true
+    if [[ $sni_res == FAIL* ]]; then
+      warn "导入的 SNI ${SNI} 现在不可用（${sni_res##*|}）。将重新优选。"
+      SNI=""
+    else
+      info "导入的 SNI ${SNI} 仍然可用。"
+    fi
+  fi
   [[ -n $SNI && -z $OPT_SNI ]] && { sni_pq_check "$SNI" || pqrc=$?; }
   if (( pqrc == 1 )); then
     # 不支持 MLKEM 只是偏好问题：给出警告，交互模式默认建议重新优选，自动模式保留原 SNI

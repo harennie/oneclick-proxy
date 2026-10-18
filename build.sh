@@ -20,6 +20,7 @@ files=(
   src/land.sh
   src/menu.sh
   src/route.sh
+  src/export.sh
   src/cli.sh
 )
 

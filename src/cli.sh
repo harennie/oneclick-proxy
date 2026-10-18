@@ -156,7 +156,9 @@ show_menu() {
     "切换 NAT 模式（当前: $(nat_pref_text)）" \
     "协议开关" \
     "申请证书" \
-    "回程线路检测"
+    "回程线路检测" \
+    "导出配置（迁到另一台机器）" \
+    "导入配置"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -178,6 +180,8 @@ show_menu() {
     16) act=menu_proto ;;
     17) act=menu_cert ;;
     18) act=do_route ;;
+    19) act=menu_export ;;
+    20) act=menu_import ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -225,7 +229,9 @@ show_land_menu() {
     "回程线路检测" \
     "出口：本机直连（清除下一跳与原样转发）" \
     "出口：加密转发（SS2022 再加密到下一跳）" \
-    "出口：原样转发（不解密，DNAT 到最终落地）"
+    "出口：原样转发（不解密，DNAT 到最终落地）" \
+    "导出配置（迁到另一台机器）" \
+    "导入配置"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -244,6 +250,8 @@ show_land_menu() {
     13) act=menu_land_direct ;;
     14) act=menu_land_relay ;;
     15) act=menu_land_raw ;;
+    16) act=menu_export ;;
+    17) act=menu_import ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -398,6 +406,9 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy user          用户管理
   proxy update        更新组件
   proxy update-script 只更新本脚本
+  proxy export [文件]  导出密钥和证书（权限 600）。--password 加密，密码不回显
+  proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
+  bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
   proxy speed         测速 / 延迟提示
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
@@ -608,6 +619,13 @@ parse_args() {
         [[ -n ${2-} ]] || die "--land-allow 需要参数（例如 1.2.3.4,2001:db8::/64，或 none）"
         if [[ ${2,,} == none ]]; then OPT_LAND_ALLOW=none; else land_norm_allow "$2" || die "--land-allow 中有无效地址: ${LAND_BAD}"; OPT_LAND_ALLOW=$2; fi
         shift ;;
+          --import)
+        [[ -n ${2-} && -f ${2-} ]] || die "--import 需要已存在的导出文件"
+        OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
+      --import=*)
+        OPT_IMPORT=${1#*=}; [[ -f $OPT_IMPORT ]] || die "--import 需要已存在的导出文件"
+        OPT_ACTION=import ;;
+      --password) OPT_EXPORT_ENC=1 ;;
       --force) OPT_FORCE=1 ;;
       land-add|relay-add)
         OPT_ACTION=land; OPT_LAND_ACT=add
@@ -638,6 +656,13 @@ parse_args() {
       port|ports) OPT_ACTION=port ;;
       user|users) OPT_ACTION=user ;;
       update|upgrade) OPT_ACTION=update ;;
+      export)
+        OPT_ACTION="export"
+        if [[ ${2-} == --password ]]; then OPT_EXPORT_ENC=1; shift; fi
+        if [[ -n ${2-} && ${2} != -* ]]; then OPT_EXPORT_PATH=$2; shift; fi ;;
+      import)
+        [[ -n ${2-} ]] || die "用法: proxy import 文件"
+        OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
       update-script) OPT_ACTION=update-script ;;
       status|log|logs) OPT_ACTION=status ;;
       speed) OPT_ACTION=speed ;;
@@ -750,6 +775,8 @@ main() {
     land) do_land_cli ;;
     allow) land_menu_allow ;;
     uninstall) do_uninstall ;;
+    export) do_export ;;
+    import) do_import ;;
     "")
       if [[ ! -t 0 && ! -r /dev/tty ]]; then usage; die "非交互环境请使用 --auto。"; fi
       while :; do show_menu; pause; done ;;
