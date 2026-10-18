@@ -27,7 +27,11 @@
 #   bash proxy.sh proto           # 协议开关（菜单第 16 项「协议开关」）
 #                                 # 默认 Vision、XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC / AnyTLS
 #   proxy proto xhttp-443 on|off  # Vision 与 XHTTP 共用 / 分开 TCP 端口
+#   proxy export [文件]           # 导出密钥和证书。--password 或 PROXY_EXPORT_PASS 可选加密
+#   proxy import <文件>           # 导入后重新检测 IP、NAT、SNI 和防火墙
+#   proxy doctor [--fix]          # 健康检查。--fix 只拉起服务、对时、同步防火墙、修正权限
 #   bash proxy.sh --help          # 查看全部参数
+# 出错时把拼好的 proxy.sh 行号映回 src/*.sh（build.sh 写入的模块对照），并打印调用栈。
 #   bash proxy.sh --xray-ver v26.3.27 --hy2-ver v2.6.1 --singbox-ver v1.11.0
 #                                 # 安装指定的已发布版本
 #   proxy update --rollback [xray|hy2|singbox|all]

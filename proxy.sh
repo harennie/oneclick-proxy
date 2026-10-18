@@ -28,7 +28,11 @@
 #   bash proxy.sh proto           # 协议开关（菜单第 16 项「协议开关」）
 #                                 # 默认 Vision、XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC / AnyTLS
 #   proxy proto xhttp-443 on|off  # Vision 与 XHTTP 共用 / 分开 TCP 端口
+#   proxy export [文件]           # 导出密钥和证书。--password 或 PROXY_EXPORT_PASS 可选加密
+#   proxy import <文件>           # 导入后重新检测 IP、NAT、SNI 和防火墙
+#   proxy doctor [--fix]          # 健康检查。--fix 只拉起服务、对时、同步防火墙、修正权限
 #   bash proxy.sh --help          # 查看全部参数
+# 出错时把拼好的 proxy.sh 行号映回 src/*.sh（build.sh 写入的模块对照），并打印调用栈。
 #   bash proxy.sh --xray-ver v26.3.27 --hy2-ver v2.6.1 --singbox-ver v1.11.0
 #                                 # 安装指定的已发布版本
 #   proxy update --rollback [xray|hy2|singbox|all]
@@ -372,7 +376,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;722:src/os.sh:1;1231:src/tune.sh:1;2031:src/xray.sh:1;4054:src/hy2.sh:1;4193:src/firewall.sh:1;5451:src/cert.sh:1;7483:src/cdn.sh:1;8468:src/link.sh:1;8857:src/singbox.sh:1;9435:src/nat.sh:1;10073:src/selftest.sh:1;10218:src/land.sh:1;11664:src/menu.sh:1;12237:src/route.sh:1;12752:src/export.sh:1;12968:src/doctor.sh:1;13303:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;726:src/os.sh:1;1235:src/tune.sh:1;2035:src/xray.sh:1;4058:src/hy2.sh:1;4197:src/firewall.sh:1;5455:src/cert.sh:1;7487:src/cdn.sh:1;8472:src/link.sh:1;8861:src/singbox.sh:1;9439:src/nat.sh:1;10077:src/selftest.sh:1;10222:src/land.sh:1;11668:src/menu.sh:1;12241:src/route.sh:1;12756:src/export.sh:1;12972:src/doctor.sh:1;13307:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -13755,9 +13759,11 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy proto         协议开关（菜单第 16 项）。逐个开/关，不删除已有密钥
                       默认开：Vision、XHTTP+REALITY、Hysteria2
                       默认关：Trojan、TUIC、AnyTLS，以及 CDN 的 XHTTP+TLS / WebSocket+TLS
+                      关闭只停止监听。这里关掉 Hysteria2 不删除程序；
+                      重新安装时 --no-hy2 会移除它（密码仍留在 state.env）
                       Vision 和 XHTTP 都开着时，菜单里的 s 切换是否共用 TCP 端口
   proxy proto xhttp-443 on|off
-                      XHTTP 与 Vision 共用 / 分开 TCP 端口
+                      XHTTP 与 Vision 共用 / 分开 TCP 端口（Xray fallbacks）
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
   proxy port          修改端口。可带 --port、--hy2-port、--xhttp-port；同步开启时 ufw/firewalld 跟着改
@@ -13774,7 +13780,11 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
   bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
-  proxy doctor        只读健康检查。--fix 只做安全修复（拉起服务、对时、同步防火墙、修正权限）
+  proxy doctor        只读健康检查（时间、服务、端口、nftables、ufw/firewalld 同步、
+                      端口跳跃计数、SNI、回环自检、证书到期）。有失败项时退出码非 0
+  proxy doctor --fix  只做安全修复：拉起已停止的服务、对时、按清单重写防火墙同步、
+                      把 state.env 改为 600。这次有过失败项时会再查一遍。
+                      没有失败项时退出码为 0
   proxy speed         测速 / 延迟提示
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
   proxy firewall strict|allow|off
