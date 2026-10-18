@@ -453,9 +453,11 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy proto         协议开关（菜单第 16 项）。逐个开/关，不删除已有密钥
                       默认开：Vision、XHTTP+REALITY、Hysteria2
                       默认关：Trojan、TUIC、AnyTLS，以及 CDN 的 XHTTP+TLS / WebSocket+TLS
+                      关闭只停止监听。这里关掉 Hysteria2 不删除程序；
+                      重新安装时 --no-hy2 会移除它（密码仍留在 state.env）
                       Vision 和 XHTTP 都开着时，菜单里的 s 切换是否共用 TCP 端口
   proxy proto xhttp-443 on|off
-                      XHTTP 与 Vision 共用 / 分开 TCP 端口
+                      XHTTP 与 Vision 共用 / 分开 TCP 端口（Xray fallbacks）
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
   proxy port          修改端口。可带 --port、--hy2-port、--xhttp-port；同步开启时 ufw/firewalld 跟着改
@@ -472,7 +474,11 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
   bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
-  proxy doctor        只读健康检查。--fix 只做安全修复（拉起服务、对时、同步防火墙、修正权限）
+  proxy doctor        只读健康检查（时间、服务、端口、nftables、ufw/firewalld 同步、
+                      端口跳跃计数、SNI、回环自检、证书到期）。有失败项时退出码非 0
+  proxy doctor --fix  只做安全修复：拉起已停止的服务、对时、按清单重写防火墙同步、
+                      把 state.env 改为 600。这次有过失败项时会再查一遍。
+                      没有失败项时退出码为 0
   proxy speed         测速 / 延迟提示
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
   proxy firewall strict|allow|off

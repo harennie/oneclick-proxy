@@ -1,6 +1,6 @@
 # oneclick proxy
 
-单文件 Bash 脚本，一键在 VPS 上安装代理节点，不需要自己的域名。
+一键在 VPS 上安装代理节点，不需要自己的域名。给用户运行的是仓库根目录拼好的 `proxy.sh`；源码在 `src/*.sh`，由 `build.sh` 按固定顺序拼起来。
 
 - 默认装好 VLESS + REALITY + Vision、VLESS + XHTTP + REALITY 和 Hysteria2，可选 Trojan、TUIC、AnyTLS 与 CDN 线路
 - 自动优选 REALITY 伪装站点，Hysteria2 支持端口跳跃；有域名时可以另外申请证书
@@ -37,7 +37,7 @@ apk add bash curl && curl -fsSLo proxy.sh https://raw.githubusercontent.com/hare
 
 ## 一键安装
 
-单文件 Bash 脚本，一键在 VPS 上安装代理节点，不需要自己的域名。有已经解析到本机的自有域名时，可以另外申请证书；不申请时，安装方式和现在一样。默认是 Let's Encrypt 单域名。也可以改成通配符、多域名、ZeroSSL，或只给 CDN 用的 Cloudflare 源站证书。证书签好之后，还可以另开两条给 CDN 用的线路（XHTTP+TLS、WebSocket+TLS），默认关闭，不替换 REALITY。
+给用户运行的是拼好的 `proxy.sh`。仓库里要改的是 `src/*.sh`，`./build.sh` 再拼回根目录的 `proxy.sh`（模块顺序和出错时怎么映回源文件，见 `CONTRIBUTING.md`）。一键在 VPS 上安装代理节点，不需要自己的域名。有已经解析到本机的自有域名时，可以另外申请证书；不申请时，安装方式和现在一样。默认是 Let's Encrypt 单域名。也可以改成通配符、多域名、ZeroSSL，或只给 CDN 用的 Cloudflare 源站证书。证书签好之后，还可以另开两条给 CDN 用的线路（XHTTP+TLS、WebSocket+TLS），默认关闭，不替换 REALITY。
 
 **推荐**：先下载再运行（可以看到交互菜单）
 
@@ -190,7 +190,7 @@ proxy --no-hy2 --auto
 默认一次装好三个，都不需要自己的域名：
 
 - **VLESS + REALITY + XTLS-Vision**（含后量子签名 ML-DSA-65）
-- **VLESS + XHTTP + REALITY**（与 Vision 共用同一把 Reality 密钥和 SNI，单独 TCP 端口）
+- **VLESS + XHTTP + REALITY**（与 Vision 共用同一把 Reality 密钥和 SNI。默认单独 TCP 8443；`--xhttp-on-443` 或 `proxy proto xhttp-443 on` 后改走 Vision 的端口）
 - **Hysteria2**（端口跳跃 + 证书指纹固定）
 
 第一次交互安装会确认 XHTTP 和 Hysteria2，直接回车就是装上。已经装过再重装时，回车沿用现在的开关。`--auto` 第一次按这三个默认值安装；状态里已经记下的开关会沿用，除非写了 `--xhttp` / `--no-xhttp` 或 `--hy2` / `--no-hy2`。更早的状态文件里如果没有 `XHTTP_ENABLED` 这一项，下一次安装会按默认打开 XHTTP。
@@ -229,7 +229,7 @@ proxy --no-hy2 --auto
 - **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」，第 17 项是「申请证书」，第 18 项是「回程线路检测」，第 19 项是「导出配置」，第 20 项是「导入配置」，第 21 项是「健康检查」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注，只写入已开启的 VLESS 入站）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。落地机是另一套 18 项的两列菜单，框标题同样是 `oneclick proxy`。
 - **回程线路检测**：`proxy route` 只测从本机发向大陆的回程（电信 / 联通 / 移动，北京 / 上海 / 广州）。用 nexttrace 的 TCP，缺了会自动装。结果是一张短表和按运营商的汇总，不测国际线路，也不测从家里到本机的去程。不改配置，不重启。详见「回程线路检测」。
 - **落地机 / 落地转发**：`--land` 把本机装成只跑 Shadowsocks 2022 的出口（落地机）；已安装的节点用 `proxy land-add 'ss://...'` 把出口切到落地机（中转），见下文。
-- **健壮性**：`set -o errexit -o pipefail -o errtrace` + 错误陷阱提示出错行；可重复运行（保留已有密钥，只更新组件与配置）；安装前检查端口占用；没有 IPv6 也能正常工作（链接使用 IPv4）；通过 shellcheck 检查。
+- **健壮性**：`set -o errexit -o pipefail -o errtrace`。出错时把合并后的行号（含管道里失败的那一截）映回 `src/*.sh`：先用 `build.sh` 写进脚本的模块对照，对照读不到再扫文件里的 `# @module` 标记，最后才打印拼好文件里的行号，并打出调用栈。`GITHUB_TOKEN` 和导出密码不会出现在这条错误里。可重复运行（保留已有密钥，只更新组件与配置）；安装前检查端口占用；没有 IPv6 也能正常工作（链接使用 IPv4）；通过 shellcheck 检查。
 
 ---
 
@@ -1205,8 +1205,10 @@ proxy uninstall --auto
 - Vision 和 XHTTP 可以共用同一个 TCP 端口：`--xhttp-on-443`，或 `proxy proto xhttp-443 on|off`。协议开关里 Vision 和 XHTTP 都开着时，按 `s` 切换。已有安装默认仍分开。NAT 只有一个 TCP 映射时，`--auto` 直接共用。
 - 只放行模式会把代理端口同步进正在运行的 ufw / firewalld，清单在 `fw-host.list`。已经装过又没写 `--firewall` 时，非交互重装沿用保存的模式。
 - 更新 Xray / Hysteria2 / sing-box 前备份为 `.bak`。`proxy update --rollback` 换回；`--xray-ver`、`--hy2-ver`、`--singbox-ver` 安装指定的已发布版本。
+- 出错时把拼好的 `proxy.sh` 行号映回 `src/*.sh`，并打印调用栈。`GITHUB_TOKEN` 和导出密码不会写进这条错误。
 
 ### v1.5.0
+- 源码改为 `src/*.sh`。`./build.sh` 按写死的顺序拼出根目录的 `proxy.sh`，用户安装下载的仍是这个文件。
 - 防火墙增加三种模式。`strict` 入站默认拒绝；`allow` 只给代理端口、SSH 和端口跳跃写 accept，不接管入站策略，也不改 Docker / Podman 的表；`off` 不写 nftables（`--no-firewall` 相同）。干净机器默认严格。检测到 Docker/Podman、WireGuard、已有防火墙或多个非标准端口时，交互安装默认推荐只放行；`--auto` 且没写 `--firewall` 时直接用只放行。装好后：`proxy firewall strict`、`proxy firewall allow`、`proxy firewall off`。
 - 回程线路检测只测从本机发向大陆的回程（电信 / 联通 / 移动，北京 / 上海 / 广州），默认用 nexttrace 的 TCP。主菜单第 18 项、落地机菜单第 12 项是「回程线路检测」。不再测国际线路，也不打分。
 
