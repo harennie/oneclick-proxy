@@ -28,6 +28,21 @@ proto_ensure_port() { # $1 reality|xhttp|hy2|trojan|tuic|anytls ；失败时调�
     esac
   fi
 }
+xhttp_443_apply() { # $1 = 1 共用，0 分开
+  local on=$1
+  (( REALITY_ENABLED && XHTTP_ENABLED )) || { warn "共用端口需要同时打开 Vision 和 XHTTP。"; return 1; }
+  if [[ $on == 1 ]]; then
+    XHTTP_ON_443=1
+    XHTTP_EXT_PORT=""
+  else
+    XHTTP_ON_443=0
+    proto_ensure_port xhttp || { XHTTP_ON_443=1; warn "没有单独的端口，仍与 Vision 共用。"; return 1; }
+  fi
+  apply_proto_services
+  if [[ $on == 1 ]]; then ok "XHTTP 与 Vision 共用 TCP $(pub_xray_port)。"
+  else ok "XHTTP 使用单独端口 $(pub_xhttp_port)。"; fi
+  show_info
+}
 menu_proto() {
   need_node
   [[ -n $OS_ID ]] || detect_os
@@ -48,8 +63,17 @@ menu_proto() {
       "VLESS + WebSocket + TLS（CDN）  $([[ $WS_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
       "CDN 的 VLESS Encryption  $(vless_enc_label)"
     printf '%s第 9 项只给第 7、8 项加密，不影响 REALITY 和 Hysteria2。sing-box 内核的客户端可能不支持。%s\n' "$C_DIM" "$C_NONE"
+    if (( REALITY_ENABLED && XHTTP_ENABLED )); then
+      printf '  s) XHTTP 与 Vision 共用 TCP %s    当前: %s\n' "$(pub_xray_port)" "$(xhttp_shared && echo 开 || echo 关)"
+    fi
+    if [[ -n $OPT_XHTTP_ON_443 ]]; then
+      xhttp_443_apply "$OPT_XHTTP_ON_443" || true
+      OPT_XHTTP_ON_443=""
+      return 0
+    fi
     local c kind var
     ask c "请选择" "0"
+    if [[ $c == s || $c == S ]]; then xhttp_443_apply "$(xhttp_shared && echo 0 || echo 1)"; continue; fi
     if [[ $c == 9 ]]; then
       menu_vless_enc
       continue
@@ -66,6 +90,14 @@ menu_proto() {
       *) return 0 ;;
     esac
     if (( ${!var} )); then
+      if [[ $kind == reality ]] && xhttp_shared; then
+        XHTTP_ON_443=0
+        if ! proto_ensure_port xhttp; then
+          XHTTP_ON_443=1
+          warn "没有单独的端口给 XHTTP，Vision 保持打开。"
+          continue
+        fi
+      fi
       printf -v "$var" 0
       if ! proto_any_enabled; then
         printf -v "$var" 1
@@ -83,10 +115,16 @@ menu_proto() {
           warn "没有打开。REALITY 和原来的协议保持原样。"
           continue
         fi
+      elif [[ $kind == xhttp ]] && (( REALITY_ENABLED )) && confirm "与 Vision 共用 TCP $(pub_xray_port)？" n; then
+        XHTTP_ON_443=1
+        XHTTP_EXT_PORT=""
       elif ! proto_ensure_port "$kind"; then
         printf -v "$var" 0
+        [[ $kind == xhttp ]] && XHTTP_ON_443=0
         warn "没有可用端口，保持关闭。"
         continue
+      else
+        [[ $kind == xhttp ]] && XHTTP_ON_443=0
       fi
       info "已开启。"
     fi
@@ -156,7 +194,10 @@ show_menu() {
     "切换 NAT 模式（当前: $(nat_pref_text)）" \
     "协议开关" \
     "申请证书" \
-    "回程线路检测"
+    "回程线路检测" \
+    "导出配置（迁到另一台机器）" \
+    "导入配置" \
+    "健康检查"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -178,6 +219,9 @@ show_menu() {
     16) act=menu_proto ;;
     17) act=menu_cert ;;
     18) act=do_route ;;
+    19) act=menu_export ;;
+    20) act=menu_import ;;
+    21) act=menu_doctor ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -225,7 +269,10 @@ show_land_menu() {
     "回程线路检测" \
     "出口：本机直连（清除下一跳与原样转发）" \
     "出口：加密转发（SS2022 再加密到下一跳）" \
-    "出口：原样转发（不解密，DNAT 到最终落地）"
+    "出口：原样转发（不解密，DNAT 到最终落地）" \
+    "导出配置（迁到另一台机器）" \
+    "导入配置" \
+    "健康检查"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -244,6 +291,9 @@ show_land_menu() {
     13) act=menu_land_direct ;;
     14) act=menu_land_relay ;;
     15) act=menu_land_raw ;;
+    16) act=menu_export ;;
+    17) act=menu_import ;;
+    18) act=menu_doctor ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -271,6 +321,8 @@ usage() {
   --xhttp / --no-xhttp
                       开启 / 关闭 VLESS + XHTTP + REALITY（默认开启，免自己的域名）
   --xhttp-port <端口> XHTTP 的 TCP 端口（默认 8443；NAT 模式为外部端口）
+  --xhttp-on-443      XHTTP 与 Vision 共用同一个 TCP 端口（默认仍是分开的 8443）
+  --no-xhttp-on-443   XHTTP 使用单独端口
   --trojan            额外启用 Trojan + REALITY（默认不装）
   --no-trojan         关闭 Trojan
   --trojan-port <端口> Trojan TCP 端口（默认 8444）
@@ -316,9 +368,13 @@ usage() {
   --firewall <模式>   strict 入站默认拒绝 | allow 只放行（不接管入站）| off 不写 nftables
                       不写时：干净机器默认 strict；检测到 Docker/Podman、WireGuard、
                       已有防火墙或多个非标准端口时，交互安装默认推荐 allow，
-                      非交互安装直接用 allow。--no-firewall 同 off
+                      非交互安装直接用 allow。allow 时若 ufw 或 firewalld 正在运行，
+                      会把代理端口写进它们。--no-firewall 同 off
   --no-firewall       不配置 nftables 防火墙（同 --firewall off）
   --no-upgrade        跳过系统软件包升级
+  --xray-ver <版本>   安装指定的 Xray 发布标签（例如 v26.3.27）。直接下载该版本，校验通过后才替换
+  --hy2-ver <版本>    安装指定的 Hysteria2 发布标签（例如 v2.6.1 或 app/v2.6.1）
+  --singbox-ver <版本> 安装指定的 sing-box 发布标签（例如 v1.11.0）
   --no-tune           跳过 sysctl 网络调优
   --tune-preset <名>  安装/调优使用的预设（默认 bbr-fq，见下方「网络调优」）
   -h, --help          显示帮助
@@ -397,13 +453,26 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy proto         协议开关（菜单第 16 项）。逐个开/关，不删除已有密钥
                       默认开：Vision、XHTTP+REALITY、Hysteria2
                       默认关：Trojan、TUIC、AnyTLS，以及 CDN 的 XHTTP+TLS / WebSocket+TLS
+                      Vision 和 XHTTP 都开着时，菜单里的 s 切换是否共用 TCP 端口
+  proxy proto xhttp-443 on|off
+                      XHTTP 与 Vision 共用 / 分开 TCP 端口
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
-  proxy port          修改端口
+  proxy port          修改端口。可带 --port、--hy2-port、--xhttp-port；同步开启时 ufw/firewalld 跟着改
   proxy user          用户管理
-  proxy update        更新组件
+  proxy update        更新组件。菜单里可以回滚到 .bak
+  proxy update --xray-ver <版本> [--hy2-ver <版本>] [--singbox-ver <版本>]
+                      只把写出的内核换成这个已经发布的版本
+  proxy update --rollback [xray|hy2|singbox|all]
+                      用 <程序>.bak 换回并重启服务，打印 旧版本 -> 新版本
+                      不写目标时回滚这三个，没有 .bak 的跳过。点名某一个却没有 .bak 时失败退出
+                      systemd 和 OpenRC 都用同一套重启
   proxy update-script 只更新本脚本
+  proxy export [文件]  导出密钥和证书（权限 600）。--password 加密；没有终端时请设置 PROXY_EXPORT_PASS
+  proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
+  bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
+  proxy doctor        只读健康检查。--fix 只做安全修复（拉起服务、对时、同步防火墙、修正权限）
   proxy speed         测速 / 延迟提示
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
   proxy firewall strict|allow|off
@@ -458,6 +527,8 @@ parse_args() {
       --no-reality) OPT_REALITY=0 ;;
       --xhttp) OPT_XHTTP=1 ;;
       --no-xhttp) OPT_XHTTP=0 ;;
+      --xhttp-on-443) OPT_XHTTP_ON_443=1; OPT_XHTTP=1 ;;
+      --no-xhttp-on-443) OPT_XHTTP_ON_443=0 ;;
       --xhttp-port) is_port_opt "${2-}" || die "--xhttp-port 参数无效"; OPT_XHTTP_PORT=$2; shift ;;
       --xhttp-port=*) OPT_XHTTP_PORT=${1#*=}; is_port_opt "$OPT_XHTTP_PORT" || die "--xhttp-port 参数无效" ;;
       --trojan) OPT_TROJAN=1 ;;
@@ -613,6 +684,13 @@ parse_args() {
         [[ -n ${2-} ]] || die "--land-allow 需要参数（例如 1.2.3.4,2001:db8::/64，或 none）"
         if [[ ${2,,} == none ]]; then OPT_LAND_ALLOW=none; else land_norm_allow "$2" || die "--land-allow 中有无效地址: ${LAND_BAD}"; OPT_LAND_ALLOW=$2; fi
         shift ;;
+          --import)
+        [[ -n ${2-} && -f ${2-} ]] || die "--import 需要已存在的导出文件"
+        OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
+      --import=*)
+        OPT_IMPORT=${1#*=}; [[ -f $OPT_IMPORT ]] || die "--import 需要已存在的导出文件"
+        OPT_ACTION=import ;;
+      --password) OPT_EXPORT_ENC=1 ;;
       --force) OPT_FORCE=1 ;;
       land-add|relay-add)
         OPT_ACTION=land; OPT_LAND_ACT=add
@@ -637,14 +715,73 @@ parse_args() {
       -v|--version|version) echo "$SCRIPT_VERSION"; exit 0 ;;
       install) OPT_ACTION=install ;;
       info|link|links|qr) OPT_ACTION=info ;;
-      proto|protos|protocol) OPT_ACTION=proto ;;
+      proto|protos|protocol)
+        OPT_ACTION=proto
+        if [[ ${2-} == xhttp-443 ]]; then
+          case ${3-} in
+            on|1|enable) OPT_XHTTP_ON_443=1 ;;
+            off|0|disable) OPT_XHTTP_ON_443=0 ;;
+            *) die "用法: proxy proto xhttp-443 on|off" ;;
+          esac
+          shift 2
+        fi ;;
       sni) OPT_ACTION=sni ;;
       regen|rekey) OPT_ACTION=regen ;;
       port|ports) OPT_ACTION=port ;;
       user|users) OPT_ACTION=user ;;
+      --xray-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--xray-ver 需要版本号（例如 v26.3.27）"
+        OPT_XRAY_VER=$2; shift ;;
+      --xray-ver=*)
+        OPT_XRAY_VER=${1#*=}
+        [[ -n $OPT_XRAY_VER && $OPT_XRAY_VER != -* ]] || die "--xray-ver 需要版本号（例如 v26.3.27）" ;;
+      --hy2-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--hy2-ver 需要版本号（例如 v2.6.1）"
+        OPT_HY2_VER=$2; shift ;;
+      --hy2-ver=*)
+        OPT_HY2_VER=${1#*=}
+        [[ -n $OPT_HY2_VER && $OPT_HY2_VER != -* ]] || die "--hy2-ver 需要版本号（例如 v2.6.1）" ;;
+      --singbox-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--singbox-ver 需要版本号（例如 v1.11.0）"
+        OPT_SINGBOX_VER=$2; shift ;;
+      --singbox-ver=*)
+        OPT_SINGBOX_VER=${1#*=}
+        [[ -n $OPT_SINGBOX_VER && $OPT_SINGBOX_VER != -* ]] || die "--singbox-ver 需要版本号（例如 v1.11.0）" ;;
+      --rollback)
+        OPT_ACTION=update
+        if [[ -n ${2-} && ${2} != -* ]]; then OPT_ROLLBACK=${2,,}; shift
+        else OPT_ROLLBACK=all; fi
+        case $OPT_ROLLBACK in
+          xray) ;;
+          hy2|hysteria|hysteria2) OPT_ROLLBACK=hy2 ;;
+          singbox|sing-box|sb) OPT_ROLLBACK=singbox ;;
+          all) ;;
+          *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
+        esac ;;
+      --rollback=*)
+        OPT_ACTION=update
+        OPT_ROLLBACK=${1#*=}
+        OPT_ROLLBACK=${OPT_ROLLBACK,,}
+        case $OPT_ROLLBACK in
+          xray) ;;
+          hy2|hysteria|hysteria2) OPT_ROLLBACK=hy2 ;;
+          singbox|sing-box|sb) OPT_ROLLBACK=singbox ;;
+          all) ;;
+          *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
+        esac ;;
       update|upgrade) OPT_ACTION=update ;;
+      export)
+        OPT_ACTION="export"
+        if [[ ${2-} == --password ]]; then OPT_EXPORT_ENC=1; shift; fi
+        if [[ -n ${2-} && ${2} != -* ]]; then OPT_EXPORT_PATH=$2; shift; fi ;;
+      import)
+        [[ -n ${2-} ]] || die "用法: proxy import 文件"
+        OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
       update-script) OPT_ACTION=update-script ;;
       status|log|logs) OPT_ACTION=status ;;
+      doctor)
+        OPT_ACTION=doctor
+        if [[ ${2-} == --fix ]]; then OPT_DOCTOR_FIX=1; shift; fi ;;
       speed) OPT_ACTION=speed ;;
       firewall|fw)
         OPT_ACTION=firewall
@@ -686,7 +823,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || -n $OPT_XRAY_VER || -n $OPT_HY2_VER || -n $OPT_SINGBOX_VER || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert
@@ -743,6 +880,7 @@ main() {
     update) menu_update ;;
     update-script) update_script ;;
     status) menu_status ;;
+    doctor) do_doctor ;;
     speed) menu_speed ;;
     firewall) menu_firewall ;;
     nat) menu_nat ;;
@@ -755,6 +893,8 @@ main() {
     land) do_land_cli ;;
     allow) land_menu_allow ;;
     uninstall) do_uninstall ;;
+    export) do_export ;;
+    import) do_import ;;
     "")
       if [[ ! -t 0 && ! -r /dev/tty ]]; then usage; die "非交互环境请使用 --auto。"; fi
       while :; do show_menu; pause; done ;;

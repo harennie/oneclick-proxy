@@ -26,7 +26,12 @@
 #   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
 #   bash proxy.sh proto           # 协议开关（菜单第 16 项「协议开关」）
 #                                 # 默认 Vision、XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC / AnyTLS
+#   proxy proto xhttp-443 on|off  # Vision 与 XHTTP 共用 / 分开 TCP 端口
 #   bash proxy.sh --help          # 查看全部参数
+#   bash proxy.sh --xray-ver v26.3.27 --hy2-ver v2.6.1 --singbox-ver v1.11.0
+#                                 # 安装指定的已发布版本
+#   proxy update --rollback [xray|hy2|singbox|all]
+#                                 # 用 .bak 换回内核并重启
 # 安装完成后可直接使用命令: proxy
 #
 # 支持: Debian 11/12/13, Ubuntu 20.04+, Rocky/Alma/CentOS Stream 8/9(+), RHEL, Fedora (systemd, amd64/arm64)
@@ -40,7 +45,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.6.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -69,6 +74,8 @@ readonly SB_RC="/etc/init.d/sing-box"
 readonly SB_LOG="/var/log/sing-box/sing-box.log"
 readonly FW_FILE="${STATE_DIR}/firewall.nft"
 readonly FW_UNIT="/etc/systemd/system/proxy-oneclick-fw.service"
+# 写进 ufw / firewalld 的条目。只删除这份清单里、且确为本脚本新建的规则。不记录 SSH，也不改用户原来就有的放行。
+readonly FW_HOST_FILE="${STATE_DIR}/fw-host.list"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-proxy-tune.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-proxy-tune.conf"
 readonly SYSTEMD_LIMITS_FILE="/etc/systemd/system.conf.d/99-proxy-tune.conf"
@@ -164,6 +171,7 @@ OPT_HY2_PORT=""
 OPT_REALITY=""      # 空=沿用（默认开）; 1/0
 OPT_XHTTP=""        # 空=安装时默认开（状态里已有则沿用）; 1/0
 OPT_XHTTP_PORT=""
+OPT_XHTTP_ON_443="" # 空=默认分开（8443）；1=与 Vision 共用 TCP 端口；0=强制分开
 OPT_TROJAN=""       # 空=默认关; 1/0
 OPT_TROJAN_PORT=""
 OPT_TUIC=""         # 空=默认关; 1/0
@@ -204,6 +212,15 @@ OPT_LAND_ALLOW=""   # 落地机来源 IP 白名单（逗号分隔，none 清空�
 OPT_LAND_LINK=""    # 中转机 land-add 的 ss:// 链接
 OPT_LAND_ACT=""     # 中转机落地转发子命令: add | on | off | del | test
 OPT_FORCE=0         # land-add 测试不通过也强制启用
+OPT_IMPORT=""       # --import / proxy import 的文件
+OPT_EXPORT_PATH=""  # proxy export 的输出路径，空则用默认
+OPT_EXPORT_ENC=0    # 1 = 导出时用 openssl 加密
+OPT_DOCTOR_FIX=0    # 1 = proxy doctor --fix
+OPT_XRAY_VER=""     # 安装 / proxy update：指定 Xray 发布标签
+OPT_HY2_VER=""      # 安装 / proxy update：指定 Hysteria2 发布标签
+OPT_SINGBOX_VER=""  # 安装 / proxy update：指定 sing-box 发布标签
+OPT_ROLLBACK=""     # proxy update --rollback：xray | hy2 | singbox | all
+IMPORT_MODE=0       # 1 = 本次安装来自导入，要重新检测 IP / NAT / SNI / 防火墙
 OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
 OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）
 OPT_CERT_EMAIL=""   # 可选，交给 Let's Encrypt；空则不登记邮箱
@@ -352,10 +369,76 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
   else printf '%s  %s%s\n' "$C_DIM" "$(ui_pad "$2" 28)未开启" "$C_NONE"; fi
 }
 
+# build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
+# 占位符还在时表示没构建，映射直接跳过。
+readonly __MODULE_MAP="__BUILD_MODULE_MAP__"
+err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
+  local line=$1 ent p f s best_p=0 best_f="" best_s=0
+  [[ $line =~ ^[0-9]+$ ]] || return 1
+  [[ -n ${__MODULE_MAP:-} && $__MODULE_MAP != *__BUILD_MODULE_MAP__* ]] || return 1
+  local IFS=';'
+  local -a ents=()
+  read -r -a ents <<<"$__MODULE_MAP"
+  for ent in "${ents[@]}"; do
+    p=${ent%%:*}; s=${ent##*:}; f=${ent#*:}; f=${f%:*}
+    [[ $p =~ ^[0-9]+$ && $s =~ ^[0-9]+$ && -n $f ]] || continue
+    if (( 10#$p <= 10#$line && 10#$p >= best_p )); then best_p=$p; best_f=$f; best_s=$s; fi
+  done
+  (( best_p > 0 )) || return 1
+  printf '%s:%s' "$best_f" $(( 10#$best_s + 10#$line - 10#$best_p ))
+}
+err_from_file() { # 读 $0 里的 # @module。管道运行时文件不可读，交给调用方退回行号。
+  local line=$1 n=0 row mark="" start=0 src
+  [[ $line =~ ^[0-9]+$ && -r $0 && -f $0 ]] || return 1
+  while IFS= read -r row || [[ -n $row ]]; do
+    n=$(( n + 1 ))
+    if [[ $row == '# @module '* ]]; then
+      if (( n == 10#$line )); then printf '%s:1' "${row#\# @module }"; return 0; fi
+      if (( n < 10#$line )); then mark=${row#\# @module }; start=$n; fi
+    fi
+    (( n >= 10#$line )) && break
+  done <"$0"
+  [[ -n $mark && start -gt 0 ]] || return 1
+  if [[ $mark == src/core.sh ]]; then src=$(( 10#$line - start + 1 ))
+  else src=$(( 10#$line - start )); fi
+  (( src > 0 )) || return 1
+  printf '%s:%s' "$mark" "$src"
+}
+err_loc() { # $1 合并后的行号
+  local loc=""
+  loc=$(err_from_map "$1" 2>/dev/null) || loc=""
+  [[ -n $loc ]] || loc=$(err_from_file "$1" 2>/dev/null) || loc=""
+  if [[ -n $loc ]]; then printf '%s' "$loc"; else printf '第 %s 行' "$1"; fi
+}
+err_print_stack() {
+  local i fn bl loc n=0 row
+  local -a rows=()
+  (( ${#FUNCNAME[@]} > 1 )) || return 0
+  for (( i=1; i<${#FUNCNAME[@]}; i++ )); do
+    fn=${FUNCNAME[$i]}
+    # main 留着：顶层失败时栈里往往只剩它，丢掉就会只打出一个空的「调用栈」标题。
+    [[ $fn == on_error || $fn == err_print_stack || $fn == err_loc ]] && continue
+    bl=${BASH_LINENO[$(( i - 1 ))]:-0}
+    [[ $bl =~ ^[0-9]+$ ]] || bl=0
+    if [[ $bl == 0 ]]; then loc="脚本入口"
+    else loc=$(err_loc "$bl"); fi
+    n=$(( n + 1 ))
+    rows+=("$(printf '  [%s] %s() <- %s' "$n" "$fn" "$loc")")
+  done
+  (( n > 0 )) || return 0
+  printf '%s调用栈：%s\n' "$C_YELLOW" "$C_NONE" >&2
+  for row in "${rows[@]}"; do printf '%s\n' "$row" >&2; done
+  return 0
+}
 on_error() {
-  local rc=$? line=$1 cmd=$2
+  local rc=$? line=$1 cmd=$2 where
   trap - ERR
-  printf '\n%s[错误]%s 脚本在第 %s 行执行失败 (退出码 %s)：\n    %s\n' "$C_RED" "$C_NONE" "$line" "$rc" "$cmd" >&2
+  if [[ -n ${GITHUB_TOKEN:-} ]]; then cmd=${cmd//${GITHUB_TOKEN}/***}; fi
+  if [[ -n ${PROXY_EXPORT_PASS:-} ]]; then cmd=${cmd//${PROXY_EXPORT_PASS}/***}; fi
+  cmd=${cmd//Authorization: Bearer */Authorization: Bearer ***}
+  where=$(err_loc "$line")
+  printf '\n%s[错误]%s 脚本在 %s 执行失败 (退出码 %s)：\n    %s\n' "$C_RED" "$C_NONE" "$where" "$rc" "$cmd" >&2
+  err_print_stack
   printf '%s如需帮助，请带上以上信息及服务日志（journalctl -xe 或 /var/log/xray、/var/log/hysteria）反馈。重新运行本脚本是安全的（幂等）。%s\n' "$C_YELLOW" "$C_NONE" >&2
   exit "$rc"
 }
@@ -455,6 +538,17 @@ rand_hex() { openssl rand -hex "$1"; }
 rand_pass() { openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | cut -c1-24; }
 ver_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | awk 'NR==1')" == "$2" ]]; }
 fetch() { curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 --retry 2 --retry-delay 2 "$@"; }
+# 访问 api.github.com。设置了 GITHUB_TOKEN 时带上，令牌不出现在命令行里，也不写进日志。
+gh_curl() {
+  if [[ -z ${GITHUB_TOKEN:-} ]]; then curl "$@"; return; fi
+  local rc=0 cfg
+  cfg=$(mktemp)
+  chmod 600 "$cfg"
+  awk 'BEGIN{t=ENVIRON["GITHUB_TOKEN"]; printf "header = \"Authorization: Bearer %s\"\n", t}' >"$cfg"
+  curl --config "$cfg" "$@" || rc=$?
+  rm -f "$cfg"
+  return "$rc"
+}
 host_fmt() { [[ $1 == *:* ]] && printf '[%s]' "$1" || printf '%s' "$1"; }
 
 # ----------------------------- 服务管理（systemd / OpenRC 抽象） -----------------------------
@@ -536,12 +630,12 @@ take_lock() {
 # ----------------------------- 状态持久化 -----------------------------
 # 持久化的键
 STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY MLDSA_ON SNI SNI_TARGET
-            HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED FW_MODE SSH_PORTS
+            HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED FW_MODE FW_HOST_SYNC SSH_PORTS
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
             HOP_BACKEND VIRT DNS64_SET
             LAND_MODE LAND_METHOD LAND_KEY LAND_ALLOW RELAY_LINK RELAY_ON RELAY_SOCKS FWD_LINK FWD_ON NAT_PREF
-            REALITY_ENABLED XHTTP_ENABLED XHTTP_PORT XHTTP_PATH XHTTP_EXT_PORT
+            REALITY_ENABLED XHTTP_ENABLED XHTTP_PORT XHTTP_PATH XHTTP_EXT_PORT XHTTP_ON_443
             TROJAN_ENABLED TROJAN_PORT TROJAN_PASS TROJAN_EXT_PORT
             TUIC_ENABLED TUIC_PORT TUIC_PASS TUIC_EXT_PORT
             ANYTLS_ENABLED ANYTLS_PORT ANYTLS_PASS ANYTLS_EXT_PORT
@@ -552,11 +646,11 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
             CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
-HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" SSH_PORTS=""
+HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" FW_HOST_SYNC=0 SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
 # 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。
 REALITY_ENABLED=1
-XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT=""
+XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT="" XHTTP_ON_443=0
 TROJAN_ENABLED=0 TROJAN_PORT=8444 TROJAN_PASS="" TROJAN_EXT_PORT=""
 TUIC_ENABLED=0 TUIC_PORT=8446 TUIC_PASS="" TUIC_EXT_PORT=""
 ANYTLS_ENABLED=0 ANYTLS_PORT=8445 ANYTLS_PASS="" ANYTLS_EXT_PORT=""

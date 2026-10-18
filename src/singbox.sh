@@ -169,10 +169,23 @@ local_pick() { # $1 proto $2 变量 $3 --xx-port $4 名称 $5 允许的进程名
     return 0
   done
 }
+confirm_xhttp_share() {
+  if (( ! XHTTP_ENABLED || ! REALITY_ENABLED )); then XHTTP_ON_443=0; return 0; fi
+  if [[ -n $OPT_XHTTP_ON_443 ]]; then XHTTP_ON_443=$OPT_XHTTP_ON_443; return 0; fi
+  if (( OPT_AUTO )); then return 0; fi
+  local def=n
+  [[ ${XHTTP_ON_443:-0} == 1 ]] && def=y
+  if confirm "XHTTP 与 Vision 共用 TCP ${XRAY_PORT}？（否则 XHTTP 单独监听 ${XHTTP_PORT:-8443}）" "$def"; then
+    XHTTP_ON_443=1
+  else
+    XHTTP_ON_443=0
+  fi
+}
 choose_extra_local() {
   confirm_xhttp
+  confirm_xhttp_share
   local_seed_used
-  if (( XHTTP_ENABLED )); then local_pick tcp XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then local_pick tcp XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}"; fi
   if (( TROJAN_ENABLED )); then local_pick tcp TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" "${TROJAN_PORT:-8444}"; fi
   if (( ANYTLS_ENABLED )); then local_pick tcp ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" "${ANYTLS_PORT:-8445}"; fi
   if (( TUIC_ENABLED )); then local_pick udp TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" "${TUIC_PORT:-8446}"; fi
@@ -184,10 +197,36 @@ choose_extra_local() {
   fi
   proto_any_enabled || die "至少需要启用一个协议（Reality / XHTTP / Hysteria2 / Trojan / TUIC / AnyTLS）。"
 }
+nat_usable_count() {
+  local n=0 p
+  while read -r p; do
+    [[ -n $p ]] || continue
+    nat_excluded "$p" && continue
+    n=$(( n + 1 ))
+    (( n > 1 )) && break
+  done < <(nat_all_ext)
+  printf '%s' "$n"
+}
 choose_extra_nat() {
   confirm_xhttp
   nat_seed_used
-  if (( XHTTP_ENABLED )); then nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" || XHTTP_ENABLED=0; fi
+  if (( XHTTP_ENABLED && REALITY_ENABLED )); then
+    if [[ -n $OPT_XHTTP_ON_443 ]]; then XHTTP_ON_443=$OPT_XHTTP_ON_443
+    elif [[ $(nat_usable_count) == 1 ]]; then
+      if (( OPT_AUTO )); then
+        XHTTP_ON_443=1
+        info "只有一个 TCP 映射，XHTTP 与 Vision 共用外部端口 ${XRAY_EXT_PORT}。"
+      elif confirm "只有一个 TCP 映射。让 XHTTP 和 Vision 共用外部端口 ${XRAY_EXT_PORT}？" y; then
+        XHTTP_ON_443=1
+      else
+        XHTTP_ON_443=0
+      fi
+    else
+      confirm_xhttp_share
+    fi
+  fi
+  if xhttp_shared; then XHTTP_EXT_PORT=""; info "XHTTP 链接端口与 Vision 相同：$(pub_xray_port)。"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" || XHTTP_ENABLED=0; fi
   if (( TROJAN_ENABLED )); then nat_pick_mapped tcp TROJAN_EXT_PORT TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" || TROJAN_ENABLED=0; fi
   if (( ANYTLS_ENABLED )); then nat_pick_mapped tcp ANYTLS_EXT_PORT ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" || ANYTLS_ENABLED=0; fi
   if (( TUIC_ENABLED )); then nat_pick_mapped udp TUIC_EXT_PORT TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" || TUIC_ENABLED=0; fi
@@ -201,7 +240,7 @@ choose_extra_nat() {
       HOP_RANGE="" HOP_EXT_RANGE="" HOP_BACKEND=""
     fi
   fi
-  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口时放不下 XHTTP，请再加一条映射，或先用 Reality + Hysteria2（--no-xhttp）。"
+  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口、又不共用 443 时放不下 XHTTP，请再加一条映射，或加 --xhttp-on-443。"
 }
 
 ensure_sb_user() {
@@ -298,21 +337,30 @@ RC
   fi
 }
 install_singbox() {
+  BIN_UPDATED_SB=0
+  BIN_BAK_SKIP_SB=0
   step "安装 / 更新 sing-box（TUIC v5 / AnyTLS）"
   mktmp
-  local tag ver asset url sum want cur="" bin dg
-  tag=$(gh_latest_tag SagerNet/sing-box)
-  [[ -n $tag ]] || { github_hint; die "获取 sing-box 最新版本号失败。"; }
+  local tag="" ver asset url sum want cur="" bin dg old="" replaced=0
+  old=$(bin_version singbox "$SB_BIN" || true)
+  if [[ -n $OPT_SINGBOX_VER ]]; then
+    tag=$(bin_norm_tag singbox "$OPT_SINGBOX_VER") || die "sing-box 版本号无效: ${OPT_SINGBOX_VER}（例如 v1.11.0）"
+    gh_release_ok SagerNet/sing-box "$tag" || die "找不到 sing-box 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag SagerNet/sing-box)
+    [[ -n $tag ]] || { github_hint; die "获取 sing-box 最新版本号失败。"; }
+  fi
   ver=${tag#v}
-  [[ -x $SB_BIN ]] && cur=$("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')
-  if [[ $cur == "$ver" ]]; then
-    ok "sing-box 已是最新版本 ${ver}，跳过下载。"
+  cur=$old
+  if [[ -n $cur && $cur == "$ver" ]]; then
+    if [[ -n $OPT_SINGBOX_VER ]]; then ok "sing-box 已是指定版本 ${ver}，跳过下载。"
+    else ok "sing-box 已是最新版本 ${ver}，跳过下载。"; fi
   else
     asset=$(sb_asset_name "$ver")
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
     info "下载 ${asset} ..."
     fetch -o "${TMP_DIR}/${asset}" "$url" || { github_hint; die "下载 sing-box 失败。"; }
-    want=$(curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
+    want=$(gh_curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
       "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${tag}" 2>/dev/null \
       | jq -r --arg n "$asset" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null) || want=""
     want=${want#sha256:}
@@ -328,12 +376,19 @@ install_singbox() {
     bin=$(find "$dg" -type f -name sing-box | head -n1)
     [[ -n $bin ]] || die "压缩包中没有 sing-box 可执行文件。"
     chmod 755 "$bin"
-    "$bin" version >/dev/null 2>&1 || die "下载的 sing-box 无法运行（架构或 musl/glibc 不匹配？当前 ${ARCH} / ${OS_ID:-未知}）。"
+    # 先在临时路径校验，通过后才备份并替换正在使用的程序
+    if ! sb_check_bin "$bin"; then
+      rm -rf "$dg"
+      die "下载的 sing-box 未通过校验，未替换现有程序。"
+    fi
+    if [[ $cur != "$ver" ]]; then bin_backup "$SB_BIN" singbox; fi
     install -m 755 "$bin" "${SB_BIN}.new" && mv -f "${SB_BIN}.new" "$SB_BIN"
+    rm -rf "$dg"
+    replaced=1
   fi
   ensure_sb_user
   write_singbox_service
-  ok "sing-box 已安装: $("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')"
+  if (( replaced )); then bin_finish_install singbox "$SB_BIN" "sing-box" "$old"; fi
 }
 sb_copy_cert() {
   mkdir -p "$HY_DIR" "$SB_DIR"
@@ -413,13 +468,19 @@ restart_singbox() {
   sleep 1
   if ! svc_active sing-box; then
     svc_logs sing-box 20 >&2 || true
+    local rc=0
+    bin_restart_failed singbox "$SB_BIN" sing-box "sing-box" || rc=$?
+    if (( rc == 0 )); then die "sing-box 更新后没有跑起来，已恢复备份。"
+    elif (( rc == 2 )); then die "sing-box 更新后没有跑起来，恢复备份后仍未运行。"
+    fi
     die "sing-box 启动失败，请查看上方日志。"
   fi
+  BIN_UPDATED_SB=0
   ok "sing-box 运行中 ($( ((TUIC_ENABLED)) && echo -n "TUIC UDP $([[ -n $TUIC_EXT_PORT && $NAT_MODE == 1 ]] && echo "$TUIC_EXT_PORT" || echo "$TUIC_PORT")")$( ((TUIC_ENABLED && ANYTLS_ENABLED)) && echo -n " / ")$( ((ANYTLS_ENABLED)) && echo -n "AnyTLS TCP $([[ -n $ANYTLS_EXT_PORT && $NAT_MODE == 1 ]] && echo "$ANYTLS_EXT_PORT" || echo "$ANYTLS_PORT")"))"
 }
 remove_singbox() {
   svc_disable_stop sing-box
-  rm -f "$SB_UNIT" "$SB_RC" "$SB_BIN"
+  rm -f "$SB_UNIT" "$SB_RC" "$SB_BIN" "${SB_BIN}.bak" "${SB_BIN}.prebak"
   rm -rf "$SB_DIR" /etc/systemd/system/sing-box.service.d /var/log/sing-box
   if id sing-box >/dev/null 2>&1; then userdel sing-box >/dev/null 2>&1 || deluser sing-box >/dev/null 2>&1 || true; fi
   if getent group sing-box >/dev/null 2>&1; then groupdel sing-box >/dev/null 2>&1 || delgroup sing-box >/dev/null 2>&1 || true; fi

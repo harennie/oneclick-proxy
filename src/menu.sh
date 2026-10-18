@@ -58,38 +58,42 @@ menu_change_ports() {
   if (( LAND_MODE )); then land_menu_port; return; fi
   nat_pref_guard || return 0
   if (( NAT_MODE )); then menu_change_ports_nat; return; fi
-  local oldx=$XRAY_PORT oldh=$HY2_PORT
+  local oldx=$XRAY_PORT oldh=$HY2_PORT oldxh=${XHTTP_PORT:-}
   choose_ports_interactive
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
   if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
   if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
-  ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}$( ((HY2_ENABLED)) && echo "，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}")"
+  local extra=""
+  if (( HY2_ENABLED )); then extra+="，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then extra+="，XHTTP TCP ${oldxh} -> ${XHTTP_PORT}"; fi
+  ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}${extra}"
   cloud_fw_reminder
 }
 menu_change_ports_nat() {
-  local oldx=$XRAY_EXT_PORT oldh=$HY2_EXT_PORT
+  local oldx=$XRAY_EXT_PORT oldh=$HY2_EXT_PORT oldxh=${XHTTP_EXT_PORT:-}
   detect_os; detect_virt
-  local s1=$OPT_PORT s2=$OPT_HY2_PORT s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
-  OPT_PORT="" OPT_HY2_PORT="" OPT_NAT_EXT="" OPT_NAT_ADDR=""
+  local s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
+  # 保留 --port / --hy2-port / --xhttp-port，命令行可以直接改。映射列表仍按已保存的重新确认。
+  OPT_NAT_EXT="" OPT_NAT_ADDR=""
   choose_nat_addr
   choose_nat_ports
-  OPT_PORT=$s1 OPT_HY2_PORT=$s2 OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
+  OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
   if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
   if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
-  ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}$( ((HY2_ENABLED)) && echo "，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}")"
+  local extra=""
+  if (( HY2_ENABLED )); then extra+="，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then extra+="，XHTTP 外部端口 ${oldxh:-无} -> ${XHTTP_EXT_PORT}"; fi
+  ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}${extra}"
   cloud_fw_reminder
 }
 choose_ports_interactive() {
-  # 修改端口时允许当前服务占用自身端口
-  local save_opt=$OPT_PORT save_h=$OPT_HY2_PORT
-  OPT_PORT="" OPT_HY2_PORT=""
+  # 保留 --port / --hy2-port / --xhttp-port。没写的那些会在 choose_ports 里询问。
   choose_ports
-  OPT_PORT=$save_opt OPT_HY2_PORT=$save_h
 }
 
 menu_users() {
@@ -171,9 +175,20 @@ menu_users() {
 }
 
 menu_update() {
+  if [[ -n ${OPT_ROLLBACK:-} ]]; then
+    [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]] && die "回滚和指定版本不能一起用。"
+    do_rollback "$OPT_ROLLBACK"
+    return 0
+  fi
   need_installed
+  if [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]]; then
+    do_pinned_update
+    return 0
+  fi
   preflight
-  echo "  1) 更新 Xray-core   2) 更新 Hysteria2   3) 更新本脚本   4) 全部更新   0) 返回"
+  echo "  1) 更新 Xray-core    2) 更新 Hysteria2    3) 更新本脚本"
+  echo "  4) 全部更新（含 sing-box）    5) 回滚到备份    0) 返回"
+  echo "  指定版本: proxy update --xray-ver <版本>  --hy2-ver <版本>  --singbox-ver <版本>"
   local c; ask c "请选择" "4"
   case $c in
     1) install_xray; if xray_inbound_needed; then write_xray_config; restart_xray; else info "当前没有 Xray 入站，已跳过。"; fi ;;
@@ -184,8 +199,43 @@ menu_update() {
        if (( HY2_ENABLED )); then install_hysteria; write_hy2_config; restart_hy2; fi
        if sb_needed; then install_singbox; write_singbox_config; restart_singbox; fi
        update_script ;;
+    5) echo "  1) Xray    2) Hysteria2    3) sing-box    4) 全部    0) 返回"
+       local w; ask w "回滚哪一个" "0"
+       case $w in
+         1) do_rollback xray ;;
+         2) do_rollback hy2 ;;
+         3) do_rollback singbox ;;
+         4) do_rollback all ;;
+         *) return 0 ;;
+       esac ;;
     *) return 0 ;;
   esac
+}
+do_pinned_update() { # proxy update --xray-ver / --hy2-ver / --singbox-ver，不进菜单
+  need_installed
+  preflight
+  local did=0
+  if [[ -n ${OPT_XRAY_VER:-} ]]; then
+    install_xray
+    if xray_inbound_needed; then write_xray_config; restart_xray
+    else info "当前没有 Xray 入站，已跳过重启。"; fi
+    did=1
+  fi
+  if [[ -n ${OPT_HY2_VER:-} ]]; then
+    (( HY2_ENABLED )) || die "未启用 Hysteria2，不能用 --hy2-ver 更新。请先打开 Hysteria2。"
+    install_hysteria
+    write_hy2_config
+    restart_hy2
+    did=1
+  fi
+  if [[ -n ${OPT_SINGBOX_VER:-} ]]; then
+    sb_needed || die "未启用 TUIC / AnyTLS，不能用 --singbox-ver 更新。请先打开其中一项。"
+    install_singbox
+    write_singbox_config
+    restart_singbox
+    did=1
+  fi
+  (( did )) || die "没有要更新的组件。"
 }
 
 update_script() {
@@ -234,7 +284,7 @@ menu_status() {
     echo
     printf '%s已装协议%s\n' "$C_TITLE" "$C_NONE"
     ui_proto_line "$REALITY_ENABLED" "VLESS + REALITY + Vision" "TCP $(pub_xray_port)"
-    ui_proto_line "$XHTTP_ENABLED" "VLESS + XHTTP + REALITY" "TCP $(pub_xhttp_port)"
+    ui_proto_line "$XHTTP_ENABLED" "VLESS + XHTTP + REALITY" "TCP $(pub_xhttp_port)$(xhttp_shared && echo '（与 Vision 共用）')"
     ui_proto_line "$HY2_ENABLED" "Hysteria2" "UDP $(pub_hy2_port)"
     hr
     printf '%s可选协议%s\n' "$C_TITLE" "$C_NONE"
@@ -451,6 +501,12 @@ menu_firewall() {
   esac
   if [[ ${FW_MODE:-off} == off || ${FW_ENABLED:-0} == 0 ]]; then
     save_state
+    if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+      fw_host_sync
+      save_state
+      fw_print_allows
+      return 0
+    fi
     warn "防火墙是关闭的，改动已记下，但还没写入 nftables。要生效请选严格或只放行。"
     return 0
   fi
@@ -476,7 +532,7 @@ do_uninstall() {
   if have systemctl; then systemctl disable --now 'xray@*' >/dev/null 2>&1 || true; fi
   rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service "$XRAY_RC"
   rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
-  rm -f "$XRAY_BIN"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+  rm -f "$XRAY_BIN" "${XRAY_BIN}.bak" "${XRAY_BIN}.prebak"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
   sd_reload
   ok "Xray 已移除"
   remove_hysteria purge; ok "Hysteria2 已移除"
@@ -497,9 +553,12 @@ do_uninstall() {
   local fw
   for fw in $DISABLED_FW; do
     if confirm "安装时停用了 ${fw}，是否重新启用？" y; then
-      systemctl enable --now "$fw" >/dev/null 2>&1 || true
-      [[ $fw == ufw ]] && { ufw --force enable >/dev/null 2>&1 || true; }
-      ok "已重新启用 ${fw}"
+      if [[ $fw == ufw ]]; then
+        if fw_ufw_enable_kept; then ok "已重新启用 ${fw}"; fi
+      else
+        systemctl enable --now "$fw" >/dev/null 2>&1 || true
+        ok "已重新启用 ${fw}"
+      fi
     fi
   done
   (( SWAP_CREATED )) && info "安装时创建的 /swapfile 已保留（如需删除: swapoff /swapfile && rm /swapfile 并编辑 /etc/fstab）。"

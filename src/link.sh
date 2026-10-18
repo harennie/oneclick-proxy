@@ -10,7 +10,10 @@ server_addr() {
 # 链接中使用的（外部）端口：NAT 模式为服务商映射的外部端口
 pub_xray_port() { if (( NAT_MODE )) && [[ -n $XRAY_EXT_PORT ]]; then printf '%s' "$XRAY_EXT_PORT"; else printf '%s' "$XRAY_PORT"; fi; }
 pub_hy2_port() { if (( NAT_MODE )) && [[ -n $HY2_EXT_PORT ]]; then printf '%s' "$HY2_EXT_PORT"; else printf '%s' "$HY2_PORT"; fi; }
-pub_xhttp_port() { if (( NAT_MODE )) && [[ -n $XHTTP_EXT_PORT ]]; then printf '%s' "$XHTTP_EXT_PORT"; else printf '%s' "$XHTTP_PORT"; fi; }
+pub_xhttp_port() {
+  if xhttp_shared; then pub_xray_port; return; fi
+  if (( NAT_MODE )) && [[ -n $XHTTP_EXT_PORT ]]; then printf '%s' "$XHTTP_EXT_PORT"; else printf '%s' "$XHTTP_PORT"; fi
+}
 pub_trojan_port() { if (( NAT_MODE )) && [[ -n $TROJAN_EXT_PORT ]]; then printf '%s' "$TROJAN_EXT_PORT"; else printf '%s' "$TROJAN_PORT"; fi; }
 pub_tuic_port() { if (( NAT_MODE )) && [[ -n $TUIC_EXT_PORT ]]; then printf '%s' "$TUIC_EXT_PORT"; else printf '%s' "$TUIC_PORT"; fi; }
 pub_anytls_port() { if (( NAT_MODE )) && [[ -n $ANYTLS_EXT_PORT ]]; then printf '%s' "$ANYTLS_EXT_PORT"; else printf '%s' "$ANYTLS_PORT"; fi; }

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# @module src/core.sh
 # 本文件由 build.sh 从 src/ 拼接生成。请改 src/ 后执行 ./build.sh，不要直接改本文件。
 #
 # proxy.sh —— VLESS + REALITY + Vision、VLESS + XHTTP + REALITY、Hysteria2 一键安装 / 管理脚本
@@ -26,7 +27,12 @@
 #   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
 #   bash proxy.sh proto           # 协议开关（菜单第 16 项「协议开关」）
 #                                 # 默认 Vision、XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC / AnyTLS
+#   proxy proto xhttp-443 on|off  # Vision 与 XHTTP 共用 / 分开 TCP 端口
 #   bash proxy.sh --help          # 查看全部参数
+#   bash proxy.sh --xray-ver v26.3.27 --hy2-ver v2.6.1 --singbox-ver v1.11.0
+#                                 # 安装指定的已发布版本
+#   proxy update --rollback [xray|hy2|singbox|all]
+#                                 # 用 .bak 换回内核并重启
 # 安装完成后可直接使用命令: proxy
 #
 # 支持: Debian 11/12/13, Ubuntu 20.04+, Rocky/Alma/CentOS Stream 8/9(+), RHEL, Fedora (systemd, amd64/arm64)
@@ -40,7 +46,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.6.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -69,6 +75,8 @@ readonly SB_RC="/etc/init.d/sing-box"
 readonly SB_LOG="/var/log/sing-box/sing-box.log"
 readonly FW_FILE="${STATE_DIR}/firewall.nft"
 readonly FW_UNIT="/etc/systemd/system/proxy-oneclick-fw.service"
+# 写进 ufw / firewalld 的条目。只删除这份清单里、且确为本脚本新建的规则。不记录 SSH，也不改用户原来就有的放行。
+readonly FW_HOST_FILE="${STATE_DIR}/fw-host.list"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-proxy-tune.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-proxy-tune.conf"
 readonly SYSTEMD_LIMITS_FILE="/etc/systemd/system.conf.d/99-proxy-tune.conf"
@@ -164,6 +172,7 @@ OPT_HY2_PORT=""
 OPT_REALITY=""      # 空=沿用（默认开）; 1/0
 OPT_XHTTP=""        # 空=安装时默认开（状态里已有则沿用）; 1/0
 OPT_XHTTP_PORT=""
+OPT_XHTTP_ON_443="" # 空=默认分开（8443）；1=与 Vision 共用 TCP 端口；0=强制分开
 OPT_TROJAN=""       # 空=默认关; 1/0
 OPT_TROJAN_PORT=""
 OPT_TUIC=""         # 空=默认关; 1/0
@@ -204,6 +213,15 @@ OPT_LAND_ALLOW=""   # 落地机来源 IP 白名单（逗号分隔，none 清空�
 OPT_LAND_LINK=""    # 中转机 land-add 的 ss:// 链接
 OPT_LAND_ACT=""     # 中转机落地转发子命令: add | on | off | del | test
 OPT_FORCE=0         # land-add 测试不通过也强制启用
+OPT_IMPORT=""       # --import / proxy import 的文件
+OPT_EXPORT_PATH=""  # proxy export 的输出路径，空则用默认
+OPT_EXPORT_ENC=0    # 1 = 导出时用 openssl 加密
+OPT_DOCTOR_FIX=0    # 1 = proxy doctor --fix
+OPT_XRAY_VER=""     # 安装 / proxy update：指定 Xray 发布标签
+OPT_HY2_VER=""      # 安装 / proxy update：指定 Hysteria2 发布标签
+OPT_SINGBOX_VER=""  # 安装 / proxy update：指定 sing-box 发布标签
+OPT_ROLLBACK=""     # proxy update --rollback：xray | hy2 | singbox | all
+IMPORT_MODE=0       # 1 = 本次安装来自导入，要重新检测 IP / NAT / SNI / 防火墙
 OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
 OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）
 OPT_CERT_EMAIL=""   # 可选，交给 Let's Encrypt；空则不登记邮箱
@@ -352,10 +370,76 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
   else printf '%s  %s%s\n' "$C_DIM" "$(ui_pad "$2" 28)未开启" "$C_NONE"; fi
 }
 
+# build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
+# 占位符还在时表示没构建，映射直接跳过。
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;722:src/os.sh:1;1231:src/tune.sh:1;2031:src/xray.sh:1;4054:src/hy2.sh:1;4193:src/firewall.sh:1;5451:src/cert.sh:1;7483:src/cdn.sh:1;8468:src/link.sh:1;8857:src/singbox.sh:1;9435:src/nat.sh:1;10073:src/selftest.sh:1;10218:src/land.sh:1;11664:src/menu.sh:1;12237:src/route.sh:1;12752:src/export.sh:1;12968:src/doctor.sh:1;13303:src/cli.sh:1"
+err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
+  local line=$1 ent p f s best_p=0 best_f="" best_s=0
+  [[ $line =~ ^[0-9]+$ ]] || return 1
+  [[ -n ${__MODULE_MAP:-} && $__MODULE_MAP != *__BUILD_MODULE_MAP__* ]] || return 1
+  local IFS=';'
+  local -a ents=()
+  read -r -a ents <<<"$__MODULE_MAP"
+  for ent in "${ents[@]}"; do
+    p=${ent%%:*}; s=${ent##*:}; f=${ent#*:}; f=${f%:*}
+    [[ $p =~ ^[0-9]+$ && $s =~ ^[0-9]+$ && -n $f ]] || continue
+    if (( 10#$p <= 10#$line && 10#$p >= best_p )); then best_p=$p; best_f=$f; best_s=$s; fi
+  done
+  (( best_p > 0 )) || return 1
+  printf '%s:%s' "$best_f" $(( 10#$best_s + 10#$line - 10#$best_p ))
+}
+err_from_file() { # 读 $0 里的 # @module。管道运行时文件不可读，交给调用方退回行号。
+  local line=$1 n=0 row mark="" start=0 src
+  [[ $line =~ ^[0-9]+$ && -r $0 && -f $0 ]] || return 1
+  while IFS= read -r row || [[ -n $row ]]; do
+    n=$(( n + 1 ))
+    if [[ $row == '# @module '* ]]; then
+      if (( n == 10#$line )); then printf '%s:1' "${row#\# @module }"; return 0; fi
+      if (( n < 10#$line )); then mark=${row#\# @module }; start=$n; fi
+    fi
+    (( n >= 10#$line )) && break
+  done <"$0"
+  [[ -n $mark && start -gt 0 ]] || return 1
+  if [[ $mark == src/core.sh ]]; then src=$(( 10#$line - start + 1 ))
+  else src=$(( 10#$line - start )); fi
+  (( src > 0 )) || return 1
+  printf '%s:%s' "$mark" "$src"
+}
+err_loc() { # $1 合并后的行号
+  local loc=""
+  loc=$(err_from_map "$1" 2>/dev/null) || loc=""
+  [[ -n $loc ]] || loc=$(err_from_file "$1" 2>/dev/null) || loc=""
+  if [[ -n $loc ]]; then printf '%s' "$loc"; else printf '第 %s 行' "$1"; fi
+}
+err_print_stack() {
+  local i fn bl loc n=0 row
+  local -a rows=()
+  (( ${#FUNCNAME[@]} > 1 )) || return 0
+  for (( i=1; i<${#FUNCNAME[@]}; i++ )); do
+    fn=${FUNCNAME[$i]}
+    # main 留着：顶层失败时栈里往往只剩它，丢掉就会只打出一个空的「调用栈」标题。
+    [[ $fn == on_error || $fn == err_print_stack || $fn == err_loc ]] && continue
+    bl=${BASH_LINENO[$(( i - 1 ))]:-0}
+    [[ $bl =~ ^[0-9]+$ ]] || bl=0
+    if [[ $bl == 0 ]]; then loc="脚本入口"
+    else loc=$(err_loc "$bl"); fi
+    n=$(( n + 1 ))
+    rows+=("$(printf '  [%s] %s() <- %s' "$n" "$fn" "$loc")")
+  done
+  (( n > 0 )) || return 0
+  printf '%s调用栈：%s\n' "$C_YELLOW" "$C_NONE" >&2
+  for row in "${rows[@]}"; do printf '%s\n' "$row" >&2; done
+  return 0
+}
 on_error() {
-  local rc=$? line=$1 cmd=$2
+  local rc=$? line=$1 cmd=$2 where
   trap - ERR
-  printf '\n%s[错误]%s 脚本在第 %s 行执行失败 (退出码 %s)：\n    %s\n' "$C_RED" "$C_NONE" "$line" "$rc" "$cmd" >&2
+  if [[ -n ${GITHUB_TOKEN:-} ]]; then cmd=${cmd//${GITHUB_TOKEN}/***}; fi
+  if [[ -n ${PROXY_EXPORT_PASS:-} ]]; then cmd=${cmd//${PROXY_EXPORT_PASS}/***}; fi
+  cmd=${cmd//Authorization: Bearer */Authorization: Bearer ***}
+  where=$(err_loc "$line")
+  printf '\n%s[错误]%s 脚本在 %s 执行失败 (退出码 %s)：\n    %s\n' "$C_RED" "$C_NONE" "$where" "$rc" "$cmd" >&2
+  err_print_stack
   printf '%s如需帮助，请带上以上信息及服务日志（journalctl -xe 或 /var/log/xray、/var/log/hysteria）反馈。重新运行本脚本是安全的（幂等）。%s\n' "$C_YELLOW" "$C_NONE" >&2
   exit "$rc"
 }
@@ -455,6 +539,17 @@ rand_hex() { openssl rand -hex "$1"; }
 rand_pass() { openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | cut -c1-24; }
 ver_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | awk 'NR==1')" == "$2" ]]; }
 fetch() { curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 --retry 2 --retry-delay 2 "$@"; }
+# 访问 api.github.com。设置了 GITHUB_TOKEN 时带上，令牌不出现在命令行里，也不写进日志。
+gh_curl() {
+  if [[ -z ${GITHUB_TOKEN:-} ]]; then curl "$@"; return; fi
+  local rc=0 cfg
+  cfg=$(mktemp)
+  chmod 600 "$cfg"
+  awk 'BEGIN{t=ENVIRON["GITHUB_TOKEN"]; printf "header = \"Authorization: Bearer %s\"\n", t}' >"$cfg"
+  curl --config "$cfg" "$@" || rc=$?
+  rm -f "$cfg"
+  return "$rc"
+}
 host_fmt() { [[ $1 == *:* ]] && printf '[%s]' "$1" || printf '%s' "$1"; }
 
 # ----------------------------- 服务管理（systemd / OpenRC 抽象） -----------------------------
@@ -536,12 +631,12 @@ take_lock() {
 # ----------------------------- 状态持久化 -----------------------------
 # 持久化的键
 STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY MLDSA_ON SNI SNI_TARGET
-            HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED FW_MODE SSH_PORTS
+            HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED FW_MODE FW_HOST_SYNC SSH_PORTS
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
             HOP_BACKEND VIRT DNS64_SET
             LAND_MODE LAND_METHOD LAND_KEY LAND_ALLOW RELAY_LINK RELAY_ON RELAY_SOCKS FWD_LINK FWD_ON NAT_PREF
-            REALITY_ENABLED XHTTP_ENABLED XHTTP_PORT XHTTP_PATH XHTTP_EXT_PORT
+            REALITY_ENABLED XHTTP_ENABLED XHTTP_PORT XHTTP_PATH XHTTP_EXT_PORT XHTTP_ON_443
             TROJAN_ENABLED TROJAN_PORT TROJAN_PASS TROJAN_EXT_PORT
             TUIC_ENABLED TUIC_PORT TUIC_PASS TUIC_EXT_PORT
             ANYTLS_ENABLED ANYTLS_PORT ANYTLS_PASS ANYTLS_EXT_PORT
@@ -552,11 +647,11 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
             CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
-HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" SSH_PORTS=""
+HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" FW_HOST_SYNC=0 SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
 # 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。
 REALITY_ENABLED=1
-XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT=""
+XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT="" XHTTP_ON_443=0
 TROJAN_ENABLED=0 TROJAN_PORT=8444 TROJAN_PASS="" TROJAN_EXT_PORT=""
 TUIC_ENABLED=0 TUIC_PORT=8446 TUIC_PASS="" TUIC_EXT_PORT=""
 ANYTLS_ENABLED=0 ANYTLS_PORT=8445 ANYTLS_PASS="" ANYTLS_EXT_PORT=""
@@ -623,6 +718,7 @@ save_state() {
   mv -f "$tmp" "$STATE_FILE"
 }
 
+# @module src/os.sh
 # ============================================================
 #                        环境预检
 # ============================================================
@@ -1131,6 +1227,7 @@ pkg_bootstrap_curl() {
   elif [[ $PKG == apt ]]; then apt-get update -qq && pkg_install curl ca-certificates; else pkg_install curl ca-certificates; fi
 }
 
+# @module src/tune.sh
 # ============================================================
 #              网络调优（v1.2.0 起为独立功能：proxy tune）
 # ============================================================
@@ -1930,6 +2027,7 @@ nat_tune() {
   tune_run "$preset" "${OPT_TUNE_BUF:-auto}"
 }
 
+# @module src/xray.sh
 # ============================================================
 #                 REALITY 目标网站 (SNI) 自动优选
 # ============================================================
@@ -2484,38 +2582,541 @@ other_listen_ports() { # $1 = tcp|udp
 }
 
 # ============================================================
+#           内核备份 / 指定版本 / 回滚（xray、hysteria、sing-box）
+# ============================================================
+# 本次进程里换过程序时才在启动失败后自动换回。跳过备份时单独记住，避免被下一次覆盖。
+BIN_UPDATED_XRAY=0
+BIN_UPDATED_HY2=0
+BIN_UPDATED_SB=0
+BIN_BAK_MADE=0
+BIN_BAK_SKIP_XRAY=0
+BIN_BAK_SKIP_HY2=0
+BIN_BAK_SKIP_SB=0
+# 50 MB = 51200 KiB。df -Pk 的第 4 列是可用的 1 KiB 块。
+readonly BIN_FREE_MIN_KB=51200
+
+bin_free_kb() { # $1 目录。失败时输出空
+  df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+bin_backup() { # $1 程序路径  $2 xray|hy2|singbox。先写成 .prebak，替换成功后再收成 .bak
+  BIN_BAK_MADE=0
+  local p=$1 kind=$2 kb="" dir
+  [[ -f $p && -s $p ]] || return 0
+  dir=$(dirname "$p")
+  kb=$(bin_free_kb "$dir") || kb=""
+  if [[ $kb =~ ^[0-9]+$ ]] && (( kb < BIN_FREE_MIN_KB )); then
+    if (( kb >= 1024 )); then
+      warn "剩余空间不足 50 MB（${dir} 可用约 $((kb / 1024)) MB），跳过备份 ${p##*/}.bak。"
+    else
+      warn "剩余空间不足 50 MB（${dir} 可用不足 1 MB），跳过备份 ${p##*/}.bak。"
+    fi
+    case $kind in
+      xray) BIN_BAK_SKIP_XRAY=1 ;;
+      hy2) BIN_BAK_SKIP_HY2=1 ;;
+      singbox) BIN_BAK_SKIP_SB=1 ;;
+    esac
+    return 0
+  fi
+  rm -f "${p}.prebak"
+  if ! cp -a "$p" "${p}.prebak"; then
+    warn "备份 ${p} 失败，继续更新（这次失败时无法自动换回）。"
+    rm -f "${p}.prebak"
+    case $kind in
+      xray) BIN_BAK_SKIP_XRAY=1 ;;
+      hy2) BIN_BAK_SKIP_HY2=1 ;;
+      singbox) BIN_BAK_SKIP_SB=1 ;;
+    esac
+    return 0
+  fi
+  BIN_BAK_MADE=1
+}
+bin_backup_keep() { # $1 程序路径  $2 xray|hy2|singbox。新程序已经放好，把临时备份收成 .bak
+  local p=$1 kind=$2
+  [[ -f ${p}.prebak ]] || return 0
+  # 临时备份和当前程序相同就丢掉。不能拿它盖掉已有的 .bak，否则更早的版本没了。
+  if [[ -e $p ]] && cmp -s "${p}.prebak" "$p"; then
+    rm -f "${p}.prebak"
+    return 0
+  fi
+  mv -f "${p}.prebak" "${p}.bak"
+  case $kind in
+    xray) BIN_UPDATED_XRAY=1 ;;
+    hy2) BIN_UPDATED_HY2=1 ;;
+    singbox) BIN_UPDATED_SB=1 ;;
+  esac
+  info "已备份当前程序: ${p}.bak"
+}
+bin_backup_drop() { rm -f "${1}.prebak"; }
+bin_version() { # $1 xray|hy2|singbox  $2 程序路径
+  local kind=$1 p=$2
+  [[ -x $p ]] || return 0
+  case $kind in
+    xray) "$p" version 2>/dev/null | awk 'NR==1{print $2}' || true ;;
+    hy2) "$p" version 2>/dev/null | awk '/^Version:/{print $2}' || true ;;
+    singbox) "$p" version 2>/dev/null | awk 'NR==1{print $NF}' || true ;;
+  esac
+}
+bin_norm_tag() { # $1 xray|hy2|singbox  $2 用户写的版本。输出 GitHub 标签
+  local kind=$1 raw=$2 t
+  t=${raw#refs/tags/}
+  t=${t// /}
+  [[ -n $t ]] || return 1
+  case $kind in
+    xray|singbox)
+      if [[ $t == [Vv]* ]]; then t="v${t:1}"; else t="v${t}"; fi
+      [[ $t =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$ ]] || return 1
+      ;;
+    hy2)
+      t=${t#app/}
+      if [[ $t == [Vv]* ]]; then t="v${t:1}"; else t="v${t}"; fi
+      t="app/${t}"
+      [[ $t =~ ^app/v[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$ ]] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$t"
+}
+hy_official_ver() { # app/v2.6.1 -> v2.6.1（get.hy2.sh 的 --version 必须带 v，不能带 app/）
+  local t=${1#app/}
+  [[ $t == v* ]] || t="v${t}"
+  printf '%s' "$t"
+}
+xray_ver_same() { # $1 程序打出的版本  $2 标签 vX
+  local a=$1 b=$2
+  [[ -n $a && -n $b ]] || return 1
+  a=v${a#v}; b=v${b#v}
+  [[ $a == "$b" ]]
+}
+hy_ver_same() { # $1 程序打出的版本  $2 标签 app/vX 或 vX
+  local a=$1 b=$2
+  [[ -n $a && -n $b ]] || return 1
+  a=${a#app/}; a=${a#v}
+  b=${b#app/}; b=${b#v}
+  [[ $a == "$b" ]]
+}
+gh_release_ok() { # $1 仓库（owner/name）  $2 标签。存在返回 0
+  local repo=$1 tag=$2 code="" enc
+  enc=${tag//\//%2F}
+  code=$(gh_curl -sS -o /dev/null -w '%{http_code}' "${FETCH_IP[@]}" --connect-timeout 10 -m 20 \
+    -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/${repo}/releases/tags/${enc}" 2>/dev/null) || code=""
+  [[ $code == 200 ]] && return 0
+  # 接口被限流或不可达时，再看发布页本身在不在。令牌不会出现在这条命令里。
+  curl -fsSIL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -o /dev/null \
+    "https://github.com/${repo}/releases/tag/${tag}" 2>/dev/null
+}
+xray_check_bin() { # $1 程序路径。version，有当前配置时再 run -test
+  local b=$1 log
+  [[ -x $b ]] || { warn "无法执行 ${b}。"; return 1; }
+  "$b" version >/dev/null 2>&1 || { warn "xray version 没有成功（${b}）。"; return 1; }
+  [[ -s $XRAY_CONF ]] || return 0
+  log=$(mktemp)
+  if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$b" run -test -config "$XRAY_CONF" >"$log" 2>&1; then
+    warn "xray run -test 未通过（${b}）。"
+    tail -n 20 "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
+  rm -f "$log"
+}
+sb_check_bin() { # $1 程序路径。version，有当前配置时再 check
+  local b=$1 log
+  [[ -x $b ]] || { warn "无法执行 ${b}。"; return 1; }
+  "$b" version >/dev/null 2>&1 || { warn "sing-box version 没有成功（${b}）。"; return 1; }
+  [[ -s $SB_CONF ]] || return 0
+  log=$(mktemp)
+  if ! "$b" check -c "$SB_CONF" >"$log" 2>&1; then
+    warn "sing-box check 未通过（${b}）。"
+    tail -n 20 "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
+  rm -f "$log"
+}
+hy_check_bin() { # hysteria 没有配置检查，只确认 version 能跑
+  local b=$1
+  [[ -x $b ]] || { warn "无法执行 ${b}。"; return 1; }
+  "$b" version >/dev/null 2>&1 || { warn "hysteria version 没有成功（${b}）。"; return 1; }
+}
+bin_finish_install() { # $1 种类  $2 程序  $3 显示名  $4 替换前的版本。版本变了才记「已更新」
+  local kind=$1 bin=$2 name=$3 old=$4 new=""
+  new=$(bin_version "$kind" "$bin" || true)
+  if [[ -z $new ]]; then bin_backup_drop "$bin"; die "安装后无法读取 ${name} 的版本。"; fi
+  if [[ -n $old && $old == "$new" ]]; then
+    # 版本没变。丢掉这次的临时备份，原来的 .bak 还在。
+    bin_backup_drop "$bin"
+    case $kind in
+      xray) BIN_UPDATED_XRAY=0 ;;
+      hy2) BIN_UPDATED_HY2=0 ;;
+      singbox) BIN_UPDATED_SB=0 ;;
+    esac
+    ok "${name} 已安装: ${new}"
+    return 0
+  fi
+  if [[ -f ${bin}.prebak ]]; then bin_backup_keep "$bin" "$kind"; fi
+  if [[ -n $old ]]; then
+    case $kind in
+      xray) BIN_UPDATED_XRAY=1 ;;
+      hy2) BIN_UPDATED_HY2=1 ;;
+      singbox) BIN_UPDATED_SB=1 ;;
+    esac
+    ok "${name} ${old} -> ${new}"
+  else
+    ok "${name} 已安装: ${new}"
+  fi
+}
+bin_restore_prebak() { # $1 种类 $2 程序 $3 服务 $4 显示名 $5 原因（带前导空格）
+  local kind=$1 bin=$2 svc=$3 name=$4 why=$5 cur="" bakv=""
+  if [[ ! -f ${bin}.prebak ]]; then die "${name}${why}。"; fi
+  cur=$(bin_version "$kind" "$bin" || true)
+  bakv=$(bin_version "$kind" "${bin}.prebak" || true)
+  warn "${name}${why}，正在恢复备份 ..."
+  install -m 755 "${bin}.prebak" "$bin" || die "恢复 ${bin}.prebak 失败。"
+  rm -f "${bin}.prebak"
+  if [[ $kind == xray ]]; then xray_geo_restore; fi
+  if svc_exists "$svc"; then svc_restart "$svc" || true; sleep 1; fi
+  die "${name}${why}，已恢复备份（${cur:-未知} -> ${bakv:-未知}）。"
+}
+bin_reject_new() { # $1 种类 $2 程序 $3 服务 $4 显示名 $5 是否有本次备份 $6 原因（带前导空格）
+  local kind=$1 bin=$2 svc=$3 name=$4 made=$5 why=$6 cur="" bakv=""
+  if [[ $made == 1 && -f ${bin}.prebak ]]; then
+    cur=$(bin_version "$kind" "$bin" || true)
+    bakv=$(bin_version "$kind" "${bin}.prebak" || true)
+    if [[ ! -x $bin || $cur != "$bakv" ]]; then
+      warn "${name}${why}，正在恢复备份 ..."
+      install -m 755 "${bin}.prebak" "$bin" || die "恢复 ${bin}.prebak 失败。"
+      rm -f "${bin}.prebak"
+      if [[ $kind == xray ]]; then xray_geo_restore; fi
+      if svc_exists "$svc"; then svc_restart "$svc" || true; sleep 1; fi
+      die "${name}${why}，已恢复备份（${cur:-未知} -> ${bakv:-未知}）。"
+    fi
+    bin_backup_drop "$bin"
+  fi
+  if [[ $kind == xray ]]; then xray_geo_restore; fi
+  die "${name}${why}。"
+}
+bin_restart_failed() { # 启动失败且这次换过程序：用 .bak 盖回去再拉起。0=已恢复且在跑 1=没有备份可换 2=换了仍没起来
+  local kind=$1 bin=$2 svc=$3 name=$4 updated=0 skipped=0 old="" new=""
+  case $kind in
+    xray) updated=${BIN_UPDATED_XRAY:-0}; skipped=${BIN_BAK_SKIP_XRAY:-0} ;;
+    hy2) updated=${BIN_UPDATED_HY2:-0}; skipped=${BIN_BAK_SKIP_HY2:-0} ;;
+    singbox) updated=${BIN_UPDATED_SB:-0}; skipped=${BIN_BAK_SKIP_SB:-0} ;;
+  esac
+  [[ $updated == 1 ]] || return 1
+  if [[ ! -f ${bin}.bak ]]; then
+    if (( skipped )); then warn "${name} 没有备份（更新前剩余空间不足 50 MB），无法自动换回。"; fi
+    return 1
+  fi
+  old=$(bin_version "$kind" "$bin" || true)
+  new=$(bin_version "$kind" "${bin}.bak" || true)
+  warn "${name} 启动失败，正在恢复 ${bin}.bak ..."
+  install -m 755 "${bin}.bak" "$bin" || { warn "恢复 ${bin}.bak 失败。"; return 2; }
+  if [[ $kind == xray ]]; then xray_geo_restore_bak; fi
+  case $kind in
+    xray) BIN_UPDATED_XRAY=0 ;;
+    hy2) BIN_UPDATED_HY2=0 ;;
+    singbox) BIN_UPDATED_SB=0 ;;
+  esac
+  svc_restart "$svc" || true
+  sleep 1
+  if svc_active "$svc"; then
+    ok "${name} 已自动回滚: ${old:-未知} -> ${new:-未知}"
+    return 0
+  fi
+  warn "${name} 回滚后仍未运行。"
+  return 2
+}
+bin_swap_bak() { # 当前程序和 .bak 对调，这样再执行一次回滚可以换回去
+  local p=$1 tmp
+  [[ -f ${p}.bak ]] || return 1
+  if [[ ! -e $p ]]; then
+    install -m 755 "${p}.bak" "$p" || return 1
+    return 0
+  fi
+  tmp="${p}.swaptmp"
+  rm -f "$tmp"
+  mv -f "$p" "$tmp" || return 1
+  if ! mv -f "${p}.bak" "$p"; then
+    mv -f "$tmp" "$p" || true
+    return 1
+  fi
+  if ! mv -f "$tmp" "${p}.bak"; then
+    warn "已换回 ${p}，但没能把刚才的程序留作 .bak。"
+  fi
+  chmod 755 "$p" 2>/dev/null || true
+  if [[ -f ${p}.bak ]]; then chmod 755 "${p}.bak" 2>/dev/null || true; fi
+  return 0
+}
+rollback_one() { # $1 xray|hy2|singbox
+  local kind=$1 bin svc name old="" new=""
+  case $kind in
+    xray) bin=$XRAY_BIN; svc=xray; name=Xray ;;
+    hy2) bin=$HY_BIN; svc=hysteria-server; name=Hysteria2 ;;
+    singbox) bin=$SB_BIN; svc=sing-box; name=sing-box ;;
+    *) die "未知组件: ${kind}（可选 xray、hy2、singbox、all）" ;;
+  esac
+  if [[ ! -f ${bin}.bak ]]; then
+    # 点名回滚某一个时必须失败。all 仍跳过没有备份的组件。
+    if [[ ${2-} == 1 ]]; then die "没有 ${bin}.bak，无法回滚 ${name}。"; fi
+    warn "没有 ${bin}.bak，跳过 ${name}。"
+    return 0
+  fi
+  old=$(bin_version "$kind" "$bin" || true)
+  new=$(bin_version "$kind" "${bin}.bak" || true)
+  bin_swap_bak "$bin" || die "换回 ${bin}.bak 失败。"
+  if [[ $kind == xray ]]; then xray_geo_swap_bak; fi
+  if [[ $kind == xray ]] && land_raw_active; then
+    svc_disable_stop xray || true
+    ok "${name} ${old:-未知} -> ${new:-未知}（原样转发中，未启动 Xray）"
+    return 0
+  fi
+  if ! svc_exists "$svc"; then
+    ok "${name} ${old:-未知} -> ${new:-未知}（服务未安装，只换回了程序）"
+    return 0
+  fi
+  svc_restart "$svc" || true
+  sleep 1
+  if ! svc_active "$svc"; then
+    warn "${name} 换回 ${new:-未知} 后没有跑起来，正在换回刚才的程序 ..."
+    bin_swap_bak "$bin" || true
+    if [[ $kind == xray ]]; then xray_geo_swap_bak; fi
+    svc_restart "$svc" || true
+    die "${name} 回滚失败，已换回 ${old:-未知}。"
+  fi
+  ok "${name} ${old:-未知} -> ${new:-未知}"
+}
+do_rollback() { # $1 xray|hy2|singbox|all
+  local which=${1:-all} part
+  load_state
+  (( INSTALLED )) || die "尚未安装，请先选择「安装」。"
+  [[ -n $INIT_SYS ]] || detect_init
+  case $which in
+    xray|hy2|singbox) rollback_one "$which" 1 ;;
+    all)
+      for part in xray hy2 singbox; do rollback_one "$part"; done
+      ;;
+    *) die "回滚目标无效: ${which}（可选 xray、hy2、singbox、all）" ;;
+  esac
+}
+
+# ============================================================
 #                        Xray 安装与配置
 # ============================================================
+# 地理数据文件和程序一起换。失败或回滚时按 .prebak / .bak 换回去。
+xray_geo_snapshot() {
+  local f
+  mkdir -p "$XRAY_ASSET_DIR"
+  for f in geoip.dat geosite.dat; do
+    rm -f "${XRAY_ASSET_DIR}/${f}.prebak"
+    [[ -s ${XRAY_ASSET_DIR}/$f ]] || continue
+    cp -a "${XRAY_ASSET_DIR}/$f" "${XRAY_ASSET_DIR}/${f}.prebak" || warn "备份 ${f} 失败。"
+  done
+}
+xray_geo_commit() {
+  local f src live bak
+  for f in geoip.dat geosite.dat; do
+    src="${XRAY_ASSET_DIR}/${f}.prebak"
+    live="${XRAY_ASSET_DIR}/$f"
+    bak="${live}.bak"
+    [[ -f $src ]] || continue
+    if [[ -f $live ]] && cmp -s "$src" "$live"; then rm -f "$src"; continue; fi
+    if [[ -f $bak ]] && cmp -s "$src" "$bak"; then rm -f "$src"; continue; fi
+    mv -f "$src" "$bak"
+  done
+}
+xray_geo_restore() {
+  local f src
+  for f in geoip.dat geosite.dat; do
+    src="${XRAY_ASSET_DIR}/${f}.prebak"
+    [[ -f $src ]] || continue
+    mkdir -p "$XRAY_ASSET_DIR"
+    install -m 644 "$src" "${XRAY_ASSET_DIR}/$f" || warn "恢复 ${f} 失败。"
+    rm -f "$src"
+  done
+}
+xray_geo_restore_bak() {
+  local f live bak
+  for f in geoip.dat geosite.dat; do
+    live="${XRAY_ASSET_DIR}/$f"
+    bak="${live}.bak"
+    [[ -f $bak ]] || continue
+    if [[ -f $live ]] && cmp -s "$live" "$bak"; then continue; fi
+    mkdir -p "$XRAY_ASSET_DIR"
+    install -m 644 "$bak" "$live" || warn "恢复 ${f} 失败。"
+  done
+}
+xray_geo_swap_bak() {
+  local f live bak tmp
+  for f in geoip.dat geosite.dat; do
+    live="${XRAY_ASSET_DIR}/$f"
+    bak="${live}.bak"
+    [[ -f $bak ]] || continue
+    if [[ ! -e $live ]]; then
+      mkdir -p "$XRAY_ASSET_DIR"
+      install -m 644 "$bak" "$live" || warn "恢复 ${f} 失败。"
+      continue
+    fi
+    if cmp -s "$live" "$bak"; then continue; fi
+    tmp="${live}.swaptmp"
+    rm -f "$tmp"
+    mv -f "$live" "$tmp" || continue
+    if ! mv -f "$bak" "$live"; then
+      mv -f "$tmp" "$live" || true
+      warn "换回 ${f} 失败。"
+      continue
+    fi
+    mv -f "$tmp" "$bak" || warn "已换回 ${f}，但没能留下刚才的文件。"
+  done
+}
+xray_abort_swap() {
+  if [[ -f ${XRAY_BIN}.prebak ]]; then
+    install -m 755 "${XRAY_BIN}.prebak" "$XRAY_BIN" || warn "恢复 Xray 程序失败。"
+    rm -f "${XRAY_BIN}.prebak"
+  fi
+  rm -f "${XRAY_BIN}.new"
+  xray_geo_restore
+}
+# 下载并解压到临时目录。不改正在使用的程序。
+xray_fetch_release() { # $1 标签 vX  $2 解压目录
+  local tag=$1 dg=$2 asset="" base="" want="" sum=""
+  asset=$(xray_asset_name)
+  [[ -n $asset ]] || die "当前架构不支持下载 Xray: ${ARCH:-未知}"
+  base="https://github.com/XTLS/Xray-core/releases/download/${tag}"
+  info "下载 ${asset} (${tag}) ..."
+  fetch -o "${TMP_DIR}/${asset}" "${base}/${asset}" || { github_hint; die "下载 Xray 失败。"; }
+  if fetch -o "${TMP_DIR}/${asset}.dgst" "${base}/${asset}.dgst" 2>/dev/null; then
+    want=$(awk -F'= *' '/^SHA2-256/{print tolower($2); exit}' "${TMP_DIR}/${asset}.dgst" | tr -d '[:space:]')
+    sum=$(sha256sum "${TMP_DIR}/${asset}" | awk '{print $1}')
+    if [[ -n $want ]]; then
+      [[ $want == "$sum" ]] || die "Xray 压缩包 SHA256 校验失败（期望 ${want}，实际 ${sum}），已中止。"
+      ok "SHA256 校验通过。"
+    else
+      warn "无法解析 .dgst 文件，跳过 SHA256 校验。"
+    fi
+  else
+    warn "未能下载 .dgst 校验文件，跳过 SHA256 校验。"
+  fi
+  rm -rf "$dg"
+  mkdir -p "$dg"
+  if (( NAT_MODE || LAND_MODE )); then
+    unzip -qo "${TMP_DIR}/${asset}" xray -d "$dg" || die "解压 Xray 失败。"
+  else
+    unzip -qo "${TMP_DIR}/${asset}" -d "$dg" || die "解压 Xray 失败。"
+  fi
+  rm -f "${TMP_DIR}/${asset}" "${TMP_DIR}/${asset}.dgst"
+  [[ -f $dg/xray ]] || die "压缩包中没有 xray 可执行文件。"
+}
+# 先用临时程序对当前配置做检查。通过之后才备份并替换程序和 geo 文件。检查失败返回 1，什么都不改。
+xray_install_tree() { # $1 解压目录
+  local dg=$1 old="" newv="" f
+  [[ -f $dg/xray ]] || return 1
+  chmod 755 "$dg/xray"
+  if ! xray_check_bin "$dg/xray"; then return 1; fi
+  old=$(bin_version xray "$XRAY_BIN" || true)
+  newv=$(bin_version xray "$dg/xray" || true)
+  if ! xray_ver_same "$old" "$newv"; then bin_backup "$XRAY_BIN" xray; fi
+  if [[ -f $dg/geoip.dat || -f $dg/geosite.dat ]]; then xray_geo_snapshot; fi
+  if ! install -m 755 "$dg/xray" "${XRAY_BIN}.new"; then
+    xray_abort_swap
+    die "写入 Xray 失败，已恢复原程序。"
+  fi
+  if ! mv -f "${XRAY_BIN}.new" "$XRAY_BIN"; then
+    xray_abort_swap
+    die "替换 Xray 失败，已恢复原程序。"
+  fi
+  mkdir -p "$XRAY_ASSET_DIR"
+  for f in geoip.dat geosite.dat; do
+    [[ -f $dg/$f ]] || continue
+    if ! install -m 644 "$dg/$f" "${XRAY_ASSET_DIR}/$f"; then
+      xray_abort_swap
+      die "写入 ${f} 失败，已恢复原程序和地理数据。"
+    fi
+  done
+  bin_finish_install xray "$XRAY_BIN" "Xray" "$old"
+  xray_geo_commit
+  return 0
+}
+xray_ensure_service() {
+  if direct_mode || [[ ! -f $XRAY_UNIT ]] || grep -q '由 proxy-oneclick 生成' "$XRAY_UNIT"; then
+    write_xray_service
+  else
+    ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
+  fi
+}
+install_xray_pinned() {
+  BIN_UPDATED_XRAY=0
+  BIN_BAK_SKIP_XRAY=0
+  step "安装 / 更新 Xray-core（指定版本，直接下载发布包）"
+  mktmp
+  local tag="" old="" dg=""
+  tag=$(bin_norm_tag xray "$OPT_XRAY_VER") || die "Xray 版本号无效: ${OPT_XRAY_VER}（例如 v26.3.27）"
+  gh_release_ok XTLS/Xray-core "$tag" || die "找不到 Xray 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  old=$(bin_version xray "$XRAY_BIN" || true)
+  if xray_ver_same "$old" "$tag" && [[ -x $XRAY_BIN ]] && { (( NAT_MODE || LAND_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
+    ok "Xray 已是指定版本 ${tag}，跳过下载。"
+  else
+    dg="${TMP_DIR}/xray-unzip"
+    xray_fetch_release "$tag" "$dg"
+    if ! xray_install_tree "$dg"; then
+      rm -rf "$dg"
+      die "下载的 Xray 未通过校验，未替换现有程序。"
+    fi
+    rm -rf "$dg"
+  fi
+  xray_ensure_service
+}
 install_xray() {
+  if [[ -n ${OPT_XRAY_VER:-} ]]; then install_xray_pinned; return; fi
   if direct_mode; then install_xray_direct; return; fi
+  BIN_UPDATED_XRAY=0
+  BIN_BAK_SKIP_XRAY=0
   step "安装 / 更新 Xray-core（官方 XTLS/Xray-install 脚本）"
   mktmp
   # 之前以 NAT / 落地机模式安装过：删除本脚本自建的服务文件，让官方脚本重新安装它的 xray.service
   # （自建服务只在端口 < 1024 时才有 CAP_NET_BIND_SERVICE，官方脚本不会覆盖已存在的服务文件）
-  local force=()
+  local force=() tag="" old="" backed=0 same=0
   if [[ -f $XRAY_UNIT ]] && grep -q '由 proxy-oneclick 生成' "$XRAY_UNIT"; then
     systemctl stop xray >/dev/null 2>&1 || true
     rm -f "$XRAY_UNIT"; systemctl daemon-reload
   fi
   # 已有 xray 但没有服务文件时，官方脚本会因「版本相同」直接退出而不安装服务：强制重装
   [[ ! -f $XRAY_UNIT && -x $XRAY_BIN ]] && force=(--force)
-  fetch -o "${TMP_DIR}/xray-install.sh" "$XRAY_INSTALL_URL" || die "下载 Xray 安装脚本失败，请检查网络（GitHub 可达性）。"
-  if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1; then
-    # GitHub API 限流(403)时：通过 releases/latest 跳转获取版本号后重试
-    local tag
-    tag=$(latest_tag XTLS/Xray-core)
-    if [[ -n $tag ]]; then
-      warn "官方脚本获取版本列表失败（可能是 GitHub API 限流），改为指定版本 ${tag} 重试 ..."
-      TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install --version "$tag" "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1 || {
-        tail -n 20 "${TMP_DIR}/xray-install.log" >&2; die "Xray 安装失败。"; }
-    else
-      tail -n 20 "${TMP_DIR}/xray-install.log" >&2; die "Xray 安装失败。"
-    fi
+  old=$(bin_version xray "$XRAY_BIN" || true)
+  if [[ -n $OPT_XRAY_VER ]]; then
+    tag=$(bin_norm_tag xray "$OPT_XRAY_VER") || die "Xray 版本号无效: ${OPT_XRAY_VER}（例如 v26.3.27）"
+    gh_release_ok XTLS/Xray-core "$tag" || die "找不到 Xray 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag XTLS/Xray-core)
+    [[ -n $tag ]] || { github_hint; die "获取 Xray 最新版本号失败。"; }
   fi
-  [[ -x $XRAY_BIN ]] || die "未找到 ${XRAY_BIN}，Xray 安装可能失败。"
+  xray_ver_same "$old" "$tag" && same=1
+  if (( same && ${#force[@]} == 0 )); then
+    if [[ -n $OPT_XRAY_VER ]]; then ok "Xray 已是指定版本 ${tag}，跳过下载。"
+    else ok "Xray 已是最新版本 ${tag}，跳过下载。"; fi
+    ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
+    return 0
+  fi
+  # 未指定版本时仍用官方脚本，它会自己覆盖程序。先备份程序和 geo，写完立刻检查，不通过就换回。
+  if (( ! same )); then bin_backup "$XRAY_BIN" xray; backed=$BIN_BAK_MADE; fi
+  fetch -o "${TMP_DIR}/xray-install.sh" "$XRAY_INSTALL_URL" || { bin_backup_drop "$XRAY_BIN"; die "下载 Xray 安装脚本失败，请检查网络（GitHub 可达性）。"; }
+  if (( same )); then force=(--force); fi
+  xray_geo_snapshot
+  if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install --version "$tag" "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1; then
+    tail -n 20 "${TMP_DIR}/xray-install.log" >&2 || true
+    bin_reject_new xray "$XRAY_BIN" xray "Xray" "$backed" " 安装失败"
+  fi
+  [[ -x $XRAY_BIN ]] || bin_reject_new xray "$XRAY_BIN" xray "Xray" "$backed" " 安装失败"
+  if ! xray_check_bin "$XRAY_BIN"; then
+    xray_geo_restore
+    if (( backed )); then bin_restore_prebak xray "$XRAY_BIN" xray "Xray" " 未通过校验"; fi
+    bin_backup_drop "$XRAY_BIN"
+    if (( BIN_BAK_SKIP_XRAY )); then die "Xray 未通过校验。剩余空间不足，没有备份可以恢复。"; fi
+    die "Xray 未通过校验。"
+  fi
   # 官方脚本会沿用已有 User=（常见为 xray）。配置是 root:nobody 组 640，必须在启动前改成 nobody。
   ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
-  ok "Xray 已安装: $("$XRAY_BIN" version | awk 'NR==1{print $2}')"
+  bin_finish_install xray "$XRAY_BIN" "Xray" "$old"
+  xray_geo_commit
 }
 
 # 不依赖 GitHub API，从 releases/latest 的跳转地址解析最新版本号（跟随仓库改名等多次跳转）
@@ -2526,7 +3127,7 @@ latest_tag() {
 # 最新版本号：先 GitHub API，失败（限流 / 不可达）时改用 releases/latest 跳转
 gh_latest_tag() {
   local t=""
-  t=$(curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
+  t=$(gh_curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || t=""
   [[ -n $t ]] || t=$(latest_tag "$1")
   printf '%s' "$t"
@@ -2554,62 +3155,53 @@ github_hint() {
 }
 
 install_xray_direct() {
+  BIN_UPDATED_XRAY=0
+  BIN_BAK_SKIP_XRAY=0
   step "安装 / 更新 Xray-core（直接下载 XTLS/Xray-core 官方 Release）"
   mktmp
-  local tag asset base cur="" want dg sum
-  tag=$(gh_latest_tag XTLS/Xray-core)
-  [[ -n $tag ]] || { github_hint; die "获取 Xray 最新版本号失败。"; }
-  [[ -x $XRAY_BIN ]] && cur=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}')
-  if [[ -n $cur && "v${cur#v}" == "$tag" ]] && { (( NAT_MODE || LAND_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
-    ok "Xray 已是最新版本 ${tag}，跳过下载。"
+  local tag="" dg="" old=""
+  old=$(bin_version xray "$XRAY_BIN" || true)
+  if [[ -n $OPT_XRAY_VER ]]; then
+    tag=$(bin_norm_tag xray "$OPT_XRAY_VER") || die "Xray 版本号无效: ${OPT_XRAY_VER}（例如 v26.3.27）"
+    gh_release_ok XTLS/Xray-core "$tag" || die "找不到 Xray 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
   else
-    asset=$(xray_asset_name)
-    base="https://github.com/XTLS/Xray-core/releases/download/${tag}"
-    info "下载 ${asset} (${tag}) ..."
-    fetch -o "${TMP_DIR}/${asset}" "${base}/${asset}" || { github_hint; die "下载 Xray 失败。"; }
-    if fetch -o "${TMP_DIR}/${asset}.dgst" "${base}/${asset}.dgst" 2>/dev/null; then
-      want=$(awk -F'= *' '/^SHA2-256/{print tolower($2); exit}' "${TMP_DIR}/${asset}.dgst" | tr -d '[:space:]')
-      sum=$(sha256sum "${TMP_DIR}/${asset}" | awk '{print $1}')
-      if [[ -n $want ]]; then
-        [[ $want == "$sum" ]] || die "Xray 压缩包 SHA256 校验失败（期望 ${want}，实际 ${sum}），已中止。"
-        ok "SHA256 校验通过。"
-      else
-        warn "无法解析 .dgst 文件，跳过 SHA256 校验。"
-      fi
-    else
-      warn "未能下载 .dgst 校验文件，跳过 SHA256 校验。"
+    tag=$(gh_latest_tag XTLS/Xray-core)
+    [[ -n $tag ]] || { github_hint; die "获取 Xray 最新版本号失败。"; }
+  fi
+  if xray_ver_same "$old" "$tag" && { (( NAT_MODE || LAND_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
+    if [[ -n $OPT_XRAY_VER ]]; then ok "Xray 已是指定版本 ${tag}，跳过下载。"
+    else ok "Xray 已是最新版本 ${tag}，跳过下载。"; fi
+  else
+    dg="${TMP_DIR}/xray-unzip"
+    xray_fetch_release "$tag" "$dg"
+    if ! xray_install_tree "$dg"; then
+      rm -rf "$dg"
+      die "下载的 Xray 未通过校验，未替换现有程序。"
     fi
-    dg="${TMP_DIR}/xray-unzip"; rm -rf "$dg"; mkdir -p "$dg"
-    # NAT 小鸡 / 落地机：只解压 xray 本体（配置不使用 geoip/geosite，内网段直接写 CIDR），解压后立即删除压缩包
-    if (( NAT_MODE || LAND_MODE )); then
-      unzip -qo "${TMP_DIR}/${asset}" xray -d "$dg" || die "解压 Xray 失败。"
-    else
-      unzip -qo "${TMP_DIR}/${asset}" -d "$dg" || die "解压 Xray 失败。"
-    fi
-    rm -f "${TMP_DIR}/${asset}"
-    [[ -f $dg/xray ]] || die "压缩包中没有 xray 可执行文件。"
-    chmod 755 "$dg/xray"
-    "$dg/xray" version >/dev/null 2>&1 || die "下载的 xray 无法运行（架构不匹配？当前 ${ARCH}）。"
-    install -m 755 "$dg/xray" "${XRAY_BIN}.new" && mv -f "${XRAY_BIN}.new" "$XRAY_BIN"
-    mkdir -p "$XRAY_ASSET_DIR"
-    local f
-    for f in geoip.dat geosite.dat; do [[ -f $dg/$f ]] && install -m 644 "$dg/$f" "${XRAY_ASSET_DIR}/$f"; done
     rm -rf "$dg"
   fi
   write_xray_service
   [[ -x $XRAY_BIN ]] || die "未找到 ${XRAY_BIN}，Xray 安装可能失败。"
-  ok "Xray 已安装: $("$XRAY_BIN" version | awk 'NR==1{print $2}')"
 }
 
 install_hysteria_direct() {
+  BIN_UPDATED_HY2=0
+  BIN_BAK_SKIP_HY2=0
   step "安装 / 更新 Hysteria2（直接下载 apernet/hysteria 官方 Release）"
   mktmp
-  local tag asset base cur="" want sum
-  tag=$(gh_latest_tag apernet/hysteria)
-  [[ -n $tag ]] || { github_hint; die "获取 Hysteria2 最新版本号失败。"; }
-  [[ -x $HY_BIN ]] && cur=$("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')
-  if [[ -n $cur && "app/${cur}" == "$tag" ]]; then
-    ok "Hysteria2 已是最新版本 ${tag#app/}，跳过下载。"
+  local tag="" asset base cur="" want sum old="" replaced=0
+  old=$(bin_version hy2 "$HY_BIN" || true)
+  if [[ -n $OPT_HY2_VER ]]; then
+    tag=$(bin_norm_tag hy2 "$OPT_HY2_VER") || die "Hysteria2 版本号无效: ${OPT_HY2_VER}（例如 v2.6.1 或 app/v2.6.1）"
+    gh_release_ok apernet/hysteria "$tag" || die "找不到 Hysteria2 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag apernet/hysteria)
+    [[ -n $tag ]] || { github_hint; die "获取 Hysteria2 最新版本号失败。"; }
+  fi
+  cur=$old
+  if hy_ver_same "$cur" "$tag"; then
+    if [[ -n $OPT_HY2_VER ]]; then ok "Hysteria2 已是指定版本 $(hy_official_ver "$tag")，跳过下载。"
+    else ok "Hysteria2 已是最新版本 ${tag#app/}，跳过下载。"; fi
   else
     asset=$(hy_asset_name)
     base="https://github.com/apernet/hysteria/releases/download/${tag}"
@@ -2628,12 +3220,17 @@ install_hysteria_direct() {
       warn "未能下载 hashes.txt，跳过 SHA256 校验。"
     fi
     chmod 755 "${TMP_DIR}/${asset}"
-    "${TMP_DIR}/${asset}" version >/dev/null 2>&1 || die "下载的 hysteria 无法运行（架构不匹配？当前 ${ARCH}）。"
+    # hysteria 没有配置检查命令，只确认临时文件能打出 version，再替换
+    if ! hy_check_bin "${TMP_DIR}/${asset}"; then
+      die "下载的 Hysteria2 未通过校验，未替换现有程序。"
+    fi
+    bin_backup "$HY_BIN" hy2
     install -m 755 "${TMP_DIR}/${asset}" "${HY_BIN}.new" && mv -f "${HY_BIN}.new" "$HY_BIN"
+    replaced=1
   fi
   ensure_hy_user
   write_hy2_service
-  ok "Hysteria2 已安装: $("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
+  if (( replaced )); then bin_finish_install hy2 "$HY_BIN" "Hysteria2" "$old"; fi
 }
 
 ensure_hy_user() {
@@ -2649,10 +3246,30 @@ ensure_hy_user() {
 
 # 需要绑定 1024 以下端口时才申请 CAP_NET_BIND_SERVICE（老内核 / OpenVZ 不支持 ambient capabilities）
 need_bind_cap() { (( ${1:-0} > 0 && ${1:-0} < 1024 )); }
+# 1 = XHTTP 走 Vision 的同一个 TCP 端口（fallbacks），不再单独监听 8443
+xhttp_shared() { (( ${XHTTP_ON_443:-0} == 1 && ${XHTTP_ENABLED:-0} == 1 && ${REALITY_ENABLED:-0} == 1 )); }
+xhttp_fallback_prepare() {
+  XHTTP_FB_DEST="" XHTTP_FB_LISTEN="" XHTTP_FB_PORT=0
+  if [[ -d /dev/shm && -w /dev/shm ]]; then
+    rm -f /dev/shm/xray-xhttp.sock
+    XHTTP_FB_DEST="/dev/shm/xray-xhttp.sock"
+    XHTTP_FB_LISTEN="/dev/shm/xray-xhttp.sock,0666"
+    return 0
+  fi
+  local p=32768
+  while (( p < 32820 )); do
+    port_in_use tcp "$p" || break
+    p=$(( p + 1 ))
+  done
+  (( p < 32820 )) || die "没有可用的本机回环端口给 XHTTP 回落。"
+  XHTTP_FB_PORT=$p
+  XHTTP_FB_DEST="127.0.0.1:${p}"
+  XHTTP_FB_LISTEN="127.0.0.1"
+}
 xray_need_cap() {
   if (( ${LAND_MODE:-0} )); then need_bind_cap "$XRAY_PORT"; return; fi
   (( ${REALITY_ENABLED:-1} )) && need_bind_cap "$XRAY_PORT" && return 0
-  (( ${XHTTP_ENABLED:-0} )) && need_bind_cap "$XHTTP_PORT" && return 0
+  (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && need_bind_cap "$XHTTP_PORT" && return 0
   (( ${TROJAN_ENABLED:-0} )) && need_bind_cap "$TROJAN_PORT" && return 0
   (( ${XHTTP_TLS_ENABLED:-0} )) && need_bind_cap "$XHTTP_TLS_PORT" && return 0
   (( ${WS_ENABLED:-0} )) && need_bind_cap "$WS_PORT" && return 0
@@ -3291,12 +3908,15 @@ write_xray_config() {
     ensure_outbound_ip
     land_xray_json >"$tmp" || die "生成落地机 Xray 配置失败。"
   else
+  local share=0
+  if xhttp_shared; then share=1; xhttp_fallback_prepare; fi
   jq -n \
     --argjson port "$XRAY_PORT" --argjson clients "$clients" --argjson cplain "$cplain" --argjson tclients "$tclients" \
     --argjson reality "${REALITY_ENABLED:-0}" --argjson xhttp "${XHTTP_ENABLED:-0}" --argjson trojan "${TROJAN_ENABLED:-0}" \
     --argjson xport "${XHTTP_PORT:-0}" --argjson tport "${TROJAN_PORT:-0}" --arg xpath "${XHTTP_PATH:-/xhttp}" \
     --arg target "${SNI_TARGET:-$SNI:443}" --arg sni "$SNI" \
-    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$seed" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" '
+    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$seed" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" \
+    --argjson share "$share" --arg fbdest "${XHTTP_FB_DEST:-}" --arg fblisten "${XHTTP_FB_LISTEN:-}" --argjson fbport "${XHTTP_FB_PORT:-0}" '
   def reality: {
     show: false, target: $target, xver: 0,
     serverNames: [$sni], privateKey: $priv, shortIds: [$sid]
@@ -3308,11 +3928,31 @@ write_xray_config() {
       []
       + (if $reality == 1 then [{
           tag: "vless-reality", port: $port, protocol: "vless",
-          settings: {clients: $clients, decryption: "none"},
+          settings: ({clients: $clients, decryption: "none"}
+            + (if $share == 1 then {fallbacks: [{dest: $fbdest, xver: 0}]} else {} end)),
           streamSettings: {network: "raw", security: "reality", realitySettings: reality},
           sniffing: sniff
         }] else [] end)
-      + (if $xhttp == 1 then [{
+      + (if $xhttp == 1 then
+          if $share == 1 then
+            [(if $fbport == 0 then {
+                tag: "vless-xhttp", listen: $fblisten, protocol: "vless",
+                settings: {clients: $cplain, decryption: "none"},
+                streamSettings: {
+                  network: "xhttp", security: "none",
+                  xhttpSettings: {path: $xpath, mode: "stream-one"}
+                },
+                sniffing: sniff
+              } else {
+                tag: "vless-xhttp", listen: $fblisten, port: $fbport, protocol: "vless",
+                settings: {clients: $cplain, decryption: "none"},
+                streamSettings: {
+                  network: "xhttp", security: "none",
+                  xhttpSettings: {path: $xpath, mode: "stream-one"}
+                },
+                sniffing: sniff
+              } end)]
+          else [{
           tag: "vless-xhttp", port: $xport, protocol: "vless",
           settings: {clients: $cplain, decryption: "none"},
           streamSettings: {
@@ -3321,7 +3961,8 @@ write_xray_config() {
             realitySettings: reality
           },
           sniffing: sniff
-        }] else [] end)
+        }] end
+        else [] end)
       + (if $trojan == 1 then [{
           tag: "trojan-reality", port: $tport, protocol: "trojan",
           settings: {clients: $tclients},
@@ -3378,6 +4019,7 @@ write_xray_config() {
 restart_xray() {
   # 原样转发时本机不终止 SS。停掉并取消开机自启，避免 Xray 占住落地端口。
   if land_raw_active; then
+    BIN_UPDATED_XRAY=0
     svc_disable_stop xray
     ok "原样转发中：Xray 已停止，不监听 ${XRAY_PORT}（对外端口 $(pub_xray_port)）。"
     return 0
@@ -3388,8 +4030,14 @@ restart_xray() {
   sleep 1
   if ! svc_active xray; then
     svc_logs xray 20 >&2 || true
+    local rc=0
+    bin_restart_failed xray "$XRAY_BIN" xray "Xray" || rc=$?
+    if (( rc == 0 )); then die "Xray 更新后没有跑起来，已恢复备份。"
+    elif (( rc == 2 )); then die "Xray 更新后没有跑起来，恢复备份后仍未运行。"
+    fi
     die "Xray 启动失败，请查看上方日志。"
   fi
+  BIN_UPDATED_XRAY=0
   if (( LAND_MODE )); then
     ok "Xray 运行中 (Shadowsocks 2022 TCP+UDP ${XRAY_PORT}$( ((NAT_MODE)) && [[ $XRAY_EXT_PORT != "$XRAY_PORT" ]] && echo "，外部端口 ${XRAY_EXT_PORT}"))"
   else
@@ -3402,18 +4050,46 @@ selinux_fix() {
   if have restorecon; then restorecon -R "$@" >/dev/null 2>&1 || true; fi
 }
 
+# @module src/hy2.sh
 # ============================================================
 #                        Hysteria2
 # ============================================================
 install_hysteria() {
   if direct_mode; then install_hysteria_direct; return; fi
+  BIN_UPDATED_HY2=0
+  BIN_BAK_SKIP_HY2=0
   step "安装 / 更新 Hysteria2（官方 get.hy2.sh 脚本）"
   mktmp
-  fetch -o "${TMP_DIR}/hy2-install.sh" "$HY_INSTALL_URL" || die "下载 Hysteria2 安装脚本失败。"
-  TERM=${TERM:-dumb} bash "${TMP_DIR}/hy2-install.sh" >"${TMP_DIR}/hy2-install.log" 2>&1 || {
-    tail -n 20 "${TMP_DIR}/hy2-install.log" >&2; die "Hysteria2 安装失败。"; }
-  [[ -x $HY_BIN ]] || die "未找到 ${HY_BIN}，Hysteria2 安装可能失败。"
-  ok "Hysteria2 已安装: $("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
+  local tag="" cli="" old="" backed=0
+  old=$(bin_version hy2 "$HY_BIN" || true)
+  if [[ -n $OPT_HY2_VER ]]; then
+    tag=$(bin_norm_tag hy2 "$OPT_HY2_VER") || die "Hysteria2 版本号无效: ${OPT_HY2_VER}（例如 v2.6.1 或 app/v2.6.1）"
+    gh_release_ok apernet/hysteria "$tag" || die "找不到 Hysteria2 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag apernet/hysteria)
+    [[ -n $tag ]] || { github_hint; die "获取 Hysteria2 最新版本号失败。"; }
+  fi
+  cli=$(hy_official_ver "$tag")
+  if hy_ver_same "$old" "$tag"; then
+    if [[ -n $OPT_HY2_VER ]]; then ok "Hysteria2 已是指定版本 ${cli}，跳过下载。"
+    else ok "Hysteria2 已是最新版本 ${cli}，跳过下载。"; fi
+    return 0
+  fi
+  # 官方脚本自己覆盖程序。先备份，写完后只检查 version（没有配置检查），不通过就换回。
+  bin_backup "$HY_BIN" hy2
+  backed=$BIN_BAK_MADE
+  fetch -o "${TMP_DIR}/hy2-install.sh" "$HY_INSTALL_URL" || { bin_backup_drop "$HY_BIN"; die "下载 Hysteria2 安装脚本失败。"; }
+  if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/hy2-install.sh" --version "$cli" >"${TMP_DIR}/hy2-install.log" 2>&1; then
+    tail -n 20 "${TMP_DIR}/hy2-install.log" >&2 || true
+    bin_reject_new hy2 "$HY_BIN" hysteria-server "Hysteria2" "$backed" " 安装失败"
+  fi
+  if ! hy_check_bin "$HY_BIN"; then
+    if (( backed )); then bin_restore_prebak hy2 "$HY_BIN" hysteria-server "Hysteria2" " 未通过校验"; fi
+    bin_backup_drop "$HY_BIN"
+    if (( BIN_BAK_SKIP_HY2 )); then die "Hysteria2 未通过校验。剩余空间不足，没有备份可以恢复。"; fi
+    die "Hysteria2 未通过校验。"
+  fi
+  bin_finish_install hy2 "$HY_BIN" "Hysteria2" "$old"
 }
 
 gen_hy2_cert() {
@@ -3485,8 +4161,14 @@ restart_hy2() {
   sleep 2
   if ! svc_active hysteria-server; then
     svc_logs hysteria-server 20 >&2 || true
+    local rc=0
+    bin_restart_failed hy2 "$HY_BIN" hysteria-server "Hysteria2" || rc=$?
+    if (( rc == 0 )); then die "Hysteria2 更新后没有跑起来，已恢复备份。"
+    elif (( rc == 2 )); then die "Hysteria2 更新后没有跑起来，恢复备份后仍未运行。"
+    fi
     die "Hysteria2 启动失败，请查看上方日志。"
   fi
+  BIN_UPDATED_HY2=0
   if (( NAT_MODE )); then
     ok "Hysteria2 运行中 (UDP ${HY2_PORT}$([[ $HY2_EXT_PORT != "$HY2_PORT" ]] && echo "，外部端口 ${HY2_EXT_PORT}")${HOP_RANGE:+，端口跳跃 ${HOP_EXT_RANGE}})"
   else
@@ -3499,7 +4181,7 @@ remove_hysteria() { # $1 = purge：连证书目录一起删（卸载）。TUIC/A
   if have systemctl; then systemctl disable --now 'hysteria-server@*' >/dev/null 2>&1 || true; fi
   rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service "$HY_RC"
   rm -rf /etc/systemd/system/hysteria-server.service.d /var/log/hysteria
-  rm -f "$HY_BIN" "$HY_CONF"
+  rm -f "$HY_BIN" "${HY_BIN}.bak" "${HY_BIN}.prebak" "$HY_CONF"
   if [[ $1 == purge ]] || ! sb_needed; then rm -rf "$HY_DIR"; fi
   if id hysteria >/dev/null 2>&1; then userdel hysteria >/dev/null 2>&1 || deluser hysteria >/dev/null 2>&1 || true; fi
   if getent group hysteria >/dev/null 2>&1; then groupdel hysteria >/dev/null 2>&1 || delgroup hysteria >/dev/null 2>&1 || true; fi
@@ -3507,6 +4189,7 @@ remove_hysteria() { # $1 = purge：连证书目录一起删（卸载）。TUIC/A
   remove_nat_hop
 }
 
+# @module src/firewall.sh
 # ============================================================
 #                        防火墙 (nftables)
 # ============================================================
@@ -3576,13 +4259,32 @@ fw_wireguard_present() {
   if have ip && ip -d link show 2>/dev/null | grep -q wireguard; then return 0; fi
   return 1
 }
+# apt purge 之后，oneshot 服务仍可能显示 active (exited)。命令没了，或单元文件已经不在，就不算在运行。
+fw_unit_missing() { # $1 服务名。0 = 单元已经不在
+  local name=$1 load="" frag=""
+  [[ ${INIT_SYS:-} == systemd ]] || return 1
+  have systemctl || return 1
+  load=$(systemctl show -p LoadState --value "$name" 2>/dev/null || true)
+  case $load in
+    not-found|masked) return 0 ;;
+  esac
+  frag=$(systemctl show -p FragmentPath --value "$name" 2>/dev/null || true)
+  [[ -n $frag && ! -e $frag ]]
+}
 fw_ufw_active() {
+  local st=""
+  have ufw || return 1
+  fw_unit_missing ufw && return 1
   svc_active ufw && return 0
-  have ufw && ufw status 2>/dev/null | grep -q 'Status: active'
+  # 不用 grep -q 接管道：pipefail 下 ufw 写到一半会被 SIGPIPE，活动状态会误判。
+  st=$(ufw status 2>/dev/null || true)
+  [[ $st == *'Status: active'* ]]
 }
 fw_firewalld_active() {
+  have firewall-cmd || return 1
+  fw_unit_missing firewalld && return 1
   svc_active firewalld && return 0
-  have firewall-cmd && firewall-cmd --state >/dev/null 2>&1
+  firewall-cmd --state >/dev/null 2>&1
 }
 # 除本脚本的表以外，规则集里还有实际规则（空表、只有 chain 类型声明的不算）
 fw_foreign_nft() {
@@ -3591,7 +4293,8 @@ fw_foreign_nft() {
   rs=$(nft -s list ruleset 2>/dev/null || true)
   [[ -n $rs ]] || return 1
   awk '
-    $1 == "table" { skip = ($0 ~ /proxy_oneclick/); next }
+    # fail2ban 的 f2b-table 是本脚本自己写的，不能当成「别人的防火墙」。
+    $1 == "table" { skip = ($0 ~ /proxy_oneclick/ || $0 ~ /f2b/ || $0 ~ /fail2ban/); next }
     skip { next }
     /^[[:space:]]*(type |chain |}|table )/ { next }
     /^[[:space:]]*$/ { next }
@@ -3736,15 +4439,20 @@ fw_decide_install() {
       info "已按指定跳过 nftables 防火墙。"
     fi
   elif (( OPT_AUTO )) || { [[ ! -t 0 && ! -r /dev/tty ]]; }; then
-    fw_detect_risk
-    if (( FW_RISK )); then
-      FW_MODE=allow
-      warn "未指定 --firewall。检测到可能被默认拒绝打断的环境，非交互安装改用只放行模式："
-      fw_print_risk
-      info "确认要入站默认拒绝时，请使用 --firewall strict，或之后执行 proxy firewall strict。"
+    # 重装 / 更新没写 --firewall 时，沿用上次保存的模式。fail2ban 的表不能把 strict 改成 allow。
+    if [[ ${INSTALLED:-0} == 1 && ${FW_MODE:-} =~ ^(strict|allow|off)$ ]]; then
+      info "未指定 --firewall，沿用已保存的模式：$(fw_mode_label)。"
     else
-      FW_MODE=strict
-      info "未指定 --firewall，也没有发现 Docker、已有防火墙或额外的非标准监听，使用严格模式（入站默认拒绝）。"
+      fw_detect_risk
+      if (( FW_RISK )); then
+        FW_MODE=allow
+        warn "未指定 --firewall。检测到可能被默认拒绝打断的环境，非交互安装改用只放行模式："
+        fw_print_risk
+        info "确认要入站默认拒绝时，请使用 --firewall strict，或之后执行 proxy firewall strict。"
+      else
+        FW_MODE=strict
+        info "未指定 --firewall，也没有发现 Docker、已有防火墙或额外的非标准监听，使用严格模式（入站默认拒绝）。"
+      fi
     fi
   else
     fw_prompt_mode
@@ -3752,13 +4460,20 @@ fw_decide_install() {
   case $FW_MODE in
     off)
       FW_ENABLED=0
-      if [[ -f $FW_FILE || -f $FW_UNIT ]] || fw_table_loaded; then
+      FW_HOST_SYNC=0
+      if [[ -f $FW_FILE || -f $FW_UNIT || -s ${FW_HOST_FILE:-} ]] || fw_table_loaded; then
         info "不配置防火墙，移除本脚本已有的 nftables 规则 ..."
         remove_firewall
       fi
       ;;
     allow)
       FW_ENABLED=1
+      if fw_ufw_active || fw_firewalld_active; then
+        FW_HOST_SYNC=1
+        info "检测到 ufw 或 firewalld。只放行模式会把代理端口写进去，否则它们的默认拒绝仍会挡住这些端口。"
+      else
+        FW_HOST_SYNC=0
+      fi
       ;;
     *)
       FW_MODE=strict
@@ -3776,15 +4491,25 @@ fw_decide_install() {
 fw_switch_mode() { # strict|allow|off。已安装后从菜单或 proxy firewall 调用
   case $1 in
     off)
+      FW_HOST_SYNC=0
       remove_firewall
       FW_MODE=off
       FW_ENABLED=0
       save_state
-      ok "已关闭本脚本防火墙（没有改系统其它规则）。"
+      ok "已关闭本脚本防火墙（没有改系统其它规则，写入 ufw / firewalld 的放行也已去掉）。"
+      if fw_ufw_active; then
+        warn "ufw 仍在运行。写进 ufw 的放行已经去掉，它的默认拒绝会挡住代理端口。要恢复：proxy firewall allow；或自行停用 ufw。"
+      fi
+      if fw_firewalld_active; then
+        warn "firewalld 仍在运行。写进 firewalld 的放行已经去掉，它的默认拒绝会挡住代理端口。要恢复：proxy firewall allow；或自行停用 firewalld。"
+      fi
       ;;
     allow)
       FW_MODE=allow
       FW_ENABLED=1
+      # 严格模式停过的 ufw 要先放行 SSH 再打开，否则默认拒绝会把登录关在外面。
+      fw_reenable_disabled
+      if fw_ufw_active || fw_firewalld_active; then FW_HOST_SYNC=1; else FW_HOST_SYNC=0; fi
       save_state
       apply_firewall
       save_state
@@ -3796,8 +4521,12 @@ fw_switch_mode() { # strict|allow|off。已安装后从菜单或 proxy firewall 
       if (( ! FW_ENABLED )); then
         FW_MODE=off
         save_state
+        fw_host_sync
+        fw_print_allows
+        save_state
         return 0
       fi
+      FW_HOST_SYNC=0
       ask_extra_ports
       save_state
       apply_firewall
@@ -3825,24 +4554,43 @@ fw_rules_cover_ssh() { # $1 nft 文件
   return 0
 }
 
+# Debian 上 fail2ban.service 有 PartOf=firewalld.service，停 firewalld 会把 fail2ban 一起停掉。
+fw_revive_fail2ban() { # $1 = 停用前 fail2ban 是否在运行
+  [[ ${1:-0} == 1 ]] || return 0
+  svc_active fail2ban && return 0
+  if svc_restart fail2ban; then
+    ok "已重新拉起 fail2ban（停用其它防火墙时它被一起停掉了）。"
+  else
+    warn "fail2ban 在停用其它防火墙时被一起停掉，重新拉起失败。可手动执行: systemctl restart fail2ban"
+  fi
+  return 0
+}
 handle_other_firewalls() {
-  local fw
+  local fw f2b_was=0
+  svc_active fail2ban && f2b_was=1
+  FW_HOST_SYNC=0
   for fw in firewalld ufw; do
-    if svc_active "$fw" || { [[ $fw == ufw ]] && have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; }; then
+    if { [[ $fw == ufw ]] && fw_ufw_active; } || { [[ $fw == firewalld ]] && fw_firewalld_active; }; then
       warn "检测到 ${fw} 正在运行。严格模式会把入站改成默认拒绝，和它叠在一起容易互相挡住。"
       if confirm "是否停用 ${fw}（严格模式由本脚本放行 SSH 和现有端口；卸载时可恢复）？" y; then
+        fw_host_clear
         [[ $fw == ufw ]] && { ufw --force disable >/dev/null 2>&1 || true; }
         systemctl disable --now "$fw" >/dev/null 2>&1 || true
         [[ " $DISABLED_FW " == *" $fw "* ]] || DISABLED_FW="${DISABLED_FW:+$DISABLED_FW }$fw"
         ok "已停用 ${fw}（卸载本脚本时可恢复）。"
       else
-        warn "保留 ${fw}，已取消严格模式。可改用「只放行」（proxy firewall allow），或在 ${fw} 里自行放行代理端口。"
+        warn "保留 ${fw}，已取消严格模式。代理端口会写入 ${fw}，否则它的默认拒绝会一直挡住这些端口。"
+        remove_nft_rules
         FW_ENABLED=0
         FW_MODE=off
+        FW_HOST_SYNC=1
+        fw_revive_fail2ban "$f2b_was"
         return 0
       fi
     fi
   done
+  fw_revive_fail2ban "$f2b_was"
+  return 0
 }
 
 backup_firewall() {
@@ -3865,7 +4613,7 @@ render_firewall() {
     [[ $1 == tcp_ports && ",$ssh_set," == *",$p,"* ]] && return 0
     printf -v "$1" '%s' "${cur:+$cur,}$p"
   }
-  (( ${XHTTP_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_PORT"
+  (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && fw_add_port tcp_ports "$XHTTP_PORT"
   (( ${TROJAN_ENABLED:-0} )) && fw_add_port tcp_ports "$TROJAN_PORT"
   (( ${ANYTLS_ENABLED:-0} )) && fw_add_port tcp_ports "$ANYTLS_PORT"
   (( ${XHTTP_TLS_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_TLS_PORT"
@@ -3912,7 +4660,7 @@ render_firewall() {
     if [[ -n $hop ]]; then
       echo "  chain prerouting {"
       echo "    type nat hook prerouting priority dstnat; policy accept;"
-      echo "    udp dport ${hop} redirect to :${HY2_PORT} comment \"hy2 port hopping\""
+      echo "    udp dport ${hop} counter redirect to :${HY2_PORT} comment \"hy2 port hopping\""
       echo "  }"
     fi
     echo "}"
@@ -3933,7 +4681,7 @@ render_firewall_compat() {
         echo "table ${fam} ${NFT_TABLE}_nat {"
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
-        echo "    udp dport ${HOP_RANGE} redirect to :${HY2_PORT}"
+        echo "    udp dport ${HOP_RANGE} counter redirect to :${HY2_PORT}"
         echo "  }"
         echo "}"
       } >>"${f}.2"
@@ -3950,7 +4698,16 @@ apply_firewall() {
     off) FW_ENABLED=0 ;;
     allow|strict) FW_ENABLED=1 ;;
   esac
-  (( FW_ENABLED )) || { warn "已跳过防火墙配置（--no-firewall、--firewall off，或保留了其它防火墙）。"; return 0; }
+  if (( ! FW_ENABLED )); then
+    if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+      fw_host_sync
+      fw_print_allows
+      return 0
+    fi
+    fw_host_clear
+    warn "已跳过防火墙配置（--no-firewall、--firewall off，或保留了其它防火墙）。"
+    return 0
+  fi
   [[ ${FW_MODE:-strict} == allow ]] || FW_MODE=strict
   step "配置 nftables 防火墙（$(fw_mode_label)）"
   have nft || die "未安装 nftables。"
@@ -3958,6 +4715,7 @@ apply_firewall() {
   if [[ $FW_MODE == strict && -z ${SSH_PORTS// } ]]; then
     warn "没有检测到 SSH 端口，已改为只放行模式，避免把登录关在外面。"
     FW_MODE=allow
+    if fw_ufw_active || fw_firewalld_active; then FW_HOST_SYNC=1; fi
   fi
   mkdir -p "$STATE_DIR"
   render_firewall
@@ -3965,6 +4723,7 @@ apply_firewall() {
     warn "严格模式的规则没有包含全部 SSH 端口，已改为只放行模式，避免把登录关在外面。"
     FW_MODE=allow
     FW_ENABLED=1
+    if fw_ufw_active || fw_firewalld_active; then FW_HOST_SYNC=1; fi
     render_firewall
   fi
   if ! render_firewall_compat; then
@@ -4009,11 +4768,12 @@ UNIT
   else
     ok "nftables 规则已加载（入站默认拒绝）。"
   fi
+  if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then fw_host_sync; else fw_host_clear; fi
   fw_print_allows
 }
 
-remove_firewall() {
-  # 只删本脚本的表和服务。不 flush ruleset，不碰 Docker / Podman / 系统其它链。
+# 只卸 nftables 表和服务，不动 ufw / firewalld 里已经同步的放行
+remove_nft_rules() {
   if [[ $INIT_SYS == systemd ]]; then systemctl disable --now proxy-oneclick-fw >/dev/null 2>&1 || true; fi
   if have nft; then
     nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
@@ -4022,6 +4782,13 @@ remove_firewall() {
   fi
   rm -f "$FW_UNIT" "$FW_FILE"
   sd_reload
+}
+remove_firewall() {
+  # 只删本脚本的表和服务。不 flush ruleset，不碰 Docker / Podman / 系统其它链。
+  # 同时删掉曾经写入 ufw / firewalld 的放行（只删清单里的条目）。
+  fw_host_clear
+  FW_HOST_SYNC=0
+  remove_nft_rules
 }
 
 # ============================================================
@@ -4217,6 +4984,332 @@ fw_allow_row() { # $1 协议名 $2 tcp|udp $3 端口或范围
   FW_ALLOW_SEEN+=" ${fam,,}/${port}"
   printf '  %s  %s  %s\n' "$(ui_pad "$name" 22)" "$(ui_pad "${fam^^}" 4)" "$port"
 }
+# 收集当前要放行的端口。范围用短横线，后面按防火墙自己的写法转换。
+fw_want_has() { printf '%s\n' "$FW_WANT" | grep -Fxq -- "$1"; }
+fw_want_add() {
+  local fam=$1 port=$2 key
+  [[ -n $port && $port != 0 ]] || return 0
+  fam=${fam,,}
+  key="${fam} ${port}"
+  fw_want_has "$key" && return 0
+  if [[ -n $FW_WANT ]]; then FW_WANT+=$'\n'"$key"; else FW_WANT=$key; fi
+}
+fw_collect_want() {
+  local p seg
+  FW_WANT=""
+  (( ${REALITY_ENABLED:-0} == 1 )) && fw_want_add tcp "$XRAY_PORT"
+  (( ${XHTTP_ENABLED:-0} == 1 )) && ! xhttp_shared && fw_want_add tcp "$XHTTP_PORT"
+  (( ${HY2_ENABLED:-0} == 1 )) && fw_want_add udp "$HY2_PORT"
+  (( ${TROJAN_ENABLED:-0} == 1 )) && fw_want_add tcp "$TROJAN_PORT"
+  (( ${TUIC_ENABLED:-0} == 1 )) && fw_want_add udp "$TUIC_PORT"
+  (( ${ANYTLS_ENABLED:-0} == 1 )) && fw_want_add tcp "$ANYTLS_PORT"
+  (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && fw_want_add tcp "$XHTTP_TLS_PORT"
+  (( ${WS_ENABLED:-0} == 1 )) && fw_want_add tcp "$WS_PORT"
+  cert_is_public && fw_want_add tcp "$SUB_PORT"
+  # SSH 不进这份清单。ufw 对已有规则再 allow 只会改注释，记下来之后清理时会把用户自己的 SSH 删掉。
+  if (( ${HY2_ENABLED:-0} == 1 )) && [[ -n ${HOP_RANGE:-} ]]; then
+    for seg in ${HOP_RANGE//,/ }; do fw_want_add udp "$seg"; done
+  fi
+  for p in ${EXTRA_TCP-}; do fw_want_add tcp "$p"; done
+  for p in ${EXTRA_UDP-}; do fw_want_add udp "$p"; done
+}
+# 22，以及已保存的 SSH 端口、当前会话端口。主机防火墙不记录、不删除这些规则。
+fw_is_ssh_port() {
+  local p=$1 cur=""
+  [[ $p =~ ^[0-9]+$ ]] || return 1
+  [[ $p == 22 ]] && return 0
+  [[ " ${SSH_PORTS:-} " == *" $p "* ]] && return 0
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    cur=$(awk '{print $4}' <<<"$SSH_CONNECTION")
+    [[ $cur == "$p" ]] && return 0
+  fi
+  return 1
+}
+fw_host_port_is_ssh() { # 22、22:80、22-80 都按起始端口判断
+  local p=${1//:/-}
+  p=${p%%-*}
+  fw_is_ssh_port "$p"
+}
+fw_disabled_has() { [[ " ${DISABLED_FW:-} " == *" $1 "* ]]; }
+fw_disabled_drop() {
+  local fw=$1 out="" x
+  for x in ${DISABLED_FW:-}; do
+    [[ $x == "$fw" ]] && continue
+    out+="${x} "
+  done
+  DISABLED_FW=${out% }
+}
+# 一条已有规则的端口部分是否盖住想放行的端口或范围。
+fw_one_span_covers() { # $1 已有（22 或 20000:50000） $2 想要的
+  local span=$1 want=$2 a b wa wb
+  if [[ $want == *:* ]]; then
+    wa=${want%%:*}; wb=${want##*:}
+    [[ $wa =~ ^[0-9]+$ && $wb =~ ^[0-9]+$ ]] || return 1
+    [[ $span == *:* ]] || return 1
+    a=${span%%:*}; b=${span##*:}
+    [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]] || return 1
+    if (( 10#$a <= 10#$wa && 10#$b >= 10#$wb )); then return 0; fi
+    return 1
+  fi
+  [[ $want =~ ^[0-9]+$ ]] || return 1
+  if [[ $span == *:* ]]; then
+    a=${span%%:*}; b=${span##*:}
+    [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]] || return 1
+    if (( 10#$a <= 10#$want && 10#$want <= 10#$b )); then return 0; fi
+    return 1
+  fi
+  [[ $span == "$want" ]]
+}
+fw_token_covers_port() { # $1 可能带逗号的端口 $2 想要的端口或冒号范围
+  local tok=$1 want=$2 part rest
+  rest=$tok
+  while [[ -n $rest ]]; do
+    part=${rest%%,*}
+    if [[ $rest == *","* ]]; then rest=${rest#*,}; else rest=""; fi
+    fw_one_span_covers "$part" "$want" && return 0
+  done
+  return 1
+}
+# $1 规则目标（22/tcp、22、20000:50000/udp） $2 动作 $3 想放行的 spec
+fw_ufw_rule_covers() {
+  local to=${1,,} act=${2,,} spec=${3,,} wproto wport rproto rports
+  [[ $act == allow || $act == limit ]] || return 1
+  to=${to%%$'\r'}
+  to=${to//" (v6)"/}
+  to=${to%% }
+  [[ -n $to ]] || return 1
+  # OpenSSH、Anywhere 这类名字不含端口，不拿来凑。
+  [[ $to == *[!0-9]* && $to != *[:/,]* ]] && return 1
+  wproto=${spec##*/}
+  wport=${spec%/*}
+  if [[ $to == */* ]]; then
+    rproto=${to##*/}
+    rports=${to%/*}
+  else
+    rproto=any
+    rports=$to
+  fi
+  [[ $rproto == "$wproto" || $rproto == any ]] || return 1
+  fw_token_covers_port "$rports" "$wport"
+}
+# 不论注释，只要已有放行盖住这条端口/协议就不算我们新加的。
+fw_ufw_covers() { # $1 = 443/tcp 或 20000:50000/udp
+  local spec=${1,,} blob="" line="" to="" act="" mode=status rest="" pproto="" pport=""
+  have ufw || return 1
+  blob=$( { ufw status numbered; printf '\n--SHOW-ADDED--\n'; ufw show added; } 2>/dev/null || true)
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == '--SHOW-ADDED--' ]]; then mode=added; continue; fi
+    if [[ $mode == status ]]; then
+      [[ $line =~ ^[[:space:]]*\[[[:space:]]*[0-9]+\][[:space:]]*(.*)$ ]] || continue
+      rest=${BASH_REMATCH[1]}
+      [[ $rest =~ ^([^[:space:]]+)([[:space:]]+\(v6\))?[[:space:]]+(ALLOW|DENY|REJECT|LIMIT)([[:space:]]|$) ]] || continue
+      to=${BASH_REMATCH[1]}
+      act=${BASH_REMATCH[3]}
+      fw_ufw_rule_covers "$to" "$act" "$spec" && return 0
+    elif [[ $line =~ ^ufw[[:space:]]+(allow|limit|deny|reject)[[:space:]]+ ]]; then
+      act=${BASH_REMATCH[1]}
+      if [[ $line =~ ^ufw[[:space:]]+(allow|limit|deny|reject)[[:space:]]+([0-9][^[:space:]]*) ]]; then
+        to=${BASH_REMATCH[2]}
+        fw_ufw_rule_covers "$to" "$act" "$spec" && return 0
+      fi
+      pproto=""; pport=""
+      [[ $line =~ proto[[:space:]]+(tcp|udp) ]] && pproto=${BASH_REMATCH[1]}
+      [[ $line =~ port[[:space:]]+([0-9][0-9]*(:[0-9]+)?) ]] && pport=${BASH_REMATCH[1]}
+      if [[ -n $pport ]]; then
+        [[ -n $pproto ]] || pproto=any
+        fw_ufw_rule_covers "${pport}/${pproto}" "$act" "$spec" && return 0
+      fi
+    fi
+  done <<<"$blob"
+  return 1
+}
+fw_ufw_ensure_ssh() {
+  local p spec seen=""
+  have ufw || return 0
+  detect_ssh_ports
+  for p in ${SSH_PORTS:-} 22; do
+    is_port "$p" || continue
+    [[ " $seen " == *" $p "* ]] && continue
+    seen+=" $p"
+    spec="${p}/tcp"
+    if fw_ufw_covers "$spec"; then continue; fi
+    # 不写 proxy-oneclick，也不记入清单，避免以后被当成自己的规则删掉。
+    ufw allow "$spec" >/dev/null 2>&1 || warn "放行 SSH ${spec} 失败。"
+  done
+  return 0
+}
+fw_ufw_enable_kept() {
+  have ufw || return 0
+  fw_ufw_ensure_ssh
+  if have systemctl; then systemctl enable --now ufw >/dev/null 2>&1 || true; fi
+  if ! ufw --force enable >/dev/null 2>&1; then
+    warn "重新启用 ufw 失败。"
+    return 1
+  fi
+  return 0
+}
+fw_reenable_disabled() {
+  if fw_disabled_has ufw && have ufw; then
+    if fw_ufw_enable_kept; then ok "已重新启用 ufw（已先放行 SSH）。"; fi
+    fw_disabled_drop ufw
+  fi
+  if fw_disabled_has firewalld; then
+    if have systemctl; then systemctl enable --now firewalld >/dev/null 2>&1 || true; fi
+    fw_disabled_drop firewalld
+    ok "已重新启用 firewalld。"
+  fi
+  return 0
+}
+# ufw 编号规则里，只删带本脚本注释的那一条
+# 按整条端口匹配，避免 443 命中 8443
+fw_ufw_line_ours() { # $1 = 443/tcp 或 20000:50000/udp
+  grep -E "(^|[^0-9:])${1}([^0-9:]|$)" | grep -F 'proxy-oneclick'
+}
+fw_ufw_delete_ours() {
+  local spec=$1 n="" i port
+  have ufw || return 0
+  port=${spec%%/*}
+  fw_host_port_is_ssh "$port" && return 0
+  for i in 1 2 3 4 5 6 7 8; do
+    n=$(ufw status numbered 2>/dev/null | fw_ufw_line_ours "$spec" | head -n1 | sed -n 's/^[[:space:]]*\[ *\([0-9][0-9]*\)\].*/\1/p') || true
+    [[ -n $n ]] || break
+    ufw --force delete "$n" >/dev/null 2>&1 || return 0
+  done
+  # 停用时编号列表是空的，规则仍在 show added 里。
+  if ufw show added 2>/dev/null | fw_ufw_line_ours "$spec" >/dev/null; then
+    ufw --force delete allow "$spec" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+fw_ufw_ours_present() {
+  ufw status 2>/dev/null | fw_ufw_line_ours "$1" >/dev/null
+}
+fw_fwd_zone() {
+  local z
+  z=$(firewall-cmd --get-default-zone 2>/dev/null) || z=""
+  [[ -n $z ]] || z=public
+  printf '%s' "$z"
+}
+fw_fwd_reload() {
+  firewall-cmd --reload >/dev/null 2>&1 || warn "firewalld 重载失败，刚写入的端口可能还没生效。"
+}
+fw_line_has() { printf '%s\n' "$1" | grep -Fxq -- "$2"; }
+# 按记录文件删掉以前写进去的 ufw / firewalld 规则
+fw_host_clear() {
+  [[ -s ${FW_HOST_FILE:-} ]] || return 0
+  local kind a b c reload=0
+  while read -r kind a b c _; do
+    [[ -n $kind ]] || continue
+    case $kind in
+      ufw)
+        fw_host_port_is_ssh "$b" && continue
+        fw_ufw_delete_ours "${b}/${a}"
+        ;;
+      firewalld)
+        fw_host_port_is_ssh "$c" && continue
+        have firewall-cmd || continue
+        firewall-cmd --permanent --zone="$a" --remove-port="${c}/${b}" >/dev/null 2>&1 || true
+        reload=1
+        ;;
+    esac
+  done <"$FW_HOST_FILE"
+  (( reload )) && fw_fwd_reload
+  rm -f "$FW_HOST_FILE"
+  return 0
+}
+# allow，或用户选择保留 ufw/firewalld 时，把代理端口写进正在运行的防火墙
+fw_host_sync() {
+  if ! fw_ufw_active && ! fw_firewalld_active; then
+    [[ -s ${FW_HOST_FILE:-} ]] && fw_host_clear
+    return 0
+  fi
+  if [[ ${FW_HOST_SYNC:-0} != 1 ]]; then
+    fw_host_clear
+    return 0
+  fi
+  fw_collect_want
+  local old="" kind a b c key spec proto port uport line
+  local new="" reload=0 ufw_on=0 fwd_on=0 zone=""
+  [[ -f $FW_HOST_FILE ]] && old=$(cat "$FW_HOST_FILE")
+  fw_ufw_active && ufw_on=1
+  if fw_firewalld_active; then fwd_on=1; zone=$(fw_fwd_zone); fi
+  if [[ -n $old ]]; then
+    while read -r kind a b c _; do
+      [[ -n $kind ]] || continue
+      case $kind in
+        ufw)
+          fw_host_port_is_ssh "$b" && continue
+          key="${a} ${b//:/-}"
+          if (( ! ufw_on )) || ! fw_want_has "$key"; then fw_ufw_delete_ours "${b}/${a}"; fi
+          ;;
+        firewalld)
+          fw_host_port_is_ssh "$c" && continue
+          key="${b} ${c}"
+          if (( ! fwd_on )) || [[ $a != "$zone" ]] || ! fw_want_has "$key"; then
+            firewall-cmd --permanent --zone="$a" --remove-port="${c}/${b}" >/dev/null 2>&1 || true
+            reload=1
+          fi
+          ;;
+      esac
+    done <<<"$old"
+  fi
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    proto=${line%% *}
+    port=${line#* }
+    if (( ufw_on )); then
+      uport=${port//-/:}
+      spec="${uport}/${proto}"
+      if fw_host_port_is_ssh "$port"; then
+        :
+      elif fw_ufw_covers "$spec"; then
+        # 已有放行就别再 allow：ufw 会改掉原注释，随后清理会把用户的规则删掉。
+        # 只有清单里本来就有、而且注释仍是本脚本的，才继续记着。
+        if fw_ufw_ours_present "$spec" && fw_line_has "$old" "ufw ${proto} ${uport}"; then
+          new+="ufw ${proto} ${uport}"$'\n'
+        fi
+      elif ufw allow "$spec" comment proxy-oneclick >/dev/null 2>&1; then
+        new+="ufw ${proto} ${uport}"$'\n'
+      else
+        warn "写入 ufw 失败：${spec}"
+      fi
+    fi
+    if (( fwd_on )); then
+      if firewall-cmd --permanent --zone="$zone" --query-port="${port}/${proto}" >/dev/null 2>&1; then
+        fw_line_has "$old" "firewalld ${zone} ${proto} ${port}" && new+="firewalld ${zone} ${proto} ${port}"$'\n'
+      elif firewall-cmd --permanent --zone="$zone" --add-port="${port}/${proto}" >/dev/null 2>&1; then
+        new+="firewalld ${zone} ${proto} ${port}"$'\n'
+        reload=1
+      else
+        warn "写入 firewalld 失败：${port}/${proto}"
+      fi
+    fi
+  done <<<"$FW_WANT"
+  (( reload )) && fw_fwd_reload
+  mkdir -p "$STATE_DIR"
+  if [[ -n $new ]]; then
+    printf '%s' "$new" >"$FW_HOST_FILE"
+    chmod 600 "$FW_HOST_FILE"
+    ok "已把代理端口同步到正在运行的 ufw / firewalld。"
+  else
+    rm -f "$FW_HOST_FILE"
+  fi
+  return 0
+}
+fw_print_host_sync() {
+  [[ -s ${FW_HOST_FILE:-} ]] || return 0
+  local kind a b c ufw_s="" fwd_s="" zone=""
+  while read -r kind a b c _; do
+    case $kind in
+      ufw) ufw_s+="${a^^} ${b}、" ;;
+      firewalld) zone=$a; fwd_s+="${b^^} ${c}、" ;;
+    esac
+  done <"$FW_HOST_FILE"
+  [[ -n $ufw_s ]] && printf '已同步到 ufw（注释 proxy-oneclick）：%s\n' "${ufw_s%、}"
+  [[ -n $fwd_s ]] && printf '已同步到 firewalld（区域 %s）：%s\n' "$zone" "${fwd_s%、}"
+  return 0
+}
+
 fw_print_allows() {
   local p
   FW_ALLOW_SEEN=""
@@ -4240,6 +5333,8 @@ fw_print_allows() {
     if have nft && ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
       echo "表 inet ${NFT_TABLE} 还没加载。下面是按配置应该放行的端口，重载后才生效。"
     fi
+  elif [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+    echo "本机防火墙：没有写入 nftables 默认拒绝。代理端口写在正在运行的 ufw / firewalld 里。"
   else
     echo "本机防火墙：没有由本脚本接管，也没有做默认拒绝。"
     echo "下面是各协议要用的端口。系统防火墙和云安全组需要自己放行。"
@@ -4247,7 +5342,10 @@ fw_print_allows() {
   echo
   printf '  %s  %s  %s\n' "$(ui_pad "协议" 22)" "$(ui_pad "类型" 4)" "端口"
   (( ${REALITY_ENABLED:-0} == 1 )) && fw_allow_row "Reality" tcp "$XRAY_PORT"
-  (( ${XHTTP_ENABLED:-0} == 1 )) && fw_allow_row "XHTTP" tcp "$XHTTP_PORT"
+  if (( ${XHTTP_ENABLED:-0} == 1 )); then
+    if xhttp_shared; then fw_allow_row "XHTTP（共用）" tcp "$XRAY_PORT"
+    else fw_allow_row "XHTTP" tcp "$XHTTP_PORT"; fi
+  fi
   (( ${HY2_ENABLED:-0} == 1 )) && fw_allow_row "Hysteria2" udp "$HY2_PORT"
   (( ${TROJAN_ENABLED:-0} == 1 )) && fw_allow_row "Trojan" tcp "$TROJAN_PORT"
   (( ${TUIC_ENABLED:-0} == 1 )) && fw_allow_row "TUIC" udp "$TUIC_PORT"
@@ -4278,10 +5376,16 @@ fw_print_allows() {
     echo "端口跳跃的 UDP ${HOP_RANGE} 会转到 Hysteria2 的 UDP ${HY2_PORT}。"
   fi
   if [[ ${FW_MODE:-} == allow ]]; then
-    echo "云安全组若有限制，仍要放行上面这些端口。ufw、firewalld 或 Docker 自己的规则也要另行放行。本脚本没有改那些表。"
+    echo "云安全组若有限制，仍要放行上面这些端口。Docker 自己的表没有改。"
+    if ! fw_ufw_active && ! fw_firewalld_active; then
+      echo "本机没有正在运行的 ufw 或 firewalld，不需要再同步端口。"
+    fi
+  elif [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+    echo "云安全组若有限制，仍要放行上面这些端口。"
   elif (( ${FW_ENABLED:-0} == 1 )); then
     echo "云安全组要另外放行上面这些端口。脚本改不到云上的防火墙。"
   fi
+  fw_print_host_sync
   return 0
 }
 
@@ -4291,7 +5395,10 @@ cloud_fw_reminder() {
   if (( NAT_MODE )); then
     printf '%s请确认服务商端口映射%s  地址 %s\n' "$C_WARN" "$C_NONE" "$(server_addr)"
     (( REALITY_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  VLESS-REALITY\n' "$XRAY_EXT_PORT" "$XRAY_PORT"
-    (( XHTTP_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP\n' "$XHTTP_EXT_PORT" "$XHTTP_PORT"
+    if (( XHTTP_ENABLED )); then
+      if xhttp_shared; then printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP（与 Vision 共用）\n' "$XRAY_EXT_PORT" "$XRAY_PORT"
+      else printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP\n' "$XHTTP_EXT_PORT" "$XHTTP_PORT"; fi
+    fi
     (( TROJAN_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  Trojan\n' "$TROJAN_EXT_PORT" "$TROJAN_PORT"
     (( ANYTLS_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  AnyTLS\n' "$ANYTLS_EXT_PORT" "$ANYTLS_PORT"
     if (( HY2_ENABLED )); then
@@ -4340,6 +5447,7 @@ F2B
   fi
 }
 
+# @module src/cert.sh
 # ============================================================
 #          可选：证书（默认 Let's Encrypt 单域名）与订阅 HTTPS
 # ============================================================
@@ -6371,6 +7479,7 @@ print_sub_block() {
   ui_bar '═' "$W" "$paint"
 }
 
+# @module src/cdn.sh
 # ============================================================
 #     可选：VLESS + XHTTP + TLS / VLESS + WebSocket + TLS（CDN）
 # ============================================================
@@ -7355,6 +8464,7 @@ do_vless_enc() {
 }
 
 
+# @module src/link.sh
 # ============================================================
 #                        链接 / 二维码 / 客户端配置
 # ============================================================
@@ -7367,7 +8477,10 @@ server_addr() {
 # 链接中使用的（外部）端口：NAT 模式为服务商映射的外部端口
 pub_xray_port() { if (( NAT_MODE )) && [[ -n $XRAY_EXT_PORT ]]; then printf '%s' "$XRAY_EXT_PORT"; else printf '%s' "$XRAY_PORT"; fi; }
 pub_hy2_port() { if (( NAT_MODE )) && [[ -n $HY2_EXT_PORT ]]; then printf '%s' "$HY2_EXT_PORT"; else printf '%s' "$HY2_PORT"; fi; }
-pub_xhttp_port() { if (( NAT_MODE )) && [[ -n $XHTTP_EXT_PORT ]]; then printf '%s' "$XHTTP_EXT_PORT"; else printf '%s' "$XHTTP_PORT"; fi; }
+pub_xhttp_port() {
+  if xhttp_shared; then pub_xray_port; return; fi
+  if (( NAT_MODE )) && [[ -n $XHTTP_EXT_PORT ]]; then printf '%s' "$XHTTP_EXT_PORT"; else printf '%s' "$XHTTP_PORT"; fi
+}
 pub_trojan_port() { if (( NAT_MODE )) && [[ -n $TROJAN_EXT_PORT ]]; then printf '%s' "$TROJAN_EXT_PORT"; else printf '%s' "$TROJAN_PORT"; fi; }
 pub_tuic_port() { if (( NAT_MODE )) && [[ -n $TUIC_EXT_PORT ]]; then printf '%s' "$TUIC_EXT_PORT"; else printf '%s' "$TUIC_PORT"; fi; }
 pub_anytls_port() { if (( NAT_MODE )) && [[ -n $ANYTLS_EXT_PORT ]]; then printf '%s' "$ANYTLS_EXT_PORT"; else printf '%s' "$ANYTLS_PORT"; fi; }
@@ -7740,6 +8853,7 @@ show_info() {
   ui_bar '═' 62
 }
 
+# @module src/singbox.sh
 # ============================================================
 #                        安装主流程
 # ============================================================
@@ -7911,10 +9025,23 @@ local_pick() { # $1 proto $2 变量 $3 --xx-port $4 名称 $5 允许的进程名
     return 0
   done
 }
+confirm_xhttp_share() {
+  if (( ! XHTTP_ENABLED || ! REALITY_ENABLED )); then XHTTP_ON_443=0; return 0; fi
+  if [[ -n $OPT_XHTTP_ON_443 ]]; then XHTTP_ON_443=$OPT_XHTTP_ON_443; return 0; fi
+  if (( OPT_AUTO )); then return 0; fi
+  local def=n
+  [[ ${XHTTP_ON_443:-0} == 1 ]] && def=y
+  if confirm "XHTTP 与 Vision 共用 TCP ${XRAY_PORT}？（否则 XHTTP 单独监听 ${XHTTP_PORT:-8443}）" "$def"; then
+    XHTTP_ON_443=1
+  else
+    XHTTP_ON_443=0
+  fi
+}
 choose_extra_local() {
   confirm_xhttp
+  confirm_xhttp_share
   local_seed_used
-  if (( XHTTP_ENABLED )); then local_pick tcp XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then local_pick tcp XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}"; fi
   if (( TROJAN_ENABLED )); then local_pick tcp TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" "${TROJAN_PORT:-8444}"; fi
   if (( ANYTLS_ENABLED )); then local_pick tcp ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" "${ANYTLS_PORT:-8445}"; fi
   if (( TUIC_ENABLED )); then local_pick udp TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" "${TUIC_PORT:-8446}"; fi
@@ -7926,10 +9053,36 @@ choose_extra_local() {
   fi
   proto_any_enabled || die "至少需要启用一个协议（Reality / XHTTP / Hysteria2 / Trojan / TUIC / AnyTLS）。"
 }
+nat_usable_count() {
+  local n=0 p
+  while read -r p; do
+    [[ -n $p ]] || continue
+    nat_excluded "$p" && continue
+    n=$(( n + 1 ))
+    (( n > 1 )) && break
+  done < <(nat_all_ext)
+  printf '%s' "$n"
+}
 choose_extra_nat() {
   confirm_xhttp
   nat_seed_used
-  if (( XHTTP_ENABLED )); then nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" || XHTTP_ENABLED=0; fi
+  if (( XHTTP_ENABLED && REALITY_ENABLED )); then
+    if [[ -n $OPT_XHTTP_ON_443 ]]; then XHTTP_ON_443=$OPT_XHTTP_ON_443
+    elif [[ $(nat_usable_count) == 1 ]]; then
+      if (( OPT_AUTO )); then
+        XHTTP_ON_443=1
+        info "只有一个 TCP 映射，XHTTP 与 Vision 共用外部端口 ${XRAY_EXT_PORT}。"
+      elif confirm "只有一个 TCP 映射。让 XHTTP 和 Vision 共用外部端口 ${XRAY_EXT_PORT}？" y; then
+        XHTTP_ON_443=1
+      else
+        XHTTP_ON_443=0
+      fi
+    else
+      confirm_xhttp_share
+    fi
+  fi
+  if xhttp_shared; then XHTTP_EXT_PORT=""; info "XHTTP 链接端口与 Vision 相同：$(pub_xray_port)。"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" || XHTTP_ENABLED=0; fi
   if (( TROJAN_ENABLED )); then nat_pick_mapped tcp TROJAN_EXT_PORT TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" || TROJAN_ENABLED=0; fi
   if (( ANYTLS_ENABLED )); then nat_pick_mapped tcp ANYTLS_EXT_PORT ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" || ANYTLS_ENABLED=0; fi
   if (( TUIC_ENABLED )); then nat_pick_mapped udp TUIC_EXT_PORT TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" || TUIC_ENABLED=0; fi
@@ -7943,7 +9096,7 @@ choose_extra_nat() {
       HOP_RANGE="" HOP_EXT_RANGE="" HOP_BACKEND=""
     fi
   fi
-  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口时放不下 XHTTP，请再加一条映射，或先用 Reality + Hysteria2（--no-xhttp）。"
+  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口、又不共用 443 时放不下 XHTTP，请再加一条映射，或加 --xhttp-on-443。"
 }
 
 ensure_sb_user() {
@@ -8040,21 +9193,30 @@ RC
   fi
 }
 install_singbox() {
+  BIN_UPDATED_SB=0
+  BIN_BAK_SKIP_SB=0
   step "安装 / 更新 sing-box（TUIC v5 / AnyTLS）"
   mktmp
-  local tag ver asset url sum want cur="" bin dg
-  tag=$(gh_latest_tag SagerNet/sing-box)
-  [[ -n $tag ]] || { github_hint; die "获取 sing-box 最新版本号失败。"; }
+  local tag="" ver asset url sum want cur="" bin dg old="" replaced=0
+  old=$(bin_version singbox "$SB_BIN" || true)
+  if [[ -n $OPT_SINGBOX_VER ]]; then
+    tag=$(bin_norm_tag singbox "$OPT_SINGBOX_VER") || die "sing-box 版本号无效: ${OPT_SINGBOX_VER}（例如 v1.11.0）"
+    gh_release_ok SagerNet/sing-box "$tag" || die "找不到 sing-box 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag SagerNet/sing-box)
+    [[ -n $tag ]] || { github_hint; die "获取 sing-box 最新版本号失败。"; }
+  fi
   ver=${tag#v}
-  [[ -x $SB_BIN ]] && cur=$("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')
-  if [[ $cur == "$ver" ]]; then
-    ok "sing-box 已是最新版本 ${ver}，跳过下载。"
+  cur=$old
+  if [[ -n $cur && $cur == "$ver" ]]; then
+    if [[ -n $OPT_SINGBOX_VER ]]; then ok "sing-box 已是指定版本 ${ver}，跳过下载。"
+    else ok "sing-box 已是最新版本 ${ver}，跳过下载。"; fi
   else
     asset=$(sb_asset_name "$ver")
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
     info "下载 ${asset} ..."
     fetch -o "${TMP_DIR}/${asset}" "$url" || { github_hint; die "下载 sing-box 失败。"; }
-    want=$(curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
+    want=$(gh_curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
       "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${tag}" 2>/dev/null \
       | jq -r --arg n "$asset" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null) || want=""
     want=${want#sha256:}
@@ -8070,12 +9232,19 @@ install_singbox() {
     bin=$(find "$dg" -type f -name sing-box | head -n1)
     [[ -n $bin ]] || die "压缩包中没有 sing-box 可执行文件。"
     chmod 755 "$bin"
-    "$bin" version >/dev/null 2>&1 || die "下载的 sing-box 无法运行（架构或 musl/glibc 不匹配？当前 ${ARCH} / ${OS_ID:-未知}）。"
+    # 先在临时路径校验，通过后才备份并替换正在使用的程序
+    if ! sb_check_bin "$bin"; then
+      rm -rf "$dg"
+      die "下载的 sing-box 未通过校验，未替换现有程序。"
+    fi
+    if [[ $cur != "$ver" ]]; then bin_backup "$SB_BIN" singbox; fi
     install -m 755 "$bin" "${SB_BIN}.new" && mv -f "${SB_BIN}.new" "$SB_BIN"
+    rm -rf "$dg"
+    replaced=1
   fi
   ensure_sb_user
   write_singbox_service
-  ok "sing-box 已安装: $("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')"
+  if (( replaced )); then bin_finish_install singbox "$SB_BIN" "sing-box" "$old"; fi
 }
 sb_copy_cert() {
   mkdir -p "$HY_DIR" "$SB_DIR"
@@ -8155,13 +9324,19 @@ restart_singbox() {
   sleep 1
   if ! svc_active sing-box; then
     svc_logs sing-box 20 >&2 || true
+    local rc=0
+    bin_restart_failed singbox "$SB_BIN" sing-box "sing-box" || rc=$?
+    if (( rc == 0 )); then die "sing-box 更新后没有跑起来，已恢复备份。"
+    elif (( rc == 2 )); then die "sing-box 更新后没有跑起来，恢复备份后仍未运行。"
+    fi
     die "sing-box 启动失败，请查看上方日志。"
   fi
+  BIN_UPDATED_SB=0
   ok "sing-box 运行中 ($( ((TUIC_ENABLED)) && echo -n "TUIC UDP $([[ -n $TUIC_EXT_PORT && $NAT_MODE == 1 ]] && echo "$TUIC_EXT_PORT" || echo "$TUIC_PORT")")$( ((TUIC_ENABLED && ANYTLS_ENABLED)) && echo -n " / ")$( ((ANYTLS_ENABLED)) && echo -n "AnyTLS TCP $([[ -n $ANYTLS_EXT_PORT && $NAT_MODE == 1 ]] && echo "$ANYTLS_EXT_PORT" || echo "$ANYTLS_PORT")"))"
 }
 remove_singbox() {
   svc_disable_stop sing-box
-  rm -f "$SB_UNIT" "$SB_RC" "$SB_BIN"
+  rm -f "$SB_UNIT" "$SB_RC" "$SB_BIN" "${SB_BIN}.bak" "${SB_BIN}.prebak"
   rm -rf "$SB_DIR" /etc/systemd/system/sing-box.service.d /var/log/sing-box
   if id sing-box >/dev/null 2>&1; then userdel sing-box >/dev/null 2>&1 || deluser sing-box >/dev/null 2>&1 || true; fi
   if getent group sing-box >/dev/null 2>&1; then groupdel sing-box >/dev/null 2>&1 || delgroup sing-box >/dev/null 2>&1 || true; fi
@@ -8256,6 +9431,7 @@ choose_ports() {
   choose_extra_local
 }
 
+# @module src/nat.sh
 # ============================================================
 #            NAT 模式：公网地址 / 映射端口
 # ============================================================
@@ -8817,6 +9993,16 @@ do_install() {
   save_state
 
   local pqrc=0 redo=n
+  if (( IMPORT_MODE )) && [[ -n $SNI && -z $OPT_SNI ]]; then
+    local sni_res=""
+    sni_res=$(sni_probe "$SNI") || true
+    if [[ $sni_res == FAIL* ]]; then
+      warn "导入的 SNI ${SNI} 现在不可用（${sni_res##*|}）。将重新优选。"
+      SNI=""
+    else
+      info "导入的 SNI ${SNI} 仍然可用。"
+    fi
+  fi
   [[ -n $SNI && -z $OPT_SNI ]] && { sni_pq_check "$SNI" || pqrc=$?; }
   if (( pqrc == 1 )); then
     # 不支持 MLKEM 只是偏好问题：给出警告，交互模式默认建议重新优选，自动模式保留原 SNI
@@ -8883,6 +10069,7 @@ do_install() {
   ui_bar '═' 62
 }
 
+# @module src/selftest.sh
 # ============================================================
 #               REALITY 自检（安装 / 更换 SNI 后）
 # ============================================================
@@ -8890,6 +10077,7 @@ do_install() {
 # （VLESS + Vision + REALITY + pqv）连接本机 127.0.0.1:XRAY_PORT，再经它访问外网。
 # 只打印结果，不影响安装；客户端限制 GOMEMLIMIT，128MB 小鸡也可运行。
 reality_selftest() {
+  REALITY_SELFTEST=skip
   (( ${REALITY_ENABLED:-1} )) || return 0
   [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XRAY_PORT ]] || { warn "跳过 REALITY 自检（缺少 xray 或参数）。"; return 0; }
   mktmp
@@ -8937,6 +10125,7 @@ reality_selftest() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   if (( rc == 0 )); then
+    REALITY_SELFTEST=ok
     local h=${ok_url#https://}; h=${h%%/*}
     ok "REALITY 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
     if relay_active; then
@@ -8944,6 +10133,7 @@ reality_selftest() {
       else warn "经落地转发查询出口 IP 失败。"; fi
     fi
   else
+    REALITY_SELFTEST=fail
     local direct=""
     direct=$(curl -s -o /dev/null --connect-timeout 8 -m 12 -w '%{http_code}' "https://www.gstatic.com/generate_204" 2>/dev/null) || true
     if [[ ! $direct =~ ^[23][0-9][0-9]$ ]]; then
@@ -8959,17 +10149,21 @@ reality_selftest() {
 }
 
 xhttp_selftest() {
+  XHTTP_SELFTEST=skip
   (( ${XHTTP_ENABLED:-0} )) || return 0
-  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PORT && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
+  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
+  local dest=${XHTTP_PORT:-}
+  xhttp_shared && dest=$XRAY_PORT
+  [[ -n $dest ]] || { warn "跳过 XHTTP 自检（缺少端口）。"; return 0; }
   mktmp
   local dir port="" i pid code="" url ok_url="" rc=1
   dir=$(mktemp -d "${TMP_DIR}/xhttp-self.XXXXXX") || { warn "跳过 XHTTP 自检（无法创建临时目录）。"; return 0; }
   for i in 1 2 3 4 5 6 7 8 9 10; do
     port=$(( 20000 + RANDOM % 40000 ))
-    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "${HY2_PORT:-}" ]] && continue
+    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "$dest" || $port == "${HY2_PORT:-}" ]] && continue
     port_in_use tcp "$port" || break
   done
-  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$XHTTP_PORT" --arg sni "$SNI" \
+  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$dest" --arg sni "$SNI" \
       --arg pbk "$PUB_KEY" --arg sid "$SHORT_ID" --arg path "$XHTTP_PATH" \
       --arg pqv "$(pqv_active && printf '%s' "$MLDSA_VERIFY")" '
     {
@@ -8987,7 +10181,11 @@ xhttp_selftest() {
     rm -rf "$dir"; warn "跳过 XHTTP 自检（生成临时配置失败）。"; return 0
   fi
   chmod 600 "${dir}/client.json"
-  info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${XHTTP_PORT}（mode stream-one，SNI ${SNI}）..."
+  if xhttp_shared; then
+    info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${dest}（与 Vision 共用，mode stream-one，SNI ${SNI}）..."
+  else
+    info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${dest}（mode stream-one，SNI ${SNI}）..."
+  fi
   env GOMEMLIMIT=24MiB GOGC=50 "$XRAY_BIN" run -config "${dir}/client.json" >"${dir}/client.log" 2>&1 &
   pid=$!
   for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -9004,9 +10202,11 @@ xhttp_selftest() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   if (( rc == 0 )); then
+    XHTTP_SELFTEST=ok
     local h=${ok_url#https://}; h=${h%%/*}
     ok "XHTTP 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
   else
+    XHTTP_SELFTEST=fail
     warn "XHTTP 自检未通过。可查看 proxy status；客户端链接里的 mode 必须是 stream-one，path 必须与服务端一致。"
     grep -vi 'privatekey\|seed' "${dir}/client.log" 2>/dev/null | tail -n 3 | sed 's/^/    /' || true
   fi
@@ -9014,6 +10214,7 @@ xhttp_selftest() {
   return 0
 }
 
+# @module src/land.sh
 # ============================================================
 #       落地机（Shadowsocks 2022 出口）/ 中转机的落地转发
 # ============================================================
@@ -9482,10 +10683,11 @@ do_install_land() {
   [[ -x $HY_BIN || -f $HY_UNIT || -f $HY_RC ]] && { info "移除 Hysteria2 ..."; remove_hysteria purge; }
   [[ -x $SB_BIN || -f $SB_UNIT || -f $SB_RC ]] && { info "移除 sing-box（TUIC / AnyTLS）..."; remove_singbox; }
   remove_nat_hop
-  if [[ -f $FW_FILE || -f $FW_UNIT ]]; then info "移除节点模式的 nftables 规则 ..."; remove_firewall; fi
+  if [[ -f $FW_FILE || -f $FW_UNIT || -s ${FW_HOST_FILE:-} ]]; then info "移除节点模式的 nftables 规则 ..."; remove_firewall; fi
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; fi
   FW_ENABLED=0
   FW_MODE=off
+  FW_HOST_SYNC=0
 
   install_xray
   INSTALLED=1
@@ -10458,6 +11660,7 @@ do_land_cli() {
   esac
 }
 
+# @module src/menu.sh
 # ============================================================
 #                        管理功能
 # ============================================================
@@ -10518,38 +11721,42 @@ menu_change_ports() {
   if (( LAND_MODE )); then land_menu_port; return; fi
   nat_pref_guard || return 0
   if (( NAT_MODE )); then menu_change_ports_nat; return; fi
-  local oldx=$XRAY_PORT oldh=$HY2_PORT
+  local oldx=$XRAY_PORT oldh=$HY2_PORT oldxh=${XHTTP_PORT:-}
   choose_ports_interactive
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
   if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
   if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
-  ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}$( ((HY2_ENABLED)) && echo "，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}")"
+  local extra=""
+  if (( HY2_ENABLED )); then extra+="，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then extra+="，XHTTP TCP ${oldxh} -> ${XHTTP_PORT}"; fi
+  ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}${extra}"
   cloud_fw_reminder
 }
 menu_change_ports_nat() {
-  local oldx=$XRAY_EXT_PORT oldh=$HY2_EXT_PORT
+  local oldx=$XRAY_EXT_PORT oldh=$HY2_EXT_PORT oldxh=${XHTTP_EXT_PORT:-}
   detect_os; detect_virt
-  local s1=$OPT_PORT s2=$OPT_HY2_PORT s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
-  OPT_PORT="" OPT_HY2_PORT="" OPT_NAT_EXT="" OPT_NAT_ADDR=""
+  local s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
+  # 保留 --port / --hy2-port / --xhttp-port，命令行可以直接改。映射列表仍按已保存的重新确认。
+  OPT_NAT_EXT="" OPT_NAT_ADDR=""
   choose_nat_addr
   choose_nat_ports
-  OPT_PORT=$s1 OPT_HY2_PORT=$s2 OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
+  OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
   if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
   if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
-  ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}$( ((HY2_ENABLED)) && echo "，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}")"
+  local extra=""
+  if (( HY2_ENABLED )); then extra+="，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then extra+="，XHTTP 外部端口 ${oldxh:-无} -> ${XHTTP_EXT_PORT}"; fi
+  ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}${extra}"
   cloud_fw_reminder
 }
 choose_ports_interactive() {
-  # 修改端口时允许当前服务占用自身端口
-  local save_opt=$OPT_PORT save_h=$OPT_HY2_PORT
-  OPT_PORT="" OPT_HY2_PORT=""
+  # 保留 --port / --hy2-port / --xhttp-port。没写的那些会在 choose_ports 里询问。
   choose_ports
-  OPT_PORT=$save_opt OPT_HY2_PORT=$save_h
 }
 
 menu_users() {
@@ -10631,9 +11838,20 @@ menu_users() {
 }
 
 menu_update() {
+  if [[ -n ${OPT_ROLLBACK:-} ]]; then
+    [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]] && die "回滚和指定版本不能一起用。"
+    do_rollback "$OPT_ROLLBACK"
+    return 0
+  fi
   need_installed
+  if [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]]; then
+    do_pinned_update
+    return 0
+  fi
   preflight
-  echo "  1) 更新 Xray-core   2) 更新 Hysteria2   3) 更新本脚本   4) 全部更新   0) 返回"
+  echo "  1) 更新 Xray-core    2) 更新 Hysteria2    3) 更新本脚本"
+  echo "  4) 全部更新（含 sing-box）    5) 回滚到备份    0) 返回"
+  echo "  指定版本: proxy update --xray-ver <版本>  --hy2-ver <版本>  --singbox-ver <版本>"
   local c; ask c "请选择" "4"
   case $c in
     1) install_xray; if xray_inbound_needed; then write_xray_config; restart_xray; else info "当前没有 Xray 入站，已跳过。"; fi ;;
@@ -10644,8 +11862,43 @@ menu_update() {
        if (( HY2_ENABLED )); then install_hysteria; write_hy2_config; restart_hy2; fi
        if sb_needed; then install_singbox; write_singbox_config; restart_singbox; fi
        update_script ;;
+    5) echo "  1) Xray    2) Hysteria2    3) sing-box    4) 全部    0) 返回"
+       local w; ask w "回滚哪一个" "0"
+       case $w in
+         1) do_rollback xray ;;
+         2) do_rollback hy2 ;;
+         3) do_rollback singbox ;;
+         4) do_rollback all ;;
+         *) return 0 ;;
+       esac ;;
     *) return 0 ;;
   esac
+}
+do_pinned_update() { # proxy update --xray-ver / --hy2-ver / --singbox-ver，不进菜单
+  need_installed
+  preflight
+  local did=0
+  if [[ -n ${OPT_XRAY_VER:-} ]]; then
+    install_xray
+    if xray_inbound_needed; then write_xray_config; restart_xray
+    else info "当前没有 Xray 入站，已跳过重启。"; fi
+    did=1
+  fi
+  if [[ -n ${OPT_HY2_VER:-} ]]; then
+    (( HY2_ENABLED )) || die "未启用 Hysteria2，不能用 --hy2-ver 更新。请先打开 Hysteria2。"
+    install_hysteria
+    write_hy2_config
+    restart_hy2
+    did=1
+  fi
+  if [[ -n ${OPT_SINGBOX_VER:-} ]]; then
+    sb_needed || die "未启用 TUIC / AnyTLS，不能用 --singbox-ver 更新。请先打开其中一项。"
+    install_singbox
+    write_singbox_config
+    restart_singbox
+    did=1
+  fi
+  (( did )) || die "没有要更新的组件。"
 }
 
 update_script() {
@@ -10694,7 +11947,7 @@ menu_status() {
     echo
     printf '%s已装协议%s\n' "$C_TITLE" "$C_NONE"
     ui_proto_line "$REALITY_ENABLED" "VLESS + REALITY + Vision" "TCP $(pub_xray_port)"
-    ui_proto_line "$XHTTP_ENABLED" "VLESS + XHTTP + REALITY" "TCP $(pub_xhttp_port)"
+    ui_proto_line "$XHTTP_ENABLED" "VLESS + XHTTP + REALITY" "TCP $(pub_xhttp_port)$(xhttp_shared && echo '（与 Vision 共用）')"
     ui_proto_line "$HY2_ENABLED" "Hysteria2" "UDP $(pub_hy2_port)"
     hr
     printf '%s可选协议%s\n' "$C_TITLE" "$C_NONE"
@@ -10911,6 +12164,12 @@ menu_firewall() {
   esac
   if [[ ${FW_MODE:-off} == off || ${FW_ENABLED:-0} == 0 ]]; then
     save_state
+    if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
+      fw_host_sync
+      save_state
+      fw_print_allows
+      return 0
+    fi
     warn "防火墙是关闭的，改动已记下，但还没写入 nftables。要生效请选严格或只放行。"
     return 0
   fi
@@ -10936,7 +12195,7 @@ do_uninstall() {
   if have systemctl; then systemctl disable --now 'xray@*' >/dev/null 2>&1 || true; fi
   rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service "$XRAY_RC"
   rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
-  rm -f "$XRAY_BIN"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+  rm -f "$XRAY_BIN" "${XRAY_BIN}.bak" "${XRAY_BIN}.prebak"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
   sd_reload
   ok "Xray 已移除"
   remove_hysteria purge; ok "Hysteria2 已移除"
@@ -10957,9 +12216,12 @@ do_uninstall() {
   local fw
   for fw in $DISABLED_FW; do
     if confirm "安装时停用了 ${fw}，是否重新启用？" y; then
-      systemctl enable --now "$fw" >/dev/null 2>&1 || true
-      [[ $fw == ufw ]] && { ufw --force enable >/dev/null 2>&1 || true; }
-      ok "已重新启用 ${fw}"
+      if [[ $fw == ufw ]]; then
+        if fw_ufw_enable_kept; then ok "已重新启用 ${fw}"; fi
+      else
+        systemctl enable --now "$fw" >/dev/null 2>&1 || true
+        ok "已重新启用 ${fw}"
+      fi
     fi
   done
   (( SWAP_CREATED )) && info "安装时创建的 /swapfile 已保留（如需删除: swapoff /swapfile && rm /swapfile 并编辑 /etc/fstab）。"
@@ -10971,6 +12233,7 @@ do_uninstall() {
   ok "卸载完成。别忘了在云服务商控制台关闭不再需要的端口。"
 }
 
+# @module src/route.sh
 # ============================================================
 # 回程线路检测（proxy route）
 # 只读：不改代理配置，不重启服务，不测流媒体。
@@ -11485,6 +12748,558 @@ do_route() {
   fi
   return 0
 }
+# @module src/export.sh
+# ============================================================
+#                 导出 / 导入（换机器时带走密钥）
+# ============================================================
+# 导出的是重建同一批节点需要的密钥和证书。公网地址、网卡、NAT 映射、
+# 虚拟化类型和内存档位不放进去，导入时在新机器上重新检测。
+export_host_key() {
+  case $1 in
+    SERVER_ADDR|PUBLIC_IP4|PUBLIC_IP6|NAT_PORTS|NAT_EXCLUDE|XRAY_EXT_PORT|HY2_EXT_PORT|HOP_EXT_RANGE|HOP_BACKEND|\
+    XHTTP_EXT_PORT|TROJAN_EXT_PORT|TUIC_EXT_PORT|ANYTLS_EXT_PORT|VIRT|SSH_PORTS|FW_HOST_SYNC|DISABLED_FW|\
+    SWAP_CREATED|DNS64_SET) return 0 ;;
+  esac
+  return 1
+}
+export_stage_state() {
+  local dest=$1 k v
+  : >"$dest"
+  chmod 600 "$dest"
+  for k in "${STATE_KEYS[@]}"; do
+    v=${!k-}
+    if export_host_key "$k"; then v=""
+    elif [[ $k == NAT_MODE ]]; then v=0
+    elif [[ $k == NAT_PREF ]]; then v=auto
+    elif [[ $k == INSTALLED ]]; then v=0
+    fi
+    [[ $v == *$'\n'* || $v == *"'"* ]] && die "内部错误: 状态值 $k 含非法字符"
+    printf "%s='%s'\n" "$k" "$v" >>"$dest"
+  done
+}
+export_put() { # $1 源文件 $2 包内相对路径
+  [[ -s $1 ]] || return 0
+  local dest="${EXPORT_STAGE}/$2"
+  mkdir -p "$(dirname "$dest")"
+  install -m 600 "$1" "$dest"
+}
+export_have_tty() { # /dev/tty 打得开、并且真是终端
+  local fd
+  [[ -r /dev/tty && -w /dev/tty ]] || return 1
+  # 打开失败时 bash 会写「/dev/tty: No such device or address」。
+  # 重定向从左到右生效，所以不能写成 exec {fd}</dev/tty 2>/dev/null。
+  { exec {fd}</dev/tty; } 2>/dev/null || return 1
+  if [[ -t $fd ]]; then
+    exec {fd}<&-
+    return 0
+  fi
+  exec {fd}<&-
+  return 1
+}
+export_read_pass() { # $1 变量名 $2 提示。优先用环境变量，不回显。
+  local __p=""
+  if [[ -n ${PROXY_EXPORT_PASS:-} ]]; then
+    printf -v "$1" '%s' "$PROXY_EXPORT_PASS"
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    read -r -s -p "$2" __p || true
+    echo
+  elif export_have_tty; then
+    if ! read -r -s -p "$2" __p </dev/tty; then
+      die "需要密码。请设置环境变量 PROXY_EXPORT_PASS。"
+    fi
+    echo
+  else
+    die "需要密码。请设置环境变量 PROXY_EXPORT_PASS。"
+  fi
+  [[ -n $__p ]] || die "密码不能为空。"
+  printf -v "$1" '%s' "$__p"
+}
+export_is_enc() {
+  local magic
+  magic=$(head -c 8 "$1" 2>/dev/null || true)
+  [[ $magic == "Salted__" ]]
+}
+export_default_path() {
+  local host
+  host=$(hostname -s 2>/dev/null || true)
+  host=$(tr -cd 'A-Za-z0-9_.-' <<<"$host")
+  [[ -n $host ]] || host=host
+  local p
+  p="/root/proxy-export-${host}-$(date +%Y%m%d).tar.gz"
+  if (( OPT_EXPORT_ENC )); then p="${p}.enc"; fi
+  if [[ -e $p ]]; then
+    p="/root/proxy-export-${host}-$(date +%Y%m%d-%H%M%S).tar.gz"
+    if (( OPT_EXPORT_ENC )); then p="${p}.enc"; fi
+  fi
+  printf '%s' "$p"
+}
+do_export() {
+  load_state
+  (( INSTALLED )) || die "还没有安装，不能导出。"
+  require_root
+  mktmp
+  local stage="${TMP_DIR}/export" tar="${TMP_DIR}/export.tar.gz" out pass
+  mkdir -p "$stage"
+  chmod 700 "$stage"
+  EXPORT_STAGE=$stage
+  export_stage_state "${stage}/state.env"
+  export_put "$USERS_FILE" "users.txt"
+  export_put "$HY_CRT" "hysteria/server.crt"
+  export_put "$HY_KEY" "hysteria/server.key"
+  export_put "$SB_CRT" "singbox/server.crt"
+  export_put "$SB_KEY" "singbox/server.key"
+  export_put "$CERT_FULLCHAIN" "certs/fullchain.pem"
+  export_put "$CERT_PRIVKEY" "certs/privkey.pem"
+  export_put "$CERT_DNS_TOKEN" "certs/cf-dns.token"
+  export_put "$CERT_ZEROSSL_EAB" "certs/zerossl.eab"
+  export_put "$CERT_ORIGIN_KEY" "certs/cf-origin.key"
+  if [[ -s $TUNE_CUR ]]; then
+    mkdir -p "${stage}/tune"
+    grep -Ev '^(IFACE|TIME)=' "$TUNE_CUR" >"${stage}/tune/current.env" || true
+    chmod 600 "${stage}/tune/current.env"
+  fi
+  tar -C "$stage" -czf "$tar" .
+  out=${OPT_EXPORT_PATH:-$(export_default_path)}
+  mkdir -p "$(dirname "$out")"
+  if (( OPT_EXPORT_ENC )); then
+    export_read_pass pass "导出密码（不会回显）: "
+    PROXY_EXPORT_PASS=$pass
+    export PROXY_EXPORT_PASS
+    openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:PROXY_EXPORT_PASS -in "$tar" -out "$out" \
+      || die "加密失败。"
+  else
+    install -m 600 "$tar" "$out"
+  fi
+  chmod 600 "$out"
+  ok "已导出到 ${out}（权限 600）。"
+  info "包里有 UUID、Reality 私钥、ShortId、ML-DSA 种子、SNI、端口、XHTTP 路径、各协议密码、落地 / 中转配置、调优参数和证书。"
+  info "没有放公网 IP、网卡、NAT 映射和虚拟化类型。导入时会在新机器上重新检测。"
+  if (( OPT_EXPORT_ENC )); then
+    info "文件已用 AES-256-CBC 加密。导入时会询问密码，或读取环境变量 PROXY_EXPORT_PASS。"
+  fi
+  return 0
+}
+export_restore_file() { # $1 包内路径 $2 目标
+  [[ -s $1 ]] || return 0
+  mkdir -p "$(dirname "$2")"
+  install -m 600 "$1" "$2"
+}
+do_import() {
+  local file=${OPT_IMPORT:-}
+  [[ -n $file && -f $file ]] || die "找不到要导入的文件: ${file:-（未指定）}"
+  require_root
+  load_state
+  if (( INSTALLED )) && (( ! OPT_AUTO )); then
+    confirm "本机已有安装。导入会改用文件里的密钥并重新安装。继续？" n || return 0
+  fi
+  mktmp
+  local tar="$file" work="${TMP_DIR}/import" pass
+  mkdir -p "$work"
+  if export_is_enc "$file"; then
+    export_read_pass pass "导入密码（不会回显）: "
+    PROXY_EXPORT_PASS=$pass
+    export PROXY_EXPORT_PASS
+    tar="${TMP_DIR}/import.tar.gz"
+    openssl enc -d -aes-256-cbc -pbkdf2 -pass env:PROXY_EXPORT_PASS -in "$file" -out "$tar" \
+      || die "解密失败。请核对密码。"
+  fi
+  tar -tzf "$tar" >/dev/null 2>&1 || die "不是有效的导出文件。"
+  tar -xzf "$tar" -C "$work"
+  [[ -s ${work}/state.env ]] || die "导出文件里没有 state.env。"
+  mkdir -p "$STATE_DIR" "$HY_DIR" "$SB_DIR" "$CERT_DIR" "$TUNE_DIR"
+  chmod 700 "$STATE_DIR"
+  install -m 600 "${work}/state.env" "$STATE_FILE"
+  export_restore_file "${work}/users.txt" "$USERS_FILE"
+  export_restore_file "${work}/hysteria/server.crt" "$HY_CRT"
+  export_restore_file "${work}/hysteria/server.key" "$HY_KEY"
+  export_restore_file "${work}/singbox/server.crt" "$SB_CRT"
+  export_restore_file "${work}/singbox/server.key" "$SB_KEY"
+  export_restore_file "${work}/certs/fullchain.pem" "$CERT_FULLCHAIN"
+  export_restore_file "${work}/certs/privkey.pem" "$CERT_PRIVKEY"
+  export_restore_file "${work}/certs/cf-dns.token" "$CERT_DNS_TOKEN"
+  export_restore_file "${work}/certs/zerossl.eab" "$CERT_ZEROSSL_EAB"
+  export_restore_file "${work}/certs/cf-origin.key" "$CERT_ORIGIN_KEY"
+  if [[ -s ${work}/tune/current.env && -z $OPT_TUNE_PRESET ]]; then
+    install -m 600 "${work}/tune/current.env" "$TUNE_CUR"
+    local preset buf cc qd
+    preset=$(sed -n 's/^PRESET=//p' "$TUNE_CUR" | head -n1)
+    buf=$(sed -n 's/^BUFFER=//p' "$TUNE_CUR" | head -n1)
+    cc=$(sed -n 's/^CC=//p' "$TUNE_CUR" | head -n1)
+    qd=$(sed -n 's/^QDISC=//p' "$TUNE_CUR" | head -n1)
+    [[ -n $preset ]] && OPT_TUNE_PRESET=$preset
+    [[ -n $buf ]] && OPT_TUNE_BUF=$buf
+    [[ -n $cc && $cc != keep && -z $OPT_TUNE_CC ]] && OPT_TUNE_CC=$cc
+    [[ -n $qd && $qd != keep && -z $OPT_TUNE_QDISC ]] && OPT_TUNE_QDISC=$qd
+  fi
+  if [[ -s $CERT_FULLCHAIN ]]; then
+    if ! openssl x509 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+      warn "导入的公开证书无法读取，安装时会重新申请。"
+      rm -f "$CERT_FULLCHAIN" "$CERT_PRIVKEY"
+    elif ! openssl x509 -checkend 0 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+      warn "导入的公开证书已经过期，安装时会重新申请。"
+      rm -f "$CERT_FULLCHAIN" "$CERT_PRIVKEY"
+    else
+      info "导入的公开证书可以读取，到期 $(openssl x509 -enddate -noout -in "$CERT_FULLCHAIN" | cut -d= -f2)。"
+    fi
+  fi
+  info "已读入密钥。接下来重新检测 IP、NAT、SNI 和防火墙，并按原端口和协议装回去。"
+  IMPORT_MODE=1
+  do_install
+}
+menu_export() {
+  need_installed
+  local p
+  ask p "导出文件路径（直接回车用默认路径）" ""
+  OPT_EXPORT_PATH=$p
+  if confirm "用密码加密这个文件？" n; then OPT_EXPORT_ENC=1; else OPT_EXPORT_ENC=0; fi
+  do_export
+}
+menu_import() {
+  local p
+  ask p "导入文件路径" ""
+  [[ -n $p ]] || { warn "没有填写路径。"; return 0; }
+  OPT_IMPORT=$p
+  confirm "导入会用文件里的密钥重新安装，并重新检测 IP、NAT 和防火墙。继续？" y || return 0
+  do_import
+}
+# @module src/doctor.sh
+# ============================================================
+#                    proxy doctor 健康检查
+# ============================================================
+# 不加 --fix 时只读。--fix 只做这几件：拉起已停止的服务、步进对时、
+# 按清单重写 ufw/firewalld、把 state.env 改为 600。
+DOCTOR_FIX=0
+DOCTOR_FAIL=0
+DOCTOR_FIXED=""
+doc_line() { printf '  %-6s %s\n' "$1" "$2"; }
+doc_ok() { doc_line OK "$*"; }
+doc_warn() { doc_line WARN "$*"; }
+doc_fail() { doc_line FAIL "$*"; DOCTOR_FAIL=1; }
+doc_info() { doc_line INFO "$*"; }
+doc_fixed() { DOCTOR_FIXED+="${DOCTOR_FIXED:+$'\n'}$*"; }
+doctor_fix_time() {
+  if have chronyc && chronyc makestep >/dev/null 2>&1; then
+    doc_ok "已执行 chronyc makestep。"
+    doc_fixed "已步进对时（chronyc makestep）"
+    return 0
+  fi
+  if [[ $INIT_SYS == systemd ]] && systemctl cat systemd-timesyncd >/dev/null 2>&1; then
+    if systemctl restart systemd-timesyncd >/dev/null 2>&1; then
+      doc_ok "已重启 systemd-timesyncd。"
+      doc_fixed "已重启 systemd-timesyncd"
+      return 0
+    fi
+  fi
+  if is_openrc && [[ -x /etc/init.d/chronyd ]]; then
+    if rc-service chronyd restart >/dev/null 2>&1 9>&-; then
+      doc_ok "已重启 OpenRC chronyd。"
+      doc_fixed "已重启 OpenRC chronyd"
+      return 0
+    fi
+  fi
+  doc_warn "没有可用的对时命令（chronyc / timesyncd / chronyd）。"
+}
+doctor_clock() {
+  local body="" ts="" now off
+  body=$(curl -fsS --connect-timeout 5 -m 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || body=""
+  [[ $body == *ts=* ]] || body=$(curl -fsS --connect-timeout 5 -m 8 https://1.1.1.1/cdn-cgi/trace 2>/dev/null) || body=""
+  ts=$(sed -n 's/^ts=\([0-9][0-9]*\).*/\1/p' <<<"$body" | head -n1)
+  if [[ -z $ts ]]; then
+    doc_warn "对不上时间：Cloudflare trace 不可达，已跳过。"
+    return 0
+  fi
+  now=$(date +%s)
+  off=$(( now - ts ))
+  (( off < 0 )) && off=$(( -off ))
+  if (( off > 15 )); then
+    doc_warn "本机时间与 Cloudflare 相差 ${off} 秒（超过 15 秒）。REALITY 可能握手失败。"
+    if (( DOCTOR_FIX )); then doctor_fix_time; else echo "        可执行: proxy doctor --fix"; fi
+  else
+    doc_ok "时间偏差 ${off} 秒。"
+  fi
+}
+doctor_crash_scan() {
+  local svc=$1 hits="" log
+  if have journalctl; then
+    hits=$(journalctl -u "$svc" --since "24 hours ago" -n 300 --no-pager 2>/dev/null | grep -Ei 'out of memory|oom-kill|segfault|panic' | tail -n 3) || true
+  fi
+  log=$(svc_log_file "$svc" 2>/dev/null || true)
+  if [[ -n $log && -f $log ]]; then
+    hits+=$'\n'$(grep -Ei 'out of memory|oom-kill|segfault|panic' "$log" 2>/dev/null | tail -n 3 || true)
+  fi
+  hits=$(printf '%s\n' "$hits" | sed '/^$/d')
+  if [[ -n $hits ]]; then
+    doc_warn "${svc} 最近日志里有崩溃或内存不足记录。"
+    printf '%s\n' "$hits" | sed 's/^/        /'
+  fi
+}
+doctor_one_svc() { # $1 服务名 $2 是否必须（1/0）
+  local svc=$1 must=$2
+  if ! svc_exists "$svc"; then
+    if (( must )); then doc_fail "没有 ${svc} 服务。"; else return 0; fi
+    return 0
+  fi
+  if svc_active "$svc"; then
+    doc_ok "${svc} 正在运行。"
+  else
+    doc_fail "${svc} 没有在运行（$(svc_state "$svc")）。"
+    if (( DOCTOR_FIX )); then
+      if svc_restart "$svc" && sleep 1 && svc_active "$svc"; then
+        doc_ok "已重新拉起 ${svc}。"
+        doc_fixed "已重新拉起 ${svc}"
+      else doc_fail "重新拉起 ${svc} 失败。可查看: proxy status"; fi
+    else
+      echo "        可执行: proxy doctor --fix"
+    fi
+  fi
+  doctor_crash_scan "$svc"
+}
+doctor_port() { # $1 tcp|udp $2 port $3 名称
+  local proto=$1 port=$2 name=$3
+  [[ -n $port && $port != 0 ]] || return 0
+  if port_in_use "$proto" "$port"; then doc_ok "${name} 正在监听 ${proto^^}/${port}。"
+  else doc_fail "${name} 没有监听 ${proto^^}/${port}。可查看: proxy status"; fi
+}
+doctor_services() {
+  local need_x=0
+  if declare -F xray_inbound_needed >/dev/null && xray_inbound_needed; then need_x=1; fi
+  (( LAND_MODE )) && need_x=1
+  doctor_one_svc xray "$need_x"
+  if (( need_x )); then doctor_port tcp "$XRAY_PORT" "Xray"; fi
+  if (( HY2_ENABLED )); then
+    doctor_one_svc hysteria-server 1
+    doctor_port udp "$HY2_PORT" "Hysteria2"
+  fi
+  if sb_needed; then
+    doctor_one_svc sing-box 1
+    (( TUIC_ENABLED )) && doctor_port udp "$TUIC_PORT" "TUIC"
+    (( ANYTLS_ENABLED )) && doctor_port tcp "$ANYTLS_PORT" "AnyTLS"
+  fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then doctor_port tcp "$XHTTP_PORT" "XHTTP"; fi
+  if [[ -f $STATE_FILE ]]; then
+    local mode
+    mode=$(stat -c %a "$STATE_FILE" 2>/dev/null || true)
+    if [[ $mode == 600 ]]; then doc_ok "state.env 权限是 600。"
+    elif [[ -n $mode ]]; then
+      doc_warn "state.env 权限是 ${mode}，应为 600。"
+      if (( DOCTOR_FIX )); then
+        if chmod 600 "$STATE_FILE"; then
+          doc_ok "已把 state.env 改为 600。"
+          doc_fixed "已把 state.env 改为 600"
+        fi
+      fi
+    fi
+  fi
+}
+doctor_fw_ports_present() {
+  local text=$1 miss=0 p
+  if (( REALITY_ENABLED )); then
+    grep -Eq "dport .*${XRAY_PORT}([^0-9]|$)" <<<"$text" || miss=1
+  fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then
+    grep -Eq "dport .*${XHTTP_PORT}([^0-9]|$)" <<<"$text" || miss=1
+  fi
+  if (( HY2_ENABLED )); then
+    grep -Eq "dport .*${HY2_PORT}([^0-9]|$)" <<<"$text" || miss=1
+  fi
+  (( miss )) && return 1
+  return 0
+}
+doctor_host_sync() {
+  if ! fw_ufw_active && ! fw_firewalld_active; then
+    doc_ok "本机没有正在运行的 ufw 或 firewalld。"
+    return 0
+  fi
+  if [[ ${FW_HOST_SYNC:-0} != 1 ]]; then
+    doc_warn "ufw 或 firewalld 正在运行，当前没有同步代理端口。只放行模式可执行: proxy firewall allow"
+    return 0
+  fi
+  local kind a b c miss=0
+  if [[ ! -s $FW_HOST_FILE ]]; then
+    doc_fail "应该同步到 ufw/firewalld，但 fw-host.list 是空的。"
+    miss=1
+  else
+    while read -r kind a b c _; do
+      [[ -n $kind ]] || continue
+      case $kind in
+        ufw) fw_ufw_ours_present "${b}/${a}" || miss=1 ;;
+        firewalld)
+          firewall-cmd --zone="$a" --query-port="${c}/${b}" >/dev/null 2>&1 || miss=1
+          ;;
+      esac
+    done <"$FW_HOST_FILE"
+    if (( miss )); then doc_fail "ufw/firewalld 里缺了已记录的放行。"
+    else doc_ok "ufw/firewalld 的同步记录还在。"; fi
+  fi
+  if (( miss && DOCTOR_FIX )); then
+    fw_host_sync || true
+    doc_ok "已按清单重新同步 ufw/firewalld。"
+    doc_fixed "已重新同步 ufw/firewalld"
+  elif (( miss )); then
+    echo "        可执行: proxy doctor --fix"
+  fi
+}
+doctor_hop() {
+  (( HY2_ENABLED )) || return 0
+  [[ -n ${HOP_RANGE:-} ]] || return 0
+  local rules pkts
+  rules=$(nft list ruleset 2>/dev/null | grep -F 'redirect' | grep -F ":${HY2_PORT}" || true)
+  if [[ -z $rules ]]; then
+    doc_fail "没有找到 Hysteria2 端口跳跃的 DNAT（UDP ${HOP_RANGE} → ${HY2_PORT}）。"
+    return 0
+  fi
+  doc_ok "端口跳跃 DNAT 已加载。"
+  if [[ $rules == *counter* ]]; then
+    pkts=$(sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' <<<"$rules" | head -n1)
+    if [[ ${pkts:-0} == 0 ]]; then doc_warn "端口跳跃计数器仍是 0，还没有流量经过。"
+    else doc_ok "端口跳跃计数器 packets=${pkts}。"; fi
+  else
+    doc_info "这条跳跃规则没有计数器（旧规则）。重新应用防火墙后会带上计数。"
+  fi
+}
+doctor_firewall() {
+  if (( NAT_MODE )); then
+    doc_ok "NAT 模式不写本机入站默认拒绝。外部是否通，看服务商的端口映射。"
+    doctor_hop
+    return 0
+  fi
+  if (( LAND_MODE )); then
+    doc_ok "落地机使用单独的来源白名单，不走节点这套默认拒绝。"
+    return 0
+  fi
+  if [[ ${FW_MODE:-off} == off || ${FW_ENABLED:-0} == 0 ]]; then
+    doc_warn "本脚本没有接管 nftables。系统防火墙和云安全组需要自己放行。"
+  elif have nft && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    local text
+    text=$(nft list table inet "$NFT_TABLE" 2>/dev/null || true)
+    doc_ok "nftables 表 inet ${NFT_TABLE} 已加载（$(fw_mode_label)）。"
+    if doctor_fw_ports_present "$text"; then doc_ok "表里能看到当前协议端口。"
+    else doc_fail "表已加载，但没有看到当前协议端口。可执行: proxy firewall ${FW_MODE}"; fi
+  else
+    doc_fail "防火墙模式是 $(fw_mode_label)，但表 inet ${NFT_TABLE} 没有加载。"
+    echo "        可执行: proxy firewall ${FW_MODE:-allow}"
+  fi
+  doctor_host_sync
+  doctor_hop
+}
+doctor_sni() {
+  (( REALITY_ENABLED || XHTTP_ENABLED )) || return 0
+  [[ -n $SNI ]] || { doc_fail "没有 SNI。可执行: proxy sni"; return 0; }
+  local res
+  res=$(sni_probe "$SNI") || true
+  if [[ $res == PASS* ]]; then doc_ok "SNI ${SNI} 仍然可用。"
+  elif [[ $res == FAIL* ]]; then
+    doc_warn "SNI ${SNI} 现在不合格（${res##*|}）。建议: proxy sni"
+  else
+    doc_warn "SNI 检查没有得到结果。可稍后执行: proxy sni"
+  fi
+}
+doctor_selftests() {
+  if (( REALITY_ENABLED )); then
+    reality_selftest || true
+    case ${REALITY_SELFTEST:-skip} in
+      ok) doc_ok "REALITY 回环自检通过。" ;;
+      fail) doc_fail "REALITY 回环自检未通过。可看上面的原因，或执行 proxy sni。" ;;
+      *) doc_warn "跳过了 REALITY 回环自检。" ;;
+    esac
+  fi
+  if (( XHTTP_ENABLED )); then
+    xhttp_selftest || true
+    case ${XHTTP_SELFTEST:-skip} in
+      ok) doc_ok "XHTTP 回环自检通过。" ;;
+      fail) doc_fail "XHTTP 回环自检未通过。" ;;
+      *) doc_warn "跳过了 XHTTP 回环自检。" ;;
+    esac
+  fi
+  if (( HY2_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )); then
+    doc_ok "Hysteria2 / TUIC / AnyTLS 只核对了本机是否在监听，没有单独的回环握手。"
+  fi
+}
+doctor_reach() {
+  local addr
+  addr=$(server_addr 2>/dev/null || true)
+  [[ -n $addr ]] || addr="<服务器地址>"
+  doc_ok "外部是否通，需要在自己的电脑上检查。云安全组要放行同一批端口。"
+  if (( REALITY_ENABLED )); then
+    echo "        nc -vz ${addr} $(pub_xray_port)"
+    echo "        curl -v --connect-timeout 5 telnet://${addr}:$(pub_xray_port)"
+  fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then
+    echo "        nc -vz ${addr} $(pub_xhttp_port)"
+  fi
+  if (( HY2_ENABLED )); then
+    echo "        nc -uvz ${addr} $(pub_hy2_port)"
+  fi
+}
+doctor_cert() {
+  cert_is_public || return 0
+  [[ -s $CERT_FULLCHAIN ]] || { doc_fail "状态里开了公开证书，但文件不在。"; return 0; }
+  if ! openssl x509 -checkend 0 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+    doc_fail "公开证书已经过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。"
+    return 0
+  fi
+  if ! openssl x509 -checkend $(( 7 * 86400 )) -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+    doc_warn "公开证书不到 7 天就要过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。可执行: proxy cert"
+    return 0
+  fi
+  doc_ok "公开证书未过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。"
+}
+doctor_run_checks() {
+  doctor_clock
+  doctor_services
+  doctor_firewall
+  doctor_sni
+  doctor_selftests
+  doctor_reach
+  doctor_cert
+}
+do_doctor() {
+  load_state
+  (( INSTALLED )) || die "还没有安装。"
+  [[ -n $INIT_SYS ]] || detect_init
+  [[ -n $OS_ID ]] || detect_os
+  DOCTOR_FAIL=0
+  DOCTOR_FIXED=""
+  [[ ${OPT_DOCTOR_FIX:-0} == 1 ]] && DOCTOR_FIX=1 || DOCTOR_FIX=0
+  echo
+  if (( DOCTOR_FIX )); then hr; _green "  健康检查（会做安全修复）"; hr
+  else hr; _green "  健康检查（只读）"; hr; fi
+  doctor_run_checks
+  # 修复时第一次检查仍记着修复前的失败。复查时不再改系统，只看现在是否通过。
+  if (( DOCTOR_FIX && DOCTOR_FAIL )); then
+    echo
+    info "正在复查刚才的修复 ..."
+    DOCTOR_FAIL=0
+    DOCTOR_FIX=0
+    doctor_run_checks
+  fi
+  echo
+  if [[ -n $DOCTOR_FIXED ]]; then
+    info "这次修好了："
+    local line
+    while IFS= read -r line; do
+      [[ -n $line ]] && printf '  - %s\n' "$line"
+    done <<<"$DOCTOR_FIXED"
+  fi
+  if (( DOCTOR_FAIL )); then
+    warn "有检查未通过。"
+    exit 1
+  fi
+  if [[ -n $DOCTOR_FIXED ]]; then ok "检查完成。列出的项目已经修好。"
+  else ok "检查完成，没有失败项。"; fi
+}
+menu_doctor() {
+  need_installed
+  if confirm "顺手做安全修复（拉起停止的服务、对时、同步防火墙、修正 state.env 权限）？" n; then
+    OPT_DOCTOR_FIX=1
+  else
+    OPT_DOCTOR_FIX=0
+  fi
+  do_doctor
+}
+# @module src/cli.sh
 # ============================================================
 #                        菜单 / 参数
 # ============================================================
@@ -11515,6 +13330,21 @@ proto_ensure_port() { # $1 reality|xhttp|hy2|trojan|tuic|anytls ；失败时调�
     esac
   fi
 }
+xhttp_443_apply() { # $1 = 1 共用，0 分开
+  local on=$1
+  (( REALITY_ENABLED && XHTTP_ENABLED )) || { warn "共用端口需要同时打开 Vision 和 XHTTP。"; return 1; }
+  if [[ $on == 1 ]]; then
+    XHTTP_ON_443=1
+    XHTTP_EXT_PORT=""
+  else
+    XHTTP_ON_443=0
+    proto_ensure_port xhttp || { XHTTP_ON_443=1; warn "没有单独的端口，仍与 Vision 共用。"; return 1; }
+  fi
+  apply_proto_services
+  if [[ $on == 1 ]]; then ok "XHTTP 与 Vision 共用 TCP $(pub_xray_port)。"
+  else ok "XHTTP 使用单独端口 $(pub_xhttp_port)。"; fi
+  show_info
+}
 menu_proto() {
   need_node
   [[ -n $OS_ID ]] || detect_os
@@ -11535,8 +13365,17 @@ menu_proto() {
       "VLESS + WebSocket + TLS（CDN）  $([[ $WS_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
       "CDN 的 VLESS Encryption  $(vless_enc_label)"
     printf '%s第 9 项只给第 7、8 项加密，不影响 REALITY 和 Hysteria2。sing-box 内核的客户端可能不支持。%s\n' "$C_DIM" "$C_NONE"
+    if (( REALITY_ENABLED && XHTTP_ENABLED )); then
+      printf '  s) XHTTP 与 Vision 共用 TCP %s    当前: %s\n' "$(pub_xray_port)" "$(xhttp_shared && echo 开 || echo 关)"
+    fi
+    if [[ -n $OPT_XHTTP_ON_443 ]]; then
+      xhttp_443_apply "$OPT_XHTTP_ON_443" || true
+      OPT_XHTTP_ON_443=""
+      return 0
+    fi
     local c kind var
     ask c "请选择" "0"
+    if [[ $c == s || $c == S ]]; then xhttp_443_apply "$(xhttp_shared && echo 0 || echo 1)"; continue; fi
     if [[ $c == 9 ]]; then
       menu_vless_enc
       continue
@@ -11553,6 +13392,14 @@ menu_proto() {
       *) return 0 ;;
     esac
     if (( ${!var} )); then
+      if [[ $kind == reality ]] && xhttp_shared; then
+        XHTTP_ON_443=0
+        if ! proto_ensure_port xhttp; then
+          XHTTP_ON_443=1
+          warn "没有单独的端口给 XHTTP，Vision 保持打开。"
+          continue
+        fi
+      fi
       printf -v "$var" 0
       if ! proto_any_enabled; then
         printf -v "$var" 1
@@ -11570,10 +13417,16 @@ menu_proto() {
           warn "没有打开。REALITY 和原来的协议保持原样。"
           continue
         fi
+      elif [[ $kind == xhttp ]] && (( REALITY_ENABLED )) && confirm "与 Vision 共用 TCP $(pub_xray_port)？" n; then
+        XHTTP_ON_443=1
+        XHTTP_EXT_PORT=""
       elif ! proto_ensure_port "$kind"; then
         printf -v "$var" 0
+        [[ $kind == xhttp ]] && XHTTP_ON_443=0
         warn "没有可用端口，保持关闭。"
         continue
+      else
+        [[ $kind == xhttp ]] && XHTTP_ON_443=0
       fi
       info "已开启。"
     fi
@@ -11643,7 +13496,10 @@ show_menu() {
     "切换 NAT 模式（当前: $(nat_pref_text)）" \
     "协议开关" \
     "申请证书" \
-    "回程线路检测"
+    "回程线路检测" \
+    "导出配置（迁到另一台机器）" \
+    "导入配置" \
+    "健康检查"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -11665,6 +13521,9 @@ show_menu() {
     16) act=menu_proto ;;
     17) act=menu_cert ;;
     18) act=do_route ;;
+    19) act=menu_export ;;
+    20) act=menu_import ;;
+    21) act=menu_doctor ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -11712,7 +13571,10 @@ show_land_menu() {
     "回程线路检测" \
     "出口：本机直连（清除下一跳与原样转发）" \
     "出口：加密转发（SS2022 再加密到下一跳）" \
-    "出口：原样转发（不解密，DNAT 到最终落地）"
+    "出口：原样转发（不解密，DNAT 到最终落地）" \
+    "导出配置（迁到另一台机器）" \
+    "导入配置" \
+    "健康检查"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -11731,6 +13593,9 @@ show_land_menu() {
     13) act=menu_land_direct ;;
     14) act=menu_land_relay ;;
     15) act=menu_land_raw ;;
+    16) act=menu_export ;;
+    17) act=menu_import ;;
+    18) act=menu_doctor ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -11758,6 +13623,8 @@ usage() {
   --xhttp / --no-xhttp
                       开启 / 关闭 VLESS + XHTTP + REALITY（默认开启，免自己的域名）
   --xhttp-port <端口> XHTTP 的 TCP 端口（默认 8443；NAT 模式为外部端口）
+  --xhttp-on-443      XHTTP 与 Vision 共用同一个 TCP 端口（默认仍是分开的 8443）
+  --no-xhttp-on-443   XHTTP 使用单独端口
   --trojan            额外启用 Trojan + REALITY（默认不装）
   --no-trojan         关闭 Trojan
   --trojan-port <端口> Trojan TCP 端口（默认 8444）
@@ -11803,9 +13670,13 @@ usage() {
   --firewall <模式>   strict 入站默认拒绝 | allow 只放行（不接管入站）| off 不写 nftables
                       不写时：干净机器默认 strict；检测到 Docker/Podman、WireGuard、
                       已有防火墙或多个非标准端口时，交互安装默认推荐 allow，
-                      非交互安装直接用 allow。--no-firewall 同 off
+                      非交互安装直接用 allow。allow 时若 ufw 或 firewalld 正在运行，
+                      会把代理端口写进它们。--no-firewall 同 off
   --no-firewall       不配置 nftables 防火墙（同 --firewall off）
   --no-upgrade        跳过系统软件包升级
+  --xray-ver <版本>   安装指定的 Xray 发布标签（例如 v26.3.27）。直接下载该版本，校验通过后才替换
+  --hy2-ver <版本>    安装指定的 Hysteria2 发布标签（例如 v2.6.1 或 app/v2.6.1）
+  --singbox-ver <版本> 安装指定的 sing-box 发布标签（例如 v1.11.0）
   --no-tune           跳过 sysctl 网络调优
   --tune-preset <名>  安装/调优使用的预设（默认 bbr-fq，见下方「网络调优」）
   -h, --help          显示帮助
@@ -11884,13 +13755,26 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy proto         协议开关（菜单第 16 项）。逐个开/关，不删除已有密钥
                       默认开：Vision、XHTTP+REALITY、Hysteria2
                       默认关：Trojan、TUIC、AnyTLS，以及 CDN 的 XHTTP+TLS / WebSocket+TLS
+                      Vision 和 XHTTP 都开着时，菜单里的 s 切换是否共用 TCP 端口
+  proxy proto xhttp-443 on|off
+                      XHTTP 与 Vision 共用 / 分开 TCP 端口
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
-  proxy port          修改端口
+  proxy port          修改端口。可带 --port、--hy2-port、--xhttp-port；同步开启时 ufw/firewalld 跟着改
   proxy user          用户管理
-  proxy update        更新组件
+  proxy update        更新组件。菜单里可以回滚到 .bak
+  proxy update --xray-ver <版本> [--hy2-ver <版本>] [--singbox-ver <版本>]
+                      只把写出的内核换成这个已经发布的版本
+  proxy update --rollback [xray|hy2|singbox|all]
+                      用 <程序>.bak 换回并重启服务，打印 旧版本 -> 新版本
+                      不写目标时回滚这三个，没有 .bak 的跳过。点名某一个却没有 .bak 时失败退出
+                      systemd 和 OpenRC 都用同一套重启
   proxy update-script 只更新本脚本
+  proxy export [文件]  导出密钥和证书（权限 600）。--password 加密；没有终端时请设置 PROXY_EXPORT_PASS
+  proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
+  bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
+  proxy doctor        只读健康检查。--fix 只做安全修复（拉起服务、对时、同步防火墙、修正权限）
   proxy speed         测速 / 延迟提示
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
   proxy firewall strict|allow|off
@@ -11945,6 +13829,8 @@ parse_args() {
       --no-reality) OPT_REALITY=0 ;;
       --xhttp) OPT_XHTTP=1 ;;
       --no-xhttp) OPT_XHTTP=0 ;;
+      --xhttp-on-443) OPT_XHTTP_ON_443=1; OPT_XHTTP=1 ;;
+      --no-xhttp-on-443) OPT_XHTTP_ON_443=0 ;;
       --xhttp-port) is_port_opt "${2-}" || die "--xhttp-port 参数无效"; OPT_XHTTP_PORT=$2; shift ;;
       --xhttp-port=*) OPT_XHTTP_PORT=${1#*=}; is_port_opt "$OPT_XHTTP_PORT" || die "--xhttp-port 参数无效" ;;
       --trojan) OPT_TROJAN=1 ;;
@@ -12100,6 +13986,13 @@ parse_args() {
         [[ -n ${2-} ]] || die "--land-allow 需要参数（例如 1.2.3.4,2001:db8::/64，或 none）"
         if [[ ${2,,} == none ]]; then OPT_LAND_ALLOW=none; else land_norm_allow "$2" || die "--land-allow 中有无效地址: ${LAND_BAD}"; OPT_LAND_ALLOW=$2; fi
         shift ;;
+          --import)
+        [[ -n ${2-} && -f ${2-} ]] || die "--import 需要已存在的导出文件"
+        OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
+      --import=*)
+        OPT_IMPORT=${1#*=}; [[ -f $OPT_IMPORT ]] || die "--import 需要已存在的导出文件"
+        OPT_ACTION=import ;;
+      --password) OPT_EXPORT_ENC=1 ;;
       --force) OPT_FORCE=1 ;;
       land-add|relay-add)
         OPT_ACTION=land; OPT_LAND_ACT=add
@@ -12124,14 +14017,73 @@ parse_args() {
       -v|--version|version) echo "$SCRIPT_VERSION"; exit 0 ;;
       install) OPT_ACTION=install ;;
       info|link|links|qr) OPT_ACTION=info ;;
-      proto|protos|protocol) OPT_ACTION=proto ;;
+      proto|protos|protocol)
+        OPT_ACTION=proto
+        if [[ ${2-} == xhttp-443 ]]; then
+          case ${3-} in
+            on|1|enable) OPT_XHTTP_ON_443=1 ;;
+            off|0|disable) OPT_XHTTP_ON_443=0 ;;
+            *) die "用法: proxy proto xhttp-443 on|off" ;;
+          esac
+          shift 2
+        fi ;;
       sni) OPT_ACTION=sni ;;
       regen|rekey) OPT_ACTION=regen ;;
       port|ports) OPT_ACTION=port ;;
       user|users) OPT_ACTION=user ;;
+      --xray-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--xray-ver 需要版本号（例如 v26.3.27）"
+        OPT_XRAY_VER=$2; shift ;;
+      --xray-ver=*)
+        OPT_XRAY_VER=${1#*=}
+        [[ -n $OPT_XRAY_VER && $OPT_XRAY_VER != -* ]] || die "--xray-ver 需要版本号（例如 v26.3.27）" ;;
+      --hy2-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--hy2-ver 需要版本号（例如 v2.6.1）"
+        OPT_HY2_VER=$2; shift ;;
+      --hy2-ver=*)
+        OPT_HY2_VER=${1#*=}
+        [[ -n $OPT_HY2_VER && $OPT_HY2_VER != -* ]] || die "--hy2-ver 需要版本号（例如 v2.6.1）" ;;
+      --singbox-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--singbox-ver 需要版本号（例如 v1.11.0）"
+        OPT_SINGBOX_VER=$2; shift ;;
+      --singbox-ver=*)
+        OPT_SINGBOX_VER=${1#*=}
+        [[ -n $OPT_SINGBOX_VER && $OPT_SINGBOX_VER != -* ]] || die "--singbox-ver 需要版本号（例如 v1.11.0）" ;;
+      --rollback)
+        OPT_ACTION=update
+        if [[ -n ${2-} && ${2} != -* ]]; then OPT_ROLLBACK=${2,,}; shift
+        else OPT_ROLLBACK=all; fi
+        case $OPT_ROLLBACK in
+          xray) ;;
+          hy2|hysteria|hysteria2) OPT_ROLLBACK=hy2 ;;
+          singbox|sing-box|sb) OPT_ROLLBACK=singbox ;;
+          all) ;;
+          *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
+        esac ;;
+      --rollback=*)
+        OPT_ACTION=update
+        OPT_ROLLBACK=${1#*=}
+        OPT_ROLLBACK=${OPT_ROLLBACK,,}
+        case $OPT_ROLLBACK in
+          xray) ;;
+          hy2|hysteria|hysteria2) OPT_ROLLBACK=hy2 ;;
+          singbox|sing-box|sb) OPT_ROLLBACK=singbox ;;
+          all) ;;
+          *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
+        esac ;;
       update|upgrade) OPT_ACTION=update ;;
+      export)
+        OPT_ACTION="export"
+        if [[ ${2-} == --password ]]; then OPT_EXPORT_ENC=1; shift; fi
+        if [[ -n ${2-} && ${2} != -* ]]; then OPT_EXPORT_PATH=$2; shift; fi ;;
+      import)
+        [[ -n ${2-} ]] || die "用法: proxy import 文件"
+        OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
       update-script) OPT_ACTION=update-script ;;
       status|log|logs) OPT_ACTION=status ;;
+      doctor)
+        OPT_ACTION=doctor
+        if [[ ${2-} == --fix ]]; then OPT_DOCTOR_FIX=1; shift; fi ;;
       speed) OPT_ACTION=speed ;;
       firewall|fw)
         OPT_ACTION=firewall
@@ -12173,7 +14125,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || -n $OPT_XRAY_VER || -n $OPT_HY2_VER || -n $OPT_SINGBOX_VER || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert
@@ -12230,6 +14182,7 @@ main() {
     update) menu_update ;;
     update-script) update_script ;;
     status) menu_status ;;
+    doctor) do_doctor ;;
     speed) menu_speed ;;
     firewall) menu_firewall ;;
     nat) menu_nat ;;
@@ -12242,6 +14195,8 @@ main() {
     land) do_land_cli ;;
     allow) land_menu_allow ;;
     uninstall) do_uninstall ;;
+    export) do_export ;;
+    import) do_import ;;
     "")
       if [[ ! -t 0 && ! -r /dev/tty ]]; then usage; die "非交互环境请使用 --auto。"; fi
       while :; do show_menu; pause; done ;;

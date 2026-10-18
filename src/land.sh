@@ -466,10 +466,11 @@ do_install_land() {
   [[ -x $HY_BIN || -f $HY_UNIT || -f $HY_RC ]] && { info "移除 Hysteria2 ..."; remove_hysteria purge; }
   [[ -x $SB_BIN || -f $SB_UNIT || -f $SB_RC ]] && { info "移除 sing-box（TUIC / AnyTLS）..."; remove_singbox; }
   remove_nat_hop
-  if [[ -f $FW_FILE || -f $FW_UNIT ]]; then info "移除节点模式的 nftables 规则 ..."; remove_firewall; fi
+  if [[ -f $FW_FILE || -f $FW_UNIT || -s ${FW_HOST_FILE:-} ]]; then info "移除节点模式的 nftables 规则 ..."; remove_firewall; fi
   if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl restart fail2ban >/dev/null 2>&1 || true; fi
   FW_ENABLED=0
   FW_MODE=off
+  FW_HOST_SYNC=0
 
   install_xray
   INSTALLED=1
