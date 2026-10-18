@@ -312,7 +312,7 @@ install_singbox() {
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
     info "下载 ${asset} ..."
     fetch -o "${TMP_DIR}/${asset}" "$url" || { github_hint; die "下载 sing-box 失败。"; }
-    want=$(curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
+    want=$(gh_curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
       "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${tag}" 2>/dev/null \
       | jq -r --arg n "$asset" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null) || want=""
     want=${want#sha256:}

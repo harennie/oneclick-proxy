@@ -594,7 +594,7 @@ latest_tag() {
 # 最新版本号：先 GitHub API，失败（限流 / 不可达）时改用 releases/latest 跳转
 gh_latest_tag() {
   local t=""
-  t=$(curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
+  t=$(gh_curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || t=""
   [[ -n $t ]] || t=$(latest_tag "$1")
   printf '%s' "$t"

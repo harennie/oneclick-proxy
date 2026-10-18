@@ -27,9 +27,49 @@ for f in "${files[@]}"; do
   [[ -f $f ]] || { printf '缺少模块: %s\n' "$f" >&2; exit 1; }
 done
 
+# 每个模块前加一行 # @module，并在 src/core.sh 的占位符里写入起始行对照。
+# 对照是单行替换，不会把后面的行号挤开。core.sh 的 shebang 仍是第 1 行。
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
-cat "${files[@]}" >"$tmp"
+map=""
+out_line=1
+add_map() { # $1 生成文件行号 $2 源文件 $3 源文件行号
+  local ent="$1:$2:$3"
+  if [[ -n $map ]]; then map+=";${ent}"; else map=$ent; fi
+}
+idx=0
+for f in "${files[@]}"; do
+  lines=$(wc -l <"$f" | tr -d ' ')
+  if (( idx == 0 )); then
+    head -n 1 "$f" >>"$tmp"
+    add_map 1 "$f" 1
+    printf '# @module %s\n' "$f" >>"$tmp"
+    add_map 3 "$f" 2
+    tail -n +2 "$f" >>"$tmp"
+    out_line=$(( lines + 2 ))
+  else
+    printf '# @module %s\n' "$f" >>"$tmp"
+    out_line=$(( out_line + 1 ))
+    add_map "$out_line" "$f" 1
+    cat "$f" >>"$tmp"
+    out_line=$(( out_line + lines ))
+  fi
+  idx=$(( idx + 1 ))
+done
+placeholder='readonly __MODULE_MAP="__BUILD_MODULE_MAP__"'
+if [[ $(grep -cF "$placeholder" "$tmp") -ne 1 ]]; then
+  printf 'src/core.sh 里的模块映射占位符必须恰好一行。\n' >&2
+  exit 1
+fi
+awk -v map="$map" -v old="$placeholder" '
+  $0 == old { print "readonly __MODULE_MAP=\"" map "\""; next }
+  { print }
+' "$tmp" >"${tmp}.map"
+mv -f "${tmp}.map" "$tmp"
+if grep -q '^readonly __MODULE_MAP="__BUILD_MODULE_MAP__"$' "$tmp"; then
+  printf '模块映射没有写进生成结果。\n' >&2
+  exit 1
+fi
 chmod 755 "$tmp"
 
 if [[ ${1-} == --check ]]; then

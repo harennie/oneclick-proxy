@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# @module src/core.sh
 # 本文件由 build.sh 从 src/ 拼接生成。请改 src/ 后执行 ./build.sh，不要直接改本文件。
 #
 # proxy.sh —— VLESS + REALITY + Vision、VLESS + XHTTP + REALITY、Hysteria2 一键安装 / 管理脚本
@@ -352,10 +353,70 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
   else printf '%s  %s%s\n' "$C_DIM" "$(ui_pad "$2" 28)未开启" "$C_NONE"; fi
 }
 
+# build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
+# 占位符还在时表示没构建，映射直接跳过。
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;699:src/os.sh:1;1208:src/tune.sh:1;2008:src/xray.sh:1;3481:src/hy2.sh:1;3587:src/firewall.sh:1;4625:src/cert.sh:1;6657:src/cdn.sh:1;7642:src/link.sh:1;8028:src/singbox.sh:1;8545:src/nat.sh:1;9173:src/selftest.sh:1;9305:src/land.sh:1;10751:src/menu.sh:1;11271:src/route.sh:1;11786:src/cli.sh:1"
+err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
+  local line=$1 ent p f s best_p=0 best_f="" best_s=0
+  [[ $line =~ ^[0-9]+$ ]] || return 1
+  [[ -n ${__MODULE_MAP:-} && $__MODULE_MAP != *__BUILD_MODULE_MAP__* ]] || return 1
+  local IFS=';'
+  local -a ents=()
+  read -r -a ents <<<"$__MODULE_MAP"
+  for ent in "${ents[@]}"; do
+    p=${ent%%:*}; s=${ent##*:}; f=${ent#*:}; f=${f%:*}
+    [[ $p =~ ^[0-9]+$ && $s =~ ^[0-9]+$ && -n $f ]] || continue
+    if (( 10#$p <= 10#$line && 10#$p >= best_p )); then best_p=$p; best_f=$f; best_s=$s; fi
+  done
+  (( best_p > 0 )) || return 1
+  printf '%s:%s' "$best_f" $(( 10#$best_s + 10#$line - 10#$best_p ))
+}
+err_from_file() { # 读 $0 里的 # @module。管道运行时文件不可读，交给调用方退回行号。
+  local line=$1 n=0 row mark="" start=0 src
+  [[ $line =~ ^[0-9]+$ && -r $0 && -f $0 ]] || return 1
+  while IFS= read -r row || [[ -n $row ]]; do
+    n=$(( n + 1 ))
+    if [[ $row == '# @module '* ]]; then
+      if (( n == 10#$line )); then printf '%s:1' "${row#\# @module }"; return 0; fi
+      if (( n < 10#$line )); then mark=${row#\# @module }; start=$n; fi
+    fi
+    (( n >= 10#$line )) && break
+  done <"$0"
+  [[ -n $mark && start -gt 0 ]] || return 1
+  if [[ $mark == src/core.sh ]]; then src=$(( 10#$line - start + 1 ))
+  else src=$(( 10#$line - start )); fi
+  (( src > 0 )) || return 1
+  printf '%s:%s' "$mark" "$src"
+}
+err_loc() { # $1 合并后的行号
+  local loc=""
+  loc=$(err_from_map "$1" 2>/dev/null) || loc=""
+  [[ -n $loc ]] || loc=$(err_from_file "$1" 2>/dev/null) || loc=""
+  if [[ -n $loc ]]; then printf '%s' "$loc"; else printf '第 %s 行' "$1"; fi
+}
+err_print_stack() {
+  local i fn bl loc n=0
+  (( ${#FUNCNAME[@]} > 1 )) || return 0
+  printf '%s调用栈：%s\n' "$C_YELLOW" "$C_NONE" >&2
+  for (( i=1; i<${#FUNCNAME[@]}; i++ )); do
+    fn=${FUNCNAME[$i]}
+    [[ $fn == on_error || $fn == err_print_stack || $fn == main || $fn == err_loc ]] && continue
+    bl=${BASH_LINENO[$(( i - 1 ))]:-0}
+    [[ $bl =~ ^[0-9]+$ ]] || bl=0
+    loc=$(err_loc "$bl")
+    n=$(( n + 1 ))
+    printf '  [%s] %s() <- %s\n' "$n" "$fn" "$loc" >&2
+  done
+  return 0
+}
 on_error() {
-  local rc=$? line=$1 cmd=$2
+  local rc=$? line=$1 cmd=$2 where
   trap - ERR
-  printf '\n%s[错误]%s 脚本在第 %s 行执行失败 (退出码 %s)：\n    %s\n' "$C_RED" "$C_NONE" "$line" "$rc" "$cmd" >&2
+  if [[ -n ${GITHUB_TOKEN:-} ]]; then cmd=${cmd//${GITHUB_TOKEN}/***}; fi
+  cmd=${cmd//Authorization: Bearer */Authorization: Bearer ***}
+  where=$(err_loc "$line")
+  printf '\n%s[错误]%s 脚本在 %s 执行失败 (退出码 %s)：\n    %s\n' "$C_RED" "$C_NONE" "$where" "$rc" "$cmd" >&2
+  err_print_stack
   printf '%s如需帮助，请带上以上信息及服务日志（journalctl -xe 或 /var/log/xray、/var/log/hysteria）反馈。重新运行本脚本是安全的（幂等）。%s\n' "$C_YELLOW" "$C_NONE" >&2
   exit "$rc"
 }
@@ -455,6 +516,17 @@ rand_hex() { openssl rand -hex "$1"; }
 rand_pass() { openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | cut -c1-24; }
 ver_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | awk 'NR==1')" == "$2" ]]; }
 fetch() { curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 --retry 2 --retry-delay 2 "$@"; }
+# 访问 api.github.com。设置了 GITHUB_TOKEN 时带上，令牌不出现在命令行里，也不写进日志。
+gh_curl() {
+  if [[ -z ${GITHUB_TOKEN:-} ]]; then curl "$@"; return; fi
+  local rc=0 cfg
+  cfg=$(mktemp)
+  chmod 600 "$cfg"
+  awk 'BEGIN{t=ENVIRON["GITHUB_TOKEN"]; printf "header = \"Authorization: Bearer %s\"\n", t}' >"$cfg"
+  curl --config "$cfg" "$@" || rc=$?
+  rm -f "$cfg"
+  return "$rc"
+}
 host_fmt() { [[ $1 == *:* ]] && printf '[%s]' "$1" || printf '%s' "$1"; }
 
 # ----------------------------- 服务管理（systemd / OpenRC 抽象） -----------------------------
@@ -623,6 +695,7 @@ save_state() {
   mv -f "$tmp" "$STATE_FILE"
 }
 
+# @module src/os.sh
 # ============================================================
 #                        环境预检
 # ============================================================
@@ -1131,6 +1204,7 @@ pkg_bootstrap_curl() {
   elif [[ $PKG == apt ]]; then apt-get update -qq && pkg_install curl ca-certificates; else pkg_install curl ca-certificates; fi
 }
 
+# @module src/tune.sh
 # ============================================================
 #              网络调优（v1.2.0 起为独立功能：proxy tune）
 # ============================================================
@@ -1930,6 +2004,7 @@ nat_tune() {
   tune_run "$preset" "${OPT_TUNE_BUF:-auto}"
 }
 
+# @module src/xray.sh
 # ============================================================
 #                 REALITY 目标网站 (SNI) 自动优选
 # ============================================================
@@ -2526,7 +2601,7 @@ latest_tag() {
 # 最新版本号：先 GitHub API，失败（限流 / 不可达）时改用 releases/latest 跳转
 gh_latest_tag() {
   local t=""
-  t=$(curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
+  t=$(gh_curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || t=""
   [[ -n $t ]] || t=$(latest_tag "$1")
   printf '%s' "$t"
@@ -3402,6 +3477,7 @@ selinux_fix() {
   if have restorecon; then restorecon -R "$@" >/dev/null 2>&1 || true; fi
 }
 
+# @module src/hy2.sh
 # ============================================================
 #                        Hysteria2
 # ============================================================
@@ -3507,6 +3583,7 @@ remove_hysteria() { # $1 = purge：连证书目录一起删（卸载）。TUIC/A
   remove_nat_hop
 }
 
+# @module src/firewall.sh
 # ============================================================
 #                        防火墙 (nftables)
 # ============================================================
@@ -4544,6 +4621,7 @@ F2B
   fi
 }
 
+# @module src/cert.sh
 # ============================================================
 #          可选：证书（默认 Let's Encrypt 单域名）与订阅 HTTPS
 # ============================================================
@@ -6575,6 +6653,7 @@ print_sub_block() {
   ui_bar '═' "$W" "$paint"
 }
 
+# @module src/cdn.sh
 # ============================================================
 #     可选：VLESS + XHTTP + TLS / VLESS + WebSocket + TLS（CDN）
 # ============================================================
@@ -7559,6 +7638,7 @@ do_vless_enc() {
 }
 
 
+# @module src/link.sh
 # ============================================================
 #                        链接 / 二维码 / 客户端配置
 # ============================================================
@@ -7944,6 +8024,7 @@ show_info() {
   ui_bar '═' 62
 }
 
+# @module src/singbox.sh
 # ============================================================
 #                        安装主流程
 # ============================================================
@@ -8258,7 +8339,7 @@ install_singbox() {
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
     info "下载 ${asset} ..."
     fetch -o "${TMP_DIR}/${asset}" "$url" || { github_hint; die "下载 sing-box 失败。"; }
-    want=$(curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
+    want=$(gh_curl -fsSL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -H 'Accept: application/vnd.github+json' \
       "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${tag}" 2>/dev/null \
       | jq -r --arg n "$asset" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null) || want=""
     want=${want#sha256:}
@@ -8460,6 +8541,7 @@ choose_ports() {
   choose_extra_local
 }
 
+# @module src/nat.sh
 # ============================================================
 #            NAT 模式：公网地址 / 映射端口
 # ============================================================
@@ -9087,6 +9169,7 @@ do_install() {
   ui_bar '═' 62
 }
 
+# @module src/selftest.sh
 # ============================================================
 #               REALITY 自检（安装 / 更换 SNI 后）
 # ============================================================
@@ -9218,6 +9301,7 @@ xhttp_selftest() {
   return 0
 }
 
+# @module src/land.sh
 # ============================================================
 #       落地机（Shadowsocks 2022 出口）/ 中转机的落地转发
 # ============================================================
@@ -10663,6 +10747,7 @@ do_land_cli() {
   esac
 }
 
+# @module src/menu.sh
 # ============================================================
 #                        管理功能
 # ============================================================
@@ -11182,6 +11267,7 @@ do_uninstall() {
   ok "卸载完成。别忘了在云服务商控制台关闭不再需要的端口。"
 }
 
+# @module src/route.sh
 # ============================================================
 # 回程线路检测（proxy route）
 # 只读：不改代理配置，不重启服务，不测流媒体。
@@ -11696,6 +11782,7 @@ do_route() {
   fi
   return 0
 }
+# @module src/cli.sh
 # ============================================================
 #                        菜单 / 参数
 # ============================================================
