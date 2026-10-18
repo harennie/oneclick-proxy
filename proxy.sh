@@ -369,7 +369,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5254:src/cert.sh:1;7286:src/cdn.sh:1;8271:src/link.sh:1;8660:src/singbox.sh:1;9238:src/nat.sh:1;9876:src/selftest.sh:1;10021:src/land.sh:1;11467:src/menu.sh:1;12036:src/route.sh:1;12551:src/export.sh:1;12749:src/doctor.sh:1;13044:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5260:src/cert.sh:1;7292:src/cdn.sh:1;8277:src/link.sh:1;8666:src/singbox.sh:1;9244:src/nat.sh:1;9882:src/selftest.sh:1;10027:src/land.sh:1;11473:src/menu.sh:1;12042:src/route.sh:1;12557:src/export.sh:1;12755:src/doctor.sh:1;13050:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -4123,7 +4123,8 @@ fw_foreign_nft() {
   rs=$(nft -s list ruleset 2>/dev/null || true)
   [[ -n $rs ]] || return 1
   awk '
-    $1 == "table" { skip = ($0 ~ /proxy_oneclick/); next }
+    # fail2ban 的 f2b-table 是本脚本自己写的，不能当成「别人的防火墙」。
+    $1 == "table" { skip = ($0 ~ /proxy_oneclick/ || $0 ~ /f2b/ || $0 ~ /fail2ban/); next }
     skip { next }
     /^[[:space:]]*(type |chain |}|table )/ { next }
     /^[[:space:]]*$/ { next }
@@ -4268,15 +4269,20 @@ fw_decide_install() {
       info "已按指定跳过 nftables 防火墙。"
     fi
   elif (( OPT_AUTO )) || { [[ ! -t 0 && ! -r /dev/tty ]]; }; then
-    fw_detect_risk
-    if (( FW_RISK )); then
-      FW_MODE=allow
-      warn "未指定 --firewall。检测到可能被默认拒绝打断的环境，非交互安装改用只放行模式："
-      fw_print_risk
-      info "确认要入站默认拒绝时，请使用 --firewall strict，或之后执行 proxy firewall strict。"
+    # 重装 / 更新没写 --firewall 时，沿用上次保存的模式。fail2ban 的表不能把 strict 改成 allow。
+    if [[ ${INSTALLED:-0} == 1 && ${FW_MODE:-} =~ ^(strict|allow|off)$ ]]; then
+      info "未指定 --firewall，沿用已保存的模式：$(fw_mode_label)。"
     else
-      FW_MODE=strict
-      info "未指定 --firewall，也没有发现 Docker、已有防火墙或额外的非标准监听，使用严格模式（入站默认拒绝）。"
+      fw_detect_risk
+      if (( FW_RISK )); then
+        FW_MODE=allow
+        warn "未指定 --firewall。检测到可能被默认拒绝打断的环境，非交互安装改用只放行模式："
+        fw_print_risk
+        info "确认要入站默认拒绝时，请使用 --firewall strict，或之后执行 proxy firewall strict。"
+      else
+        FW_MODE=strict
+        info "未指定 --firewall，也没有发现 Docker、已有防火墙或额外的非标准监听，使用严格模式（入站默认拒绝）。"
+      fi
     fi
   else
     fw_prompt_mode
