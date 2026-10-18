@@ -189,7 +189,7 @@ doctor_hop() {
     if [[ ${pkts:-0} == 0 ]]; then doc_warn "端口跳跃计数器仍是 0，还没有流量经过。"
     else doc_ok "端口跳跃计数器 packets=${pkts}。"; fi
   else
-    doc_warn "这条跳跃规则没有计数器，看不出有没有流量经过。"
+    doc_info "这条跳跃规则没有计数器（旧规则）。重新应用防火墙后会带上计数。"
   fi
 }
 doctor_firewall() {

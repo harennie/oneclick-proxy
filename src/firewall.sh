@@ -447,7 +447,7 @@ render_firewall() {
     if [[ -n $hop ]]; then
       echo "  chain prerouting {"
       echo "    type nat hook prerouting priority dstnat; policy accept;"
-      echo "    udp dport ${hop} redirect to :${HY2_PORT} comment \"hy2 port hopping\""
+      echo "    udp dport ${hop} counter redirect to :${HY2_PORT} comment \"hy2 port hopping\""
       echo "  }"
     fi
     echo "}"
@@ -468,7 +468,7 @@ render_firewall_compat() {
         echo "table ${fam} ${NFT_TABLE}_nat {"
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
-        echo "    udp dport ${HOP_RANGE} redirect to :${HY2_PORT}"
+        echo "    udp dport ${HOP_RANGE} counter redirect to :${HY2_PORT}"
         echo "  }"
         echo "}"
       } >>"${f}.2"

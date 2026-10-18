@@ -4484,7 +4484,7 @@ render_firewall() {
     if [[ -n $hop ]]; then
       echo "  chain prerouting {"
       echo "    type nat hook prerouting priority dstnat; policy accept;"
-      echo "    udp dport ${hop} redirect to :${HY2_PORT} comment \"hy2 port hopping\""
+      echo "    udp dport ${hop} counter redirect to :${HY2_PORT} comment \"hy2 port hopping\""
       echo "  }"
     fi
     echo "}"
@@ -4505,7 +4505,7 @@ render_firewall_compat() {
         echo "table ${fam} ${NFT_TABLE}_nat {"
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
-        echo "    udp dport ${HOP_RANGE} redirect to :${HY2_PORT}"
+        echo "    udp dport ${HOP_RANGE} counter redirect to :${HY2_PORT}"
         echo "  }"
         echo "}"
       } >>"${f}.2"
@@ -12961,7 +12961,7 @@ doctor_hop() {
     if [[ ${pkts:-0} == 0 ]]; then doc_warn "端口跳跃计数器仍是 0，还没有流量经过。"
     else doc_ok "端口跳跃计数器 packets=${pkts}。"; fi
   else
-    doc_warn "这条跳跃规则没有计数器，看不出有没有流量经过。"
+    doc_info "这条跳跃规则没有计数器（旧规则）。重新应用防火墙后会带上计数。"
   fi
 }
 doctor_firewall() {
