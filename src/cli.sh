@@ -264,10 +264,12 @@ usage() {
   --force-sni         与 --sni 一起使用：检测不通过也强制使用
   --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
-  --no-hy2            不安装 Hysteria2
+  --hy2 / --no-hy2    安装 / 不安装 Hysteria2（默认安装）
   --hy2-port <端口>   Hysteria2 UDP 端口（默认 443）
-  --no-reality        不启用 VLESS + REALITY + Vision（默认启用）
-  --no-xhttp          不启用 VLESS + XHTTP + REALITY（默认启用，免自己的域名）
+  --reality / --no-reality
+                      开启 / 关闭 VLESS + REALITY + Vision（默认开启）
+  --xhttp / --no-xhttp
+                      开启 / 关闭 VLESS + XHTTP + REALITY（默认开启，免自己的域名）
   --xhttp-port <端口> XHTTP 的 TCP 端口（默认 8443；NAT 模式为外部端口）
   --trojan            额外启用 Trojan + REALITY（默认不装）
   --no-trojan         关闭 Trojan
@@ -282,12 +284,14 @@ usage() {
                       需要 --cert-domain。不替换 REALITY，也不要把 REALITY 放进 CDN
   --no-xhttp-tls      关闭这条 CDN 线路
   --xhttp-tls-port <端口>  回源端口（默认 2083，须是 Cloudflare 允许的 HTTPS 端口）
-  --ws-tls            额外启用 VLESS + WebSocket + TLS（放在 CDN 后面，默认不装）
-  --no-ws-tls         关闭这条 CDN 线路
+  --ws-tls / --ws     额外启用 VLESS + WebSocket + TLS（放在 CDN 后面，默认不装）
+  --no-ws-tls / --no-ws
+                      关闭这条 CDN 线路
   --ws-port <端口>    回源端口（默认 2087）
-  --no-vless-enc      两条 CDN 线路不加 VLESS Encryption（默认加，ML-KEM-768 + X25519，
-                      Cloudflare 只看到密文）。sing-box 内核的客户端可能不支持时用它
+  --vless-enc         两条 CDN 线路加 VLESS Encryption（默认就是加，ML-KEM-768 + X25519）
+  --no-vless-enc      不加。sing-box 内核的客户端可能不支持时用它；不加时 Cloudflare 能看到明文 VLESS
   --hop <a-b|none>    Hysteria2 端口跳跃范围（默认 20000-50000，none 关闭）
+  --no-hop            关闭端口跳跃（同 --hop none）
   --name <名称>       节点名称（默认 国家-城市）
   --cert-domain <域名>  可选：为自有域名申请证书。不写 --cert-kind 时是
                       Let's Encrypt 单域名 HTTP-01（默认）。订阅只走 HTTPS；
@@ -390,7 +394,9 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy cdn           查看 CDN 线路教程并复查（XHTTP+TLS / WebSocket+TLS）
   proxy vless-enc     查看 CDN 线路的 VLESS Encryption。on / off 开关，rotate 换新钥匙
                       只重写 Xray 并刷新链接和订阅，不重装；REALITY 等不变
-  proxy proto         单独打开或关闭协议（不删除已有密钥）
+  proxy proto         协议开关（菜单第 16 项）。逐个开/关，不删除已有密钥
+                      默认开：Vision、XHTTP+REALITY、Hysteria2
+                      默认关：Trojan、TUIC、AnyTLS，以及 CDN 的 XHTTP+TLS / WebSocket+TLS
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
   proxy port          修改端口
