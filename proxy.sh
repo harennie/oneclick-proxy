@@ -165,6 +165,7 @@ OPT_HY2_PORT=""
 OPT_REALITY=""      # 空=沿用（默认开）; 1/0
 OPT_XHTTP=""        # 空=安装时默认开（状态里已有则沿用）; 1/0
 OPT_XHTTP_PORT=""
+OPT_XHTTP_ON_443="" # 空=默认分开（8443）；1=与 Vision 共用 TCP 端口；0=强制分开
 OPT_TROJAN=""       # 空=默认关; 1/0
 OPT_TROJAN_PORT=""
 OPT_TUIC=""         # 空=默认关; 1/0
@@ -359,7 +360,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;704:src/os.sh:1;1213:src/tune.sh:1;2013:src/xray.sh:1;3486:src/hy2.sh:1;3592:src/firewall.sh:1;4630:src/cert.sh:1;6662:src/cdn.sh:1;7647:src/link.sh:1;8033:src/singbox.sh:1;8550:src/nat.sh:1;9188:src/selftest.sh:1;9320:src/land.sh:1;10766:src/menu.sh:1;11286:src/route.sh:1;11801:src/export.sh:1;11999:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;705:src/os.sh:1;1214:src/tune.sh:1;2014:src/xray.sh:1;3531:src/hy2.sh:1;3637:src/firewall.sh:1;4681:src/cert.sh:1;6713:src/cdn.sh:1;7698:src/link.sh:1;8087:src/singbox.sh:1;8643:src/nat.sh:1;9281:src/selftest.sh:1;9420:src/land.sh:1;10866:src/menu.sh:1;11386:src/route.sh:1;11901:src/export.sh:1;12099:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -618,7 +619,7 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
             HOP_BACKEND VIRT DNS64_SET
             LAND_MODE LAND_METHOD LAND_KEY LAND_ALLOW RELAY_LINK RELAY_ON RELAY_SOCKS FWD_LINK FWD_ON NAT_PREF
-            REALITY_ENABLED XHTTP_ENABLED XHTTP_PORT XHTTP_PATH XHTTP_EXT_PORT
+            REALITY_ENABLED XHTTP_ENABLED XHTTP_PORT XHTTP_PATH XHTTP_EXT_PORT XHTTP_ON_443
             TROJAN_ENABLED TROJAN_PORT TROJAN_PASS TROJAN_EXT_PORT
             TUIC_ENABLED TUIC_PORT TUIC_PASS TUIC_EXT_PORT
             ANYTLS_ENABLED ANYTLS_PORT ANYTLS_PASS ANYTLS_EXT_PORT
@@ -633,7 +634,7 @@ HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_N
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
 # 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。
 REALITY_ENABLED=1
-XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT=""
+XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT="" XHTTP_ON_443=0
 TROJAN_ENABLED=0 TROJAN_PORT=8444 TROJAN_PASS="" TROJAN_EXT_PORT=""
 TUIC_ENABLED=0 TUIC_PORT=8446 TUIC_PASS="" TUIC_EXT_PORT=""
 ANYTLS_ENABLED=0 ANYTLS_PORT=8445 ANYTLS_PASS="" ANYTLS_EXT_PORT=""
@@ -2729,10 +2730,30 @@ ensure_hy_user() {
 
 # 需要绑定 1024 以下端口时才申请 CAP_NET_BIND_SERVICE（老内核 / OpenVZ 不支持 ambient capabilities）
 need_bind_cap() { (( ${1:-0} > 0 && ${1:-0} < 1024 )); }
+# 1 = XHTTP 走 Vision 的同一个 TCP 端口（fallbacks），不再单独监听 8443
+xhttp_shared() { (( ${XHTTP_ON_443:-0} == 1 && ${XHTTP_ENABLED:-0} == 1 && ${REALITY_ENABLED:-0} == 1 )); }
+xhttp_fallback_prepare() {
+  XHTTP_FB_DEST="" XHTTP_FB_LISTEN="" XHTTP_FB_PORT=0
+  if [[ -d /dev/shm && -w /dev/shm ]]; then
+    rm -f /dev/shm/xray-xhttp.sock
+    XHTTP_FB_DEST="/dev/shm/xray-xhttp.sock"
+    XHTTP_FB_LISTEN="/dev/shm/xray-xhttp.sock,0666"
+    return 0
+  fi
+  local p=32768
+  while (( p < 32820 )); do
+    port_in_use tcp "$p" || break
+    p=$(( p + 1 ))
+  done
+  (( p < 32820 )) || die "没有可用的本机回环端口给 XHTTP 回落。"
+  XHTTP_FB_PORT=$p
+  XHTTP_FB_DEST="127.0.0.1:${p}"
+  XHTTP_FB_LISTEN="127.0.0.1"
+}
 xray_need_cap() {
   if (( ${LAND_MODE:-0} )); then need_bind_cap "$XRAY_PORT"; return; fi
   (( ${REALITY_ENABLED:-1} )) && need_bind_cap "$XRAY_PORT" && return 0
-  (( ${XHTTP_ENABLED:-0} )) && need_bind_cap "$XHTTP_PORT" && return 0
+  (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && need_bind_cap "$XHTTP_PORT" && return 0
   (( ${TROJAN_ENABLED:-0} )) && need_bind_cap "$TROJAN_PORT" && return 0
   (( ${XHTTP_TLS_ENABLED:-0} )) && need_bind_cap "$XHTTP_TLS_PORT" && return 0
   (( ${WS_ENABLED:-0} )) && need_bind_cap "$WS_PORT" && return 0
@@ -3371,12 +3392,15 @@ write_xray_config() {
     ensure_outbound_ip
     land_xray_json >"$tmp" || die "生成落地机 Xray 配置失败。"
   else
+  local share=0
+  if xhttp_shared; then share=1; xhttp_fallback_prepare; fi
   jq -n \
     --argjson port "$XRAY_PORT" --argjson clients "$clients" --argjson cplain "$cplain" --argjson tclients "$tclients" \
     --argjson reality "${REALITY_ENABLED:-0}" --argjson xhttp "${XHTTP_ENABLED:-0}" --argjson trojan "${TROJAN_ENABLED:-0}" \
     --argjson xport "${XHTTP_PORT:-0}" --argjson tport "${TROJAN_PORT:-0}" --arg xpath "${XHTTP_PATH:-/xhttp}" \
     --arg target "${SNI_TARGET:-$SNI:443}" --arg sni "$SNI" \
-    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$seed" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" '
+    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$seed" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" \
+    --argjson share "$share" --arg fbdest "${XHTTP_FB_DEST:-}" --arg fblisten "${XHTTP_FB_LISTEN:-}" --argjson fbport "${XHTTP_FB_PORT:-0}" '
   def reality: {
     show: false, target: $target, xver: 0,
     serverNames: [$sni], privateKey: $priv, shortIds: [$sid]
@@ -3388,11 +3412,31 @@ write_xray_config() {
       []
       + (if $reality == 1 then [{
           tag: "vless-reality", port: $port, protocol: "vless",
-          settings: {clients: $clients, decryption: "none"},
+          settings: ({clients: $clients, decryption: "none"}
+            + (if $share == 1 then {fallbacks: [{dest: $fbdest, xver: 0}]} else {} end)),
           streamSettings: {network: "raw", security: "reality", realitySettings: reality},
           sniffing: sniff
         }] else [] end)
-      + (if $xhttp == 1 then [{
+      + (if $xhttp == 1 then
+          if $share == 1 then
+            [(if $fbport == 0 then {
+                tag: "vless-xhttp", listen: $fblisten, protocol: "vless",
+                settings: {clients: $cplain, decryption: "none"},
+                streamSettings: {
+                  network: "xhttp", security: "none",
+                  xhttpSettings: {path: $xpath, mode: "stream-one"}
+                },
+                sniffing: sniff
+              } else {
+                tag: "vless-xhttp", listen: $fblisten, port: $fbport, protocol: "vless",
+                settings: {clients: $cplain, decryption: "none"},
+                streamSettings: {
+                  network: "xhttp", security: "none",
+                  xhttpSettings: {path: $xpath, mode: "stream-one"}
+                },
+                sniffing: sniff
+              } end)]
+          else [{
           tag: "vless-xhttp", port: $xport, protocol: "vless",
           settings: {clients: $cplain, decryption: "none"},
           streamSettings: {
@@ -3401,7 +3445,8 @@ write_xray_config() {
             realitySettings: reality
           },
           sniffing: sniff
-        }] else [] end)
+        }] end
+        else [] end)
       + (if $trojan == 1 then [{
           tag: "trojan-reality", port: $tport, protocol: "trojan",
           settings: {clients: $tclients},
@@ -3964,7 +4009,7 @@ render_firewall() {
     [[ $1 == tcp_ports && ",$ssh_set," == *",$p,"* ]] && return 0
     printf -v "$1" '%s' "${cur:+$cur,}$p"
   }
-  (( ${XHTTP_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_PORT"
+  (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && fw_add_port tcp_ports "$XHTTP_PORT"
   (( ${TROJAN_ENABLED:-0} )) && fw_add_port tcp_ports "$TROJAN_PORT"
   (( ${ANYTLS_ENABLED:-0} )) && fw_add_port tcp_ports "$ANYTLS_PORT"
   (( ${XHTTP_TLS_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_TLS_PORT"
@@ -4349,7 +4394,7 @@ fw_collect_want() {
   local p seg
   FW_WANT=""
   (( ${REALITY_ENABLED:-0} == 1 )) && fw_want_add tcp "$XRAY_PORT"
-  (( ${XHTTP_ENABLED:-0} == 1 )) && fw_want_add tcp "$XHTTP_PORT"
+  (( ${XHTTP_ENABLED:-0} == 1 )) && ! xhttp_shared && fw_want_add tcp "$XHTTP_PORT"
   (( ${HY2_ENABLED:-0} == 1 )) && fw_want_add udp "$HY2_PORT"
   (( ${TROJAN_ENABLED:-0} == 1 )) && fw_want_add tcp "$TROJAN_PORT"
   (( ${TUIC_ENABLED:-0} == 1 )) && fw_want_add udp "$TUIC_PORT"
@@ -4527,7 +4572,10 @@ fw_print_allows() {
   echo
   printf '  %s  %s  %s\n' "$(ui_pad "协议" 22)" "$(ui_pad "类型" 4)" "端口"
   (( ${REALITY_ENABLED:-0} == 1 )) && fw_allow_row "Reality" tcp "$XRAY_PORT"
-  (( ${XHTTP_ENABLED:-0} == 1 )) && fw_allow_row "XHTTP" tcp "$XHTTP_PORT"
+  if (( ${XHTTP_ENABLED:-0} == 1 )); then
+    if xhttp_shared; then fw_allow_row "XHTTP（共用）" tcp "$XRAY_PORT"
+    else fw_allow_row "XHTTP" tcp "$XHTTP_PORT"; fi
+  fi
   (( ${HY2_ENABLED:-0} == 1 )) && fw_allow_row "Hysteria2" udp "$HY2_PORT"
   (( ${TROJAN_ENABLED:-0} == 1 )) && fw_allow_row "Trojan" tcp "$TROJAN_PORT"
   (( ${TUIC_ENABLED:-0} == 1 )) && fw_allow_row "TUIC" udp "$TUIC_PORT"
@@ -4577,7 +4625,10 @@ cloud_fw_reminder() {
   if (( NAT_MODE )); then
     printf '%s请确认服务商端口映射%s  地址 %s\n' "$C_WARN" "$C_NONE" "$(server_addr)"
     (( REALITY_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  VLESS-REALITY\n' "$XRAY_EXT_PORT" "$XRAY_PORT"
-    (( XHTTP_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP\n' "$XHTTP_EXT_PORT" "$XHTTP_PORT"
+    if (( XHTTP_ENABLED )); then
+      if xhttp_shared; then printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP（与 Vision 共用）\n' "$XRAY_EXT_PORT" "$XRAY_PORT"
+      else printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP\n' "$XHTTP_EXT_PORT" "$XHTTP_PORT"; fi
+    fi
     (( TROJAN_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  Trojan\n' "$TROJAN_EXT_PORT" "$TROJAN_PORT"
     (( ANYTLS_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  AnyTLS\n' "$ANYTLS_EXT_PORT" "$ANYTLS_PORT"
     if (( HY2_ENABLED )); then
@@ -7656,7 +7707,10 @@ server_addr() {
 # 链接中使用的（外部）端口：NAT 模式为服务商映射的外部端口
 pub_xray_port() { if (( NAT_MODE )) && [[ -n $XRAY_EXT_PORT ]]; then printf '%s' "$XRAY_EXT_PORT"; else printf '%s' "$XRAY_PORT"; fi; }
 pub_hy2_port() { if (( NAT_MODE )) && [[ -n $HY2_EXT_PORT ]]; then printf '%s' "$HY2_EXT_PORT"; else printf '%s' "$HY2_PORT"; fi; }
-pub_xhttp_port() { if (( NAT_MODE )) && [[ -n $XHTTP_EXT_PORT ]]; then printf '%s' "$XHTTP_EXT_PORT"; else printf '%s' "$XHTTP_PORT"; fi; }
+pub_xhttp_port() {
+  if xhttp_shared; then pub_xray_port; return; fi
+  if (( NAT_MODE )) && [[ -n $XHTTP_EXT_PORT ]]; then printf '%s' "$XHTTP_EXT_PORT"; else printf '%s' "$XHTTP_PORT"; fi
+}
 pub_trojan_port() { if (( NAT_MODE )) && [[ -n $TROJAN_EXT_PORT ]]; then printf '%s' "$TROJAN_EXT_PORT"; else printf '%s' "$TROJAN_PORT"; fi; }
 pub_tuic_port() { if (( NAT_MODE )) && [[ -n $TUIC_EXT_PORT ]]; then printf '%s' "$TUIC_EXT_PORT"; else printf '%s' "$TUIC_PORT"; fi; }
 pub_anytls_port() { if (( NAT_MODE )) && [[ -n $ANYTLS_EXT_PORT ]]; then printf '%s' "$ANYTLS_EXT_PORT"; else printf '%s' "$ANYTLS_PORT"; fi; }
@@ -8201,10 +8255,23 @@ local_pick() { # $1 proto $2 变量 $3 --xx-port $4 名称 $5 允许的进程名
     return 0
   done
 }
+confirm_xhttp_share() {
+  if (( ! XHTTP_ENABLED || ! REALITY_ENABLED )); then XHTTP_ON_443=0; return 0; fi
+  if [[ -n $OPT_XHTTP_ON_443 ]]; then XHTTP_ON_443=$OPT_XHTTP_ON_443; return 0; fi
+  if (( OPT_AUTO )); then return 0; fi
+  local def=n
+  [[ ${XHTTP_ON_443:-0} == 1 ]] && def=y
+  if confirm "XHTTP 与 Vision 共用 TCP ${XRAY_PORT}？（否则 XHTTP 单独监听 ${XHTTP_PORT:-8443}）" "$def"; then
+    XHTTP_ON_443=1
+  else
+    XHTTP_ON_443=0
+  fi
+}
 choose_extra_local() {
   confirm_xhttp
+  confirm_xhttp_share
   local_seed_used
-  if (( XHTTP_ENABLED )); then local_pick tcp XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then local_pick tcp XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}"; fi
   if (( TROJAN_ENABLED )); then local_pick tcp TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" "${TROJAN_PORT:-8444}"; fi
   if (( ANYTLS_ENABLED )); then local_pick tcp ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" "${ANYTLS_PORT:-8445}"; fi
   if (( TUIC_ENABLED )); then local_pick udp TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" "${TUIC_PORT:-8446}"; fi
@@ -8216,10 +8283,36 @@ choose_extra_local() {
   fi
   proto_any_enabled || die "至少需要启用一个协议（Reality / XHTTP / Hysteria2 / Trojan / TUIC / AnyTLS）。"
 }
+nat_usable_count() {
+  local n=0 p
+  while read -r p; do
+    [[ -n $p ]] || continue
+    nat_excluded "$p" && continue
+    n=$(( n + 1 ))
+    (( n > 1 )) && break
+  done < <(nat_all_ext)
+  printf '%s' "$n"
+}
 choose_extra_nat() {
   confirm_xhttp
   nat_seed_used
-  if (( XHTTP_ENABLED )); then nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" || XHTTP_ENABLED=0; fi
+  if (( XHTTP_ENABLED && REALITY_ENABLED )); then
+    if [[ -n $OPT_XHTTP_ON_443 ]]; then XHTTP_ON_443=$OPT_XHTTP_ON_443
+    elif [[ $(nat_usable_count) == 1 ]]; then
+      if (( OPT_AUTO )); then
+        XHTTP_ON_443=1
+        info "只有一个 TCP 映射，XHTTP 与 Vision 共用外部端口 ${XRAY_EXT_PORT}。"
+      elif confirm "只有一个 TCP 映射。让 XHTTP 和 Vision 共用外部端口 ${XRAY_EXT_PORT}？" y; then
+        XHTTP_ON_443=1
+      else
+        XHTTP_ON_443=0
+      fi
+    else
+      confirm_xhttp_share
+    fi
+  fi
+  if xhttp_shared; then XHTTP_EXT_PORT=""; info "XHTTP 链接端口与 Vision 相同：$(pub_xray_port)。"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" || XHTTP_ENABLED=0; fi
   if (( TROJAN_ENABLED )); then nat_pick_mapped tcp TROJAN_EXT_PORT TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" || TROJAN_ENABLED=0; fi
   if (( ANYTLS_ENABLED )); then nat_pick_mapped tcp ANYTLS_EXT_PORT ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" || ANYTLS_ENABLED=0; fi
   if (( TUIC_ENABLED )); then nat_pick_mapped udp TUIC_EXT_PORT TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" || TUIC_ENABLED=0; fi
@@ -8233,7 +8326,7 @@ choose_extra_nat() {
       HOP_RANGE="" HOP_EXT_RANGE="" HOP_BACKEND=""
     fi
   fi
-  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口时放不下 XHTTP，请再加一条映射，或先用 Reality + Hysteria2（--no-xhttp）。"
+  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口、又不共用 443 时放不下 XHTTP，请再加一条映射，或加 --xhttp-on-443。"
 }
 
 ensure_sb_user() {
@@ -9262,16 +9355,19 @@ reality_selftest() {
 
 xhttp_selftest() {
   (( ${XHTTP_ENABLED:-0} )) || return 0
-  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PORT && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
+  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
+  local dest=${XHTTP_PORT:-}
+  xhttp_shared && dest=$XRAY_PORT
+  [[ -n $dest ]] || { warn "跳过 XHTTP 自检（缺少端口）。"; return 0; }
   mktmp
   local dir port="" i pid code="" url ok_url="" rc=1
   dir=$(mktemp -d "${TMP_DIR}/xhttp-self.XXXXXX") || { warn "跳过 XHTTP 自检（无法创建临时目录）。"; return 0; }
   for i in 1 2 3 4 5 6 7 8 9 10; do
     port=$(( 20000 + RANDOM % 40000 ))
-    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "${HY2_PORT:-}" ]] && continue
+    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "$dest" || $port == "${HY2_PORT:-}" ]] && continue
     port_in_use tcp "$port" || break
   done
-  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$XHTTP_PORT" --arg sni "$SNI" \
+  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$dest" --arg sni "$SNI" \
       --arg pbk "$PUB_KEY" --arg sid "$SHORT_ID" --arg path "$XHTTP_PATH" \
       --arg pqv "$(pqv_active && printf '%s' "$MLDSA_VERIFY")" '
     {
@@ -9289,7 +9385,11 @@ xhttp_selftest() {
     rm -rf "$dir"; warn "跳过 XHTTP 自检（生成临时配置失败）。"; return 0
   fi
   chmod 600 "${dir}/client.json"
-  info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${XHTTP_PORT}（mode stream-one，SNI ${SNI}）..."
+  if xhttp_shared; then
+    info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${dest}（与 Vision 共用，mode stream-one，SNI ${SNI}）..."
+  else
+    info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${dest}（mode stream-one，SNI ${SNI}）..."
+  fi
   env GOMEMLIMIT=24MiB GOGC=50 "$XRAY_BIN" run -config "${dir}/client.json" >"${dir}/client.log" 2>&1 &
   pid=$!
   for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -10999,7 +11099,7 @@ menu_status() {
     echo
     printf '%s已装协议%s\n' "$C_TITLE" "$C_NONE"
     ui_proto_line "$REALITY_ENABLED" "VLESS + REALITY + Vision" "TCP $(pub_xray_port)"
-    ui_proto_line "$XHTTP_ENABLED" "VLESS + XHTTP + REALITY" "TCP $(pub_xhttp_port)"
+    ui_proto_line "$XHTTP_ENABLED" "VLESS + XHTTP + REALITY" "TCP $(pub_xhttp_port)$(xhttp_shared && echo '（与 Vision 共用）')"
     ui_proto_line "$HY2_ENABLED" "Hysteria2" "UDP $(pub_hy2_port)"
     hr
     printf '%s可选协议%s\n' "$C_TITLE" "$C_NONE"
@@ -12026,6 +12126,21 @@ proto_ensure_port() { # $1 reality|xhttp|hy2|trojan|tuic|anytls ；失败时调�
     esac
   fi
 }
+xhttp_443_apply() { # $1 = 1 共用，0 分开
+  local on=$1
+  (( REALITY_ENABLED && XHTTP_ENABLED )) || { warn "共用端口需要同时打开 Vision 和 XHTTP。"; return 1; }
+  if [[ $on == 1 ]]; then
+    XHTTP_ON_443=1
+    XHTTP_EXT_PORT=""
+  else
+    XHTTP_ON_443=0
+    proto_ensure_port xhttp || { XHTTP_ON_443=1; warn "没有单独的端口，仍与 Vision 共用。"; return 1; }
+  fi
+  apply_proto_services
+  if [[ $on == 1 ]]; then ok "XHTTP 与 Vision 共用 TCP $(pub_xray_port)。"
+  else ok "XHTTP 使用单独端口 $(pub_xhttp_port)。"; fi
+  show_info
+}
 menu_proto() {
   need_node
   [[ -n $OS_ID ]] || detect_os
@@ -12046,8 +12161,17 @@ menu_proto() {
       "VLESS + WebSocket + TLS（CDN）  $([[ $WS_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
       "CDN 的 VLESS Encryption  $(vless_enc_label)"
     printf '%s第 9 项只给第 7、8 项加密，不影响 REALITY 和 Hysteria2。sing-box 内核的客户端可能不支持。%s\n' "$C_DIM" "$C_NONE"
+    if (( REALITY_ENABLED && XHTTP_ENABLED )); then
+      printf '  s) XHTTP 与 Vision 共用 TCP %s    当前: %s\n' "$(pub_xray_port)" "$(xhttp_shared && echo 开 || echo 关)"
+    fi
+    if [[ -n $OPT_XHTTP_ON_443 ]]; then
+      xhttp_443_apply "$OPT_XHTTP_ON_443" || true
+      OPT_XHTTP_ON_443=""
+      return 0
+    fi
     local c kind var
     ask c "请选择" "0"
+    if [[ $c == s || $c == S ]]; then xhttp_443_apply "$(xhttp_shared && echo 0 || echo 1)"; continue; fi
     if [[ $c == 9 ]]; then
       menu_vless_enc
       continue
@@ -12064,6 +12188,14 @@ menu_proto() {
       *) return 0 ;;
     esac
     if (( ${!var} )); then
+      if [[ $kind == reality ]] && xhttp_shared; then
+        XHTTP_ON_443=0
+        if ! proto_ensure_port xhttp; then
+          XHTTP_ON_443=1
+          warn "没有单独的端口给 XHTTP，Vision 保持打开。"
+          continue
+        fi
+      fi
       printf -v "$var" 0
       if ! proto_any_enabled; then
         printf -v "$var" 1
@@ -12081,10 +12213,16 @@ menu_proto() {
           warn "没有打开。REALITY 和原来的协议保持原样。"
           continue
         fi
+      elif [[ $kind == xhttp ]] && (( REALITY_ENABLED )) && confirm "与 Vision 共用 TCP $(pub_xray_port)？" n; then
+        XHTTP_ON_443=1
+        XHTTP_EXT_PORT=""
       elif ! proto_ensure_port "$kind"; then
         printf -v "$var" 0
+        [[ $kind == xhttp ]] && XHTTP_ON_443=0
         warn "没有可用端口，保持关闭。"
         continue
+      else
+        [[ $kind == xhttp ]] && XHTTP_ON_443=0
       fi
       info "已开启。"
     fi
@@ -12275,6 +12413,8 @@ usage() {
   --no-reality        不启用 VLESS + REALITY + Vision（默认启用）
   --no-xhttp          不启用 VLESS + XHTTP + REALITY（默认启用，免自己的域名）
   --xhttp-port <端口> XHTTP 的 TCP 端口（默认 8443；NAT 模式为外部端口）
+  --xhttp-on-443      XHTTP 与 Vision 共用同一个 TCP 端口（默认仍是分开的 8443）
+  --no-xhttp-on-443   XHTTP 使用单独端口
   --trojan            额外启用 Trojan + REALITY（默认不装）
   --no-trojan         关闭 Trojan
   --trojan-port <端口> Trojan TCP 端口（默认 8444）
@@ -12398,6 +12538,8 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy vless-enc     查看 CDN 线路的 VLESS Encryption。on / off 开关，rotate 换新钥匙
                       只重写 Xray 并刷新链接和订阅，不重装；REALITY 等不变
   proxy proto         单独打开或关闭协议（不删除已有密钥）
+  proxy proto xhttp-443 on|off
+                      XHTTP 与 Vision 共用 / 分开 TCP 端口
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
   proxy port          修改端口
@@ -12462,6 +12604,8 @@ parse_args() {
       --no-reality) OPT_REALITY=0 ;;
       --xhttp) OPT_XHTTP=1 ;;
       --no-xhttp) OPT_XHTTP=0 ;;
+      --xhttp-on-443) OPT_XHTTP_ON_443=1; OPT_XHTTP=1 ;;
+      --no-xhttp-on-443) OPT_XHTTP_ON_443=0 ;;
       --xhttp-port) is_port_opt "${2-}" || die "--xhttp-port 参数无效"; OPT_XHTTP_PORT=$2; shift ;;
       --xhttp-port=*) OPT_XHTTP_PORT=${1#*=}; is_port_opt "$OPT_XHTTP_PORT" || die "--xhttp-port 参数无效" ;;
       --trojan) OPT_TROJAN=1 ;;
@@ -12648,7 +12792,16 @@ parse_args() {
       -v|--version|version) echo "$SCRIPT_VERSION"; exit 0 ;;
       install) OPT_ACTION=install ;;
       info|link|links|qr) OPT_ACTION=info ;;
-      proto|protos|protocol) OPT_ACTION=proto ;;
+      proto|protos|protocol)
+        OPT_ACTION=proto
+        if [[ ${2-} == xhttp-443 ]]; then
+          case ${3-} in
+            on|1|enable) OPT_XHTTP_ON_443=1 ;;
+            off|0|disable) OPT_XHTTP_ON_443=0 ;;
+            *) die "用法: proxy proto xhttp-443 on|off" ;;
+          esac
+          shift 2
+        fi ;;
       sni) OPT_ACTION=sni ;;
       regen|rekey) OPT_ACTION=regen ;;
       port|ports) OPT_ACTION=port ;;
@@ -12704,7 +12857,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert

@@ -373,7 +373,7 @@ render_firewall() {
     [[ $1 == tcp_ports && ",$ssh_set," == *",$p,"* ]] && return 0
     printf -v "$1" '%s' "${cur:+$cur,}$p"
   }
-  (( ${XHTTP_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_PORT"
+  (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && fw_add_port tcp_ports "$XHTTP_PORT"
   (( ${TROJAN_ENABLED:-0} )) && fw_add_port tcp_ports "$TROJAN_PORT"
   (( ${ANYTLS_ENABLED:-0} )) && fw_add_port tcp_ports "$ANYTLS_PORT"
   (( ${XHTTP_TLS_ENABLED:-0} )) && fw_add_port tcp_ports "$XHTTP_TLS_PORT"
@@ -758,7 +758,7 @@ fw_collect_want() {
   local p seg
   FW_WANT=""
   (( ${REALITY_ENABLED:-0} == 1 )) && fw_want_add tcp "$XRAY_PORT"
-  (( ${XHTTP_ENABLED:-0} == 1 )) && fw_want_add tcp "$XHTTP_PORT"
+  (( ${XHTTP_ENABLED:-0} == 1 )) && ! xhttp_shared && fw_want_add tcp "$XHTTP_PORT"
   (( ${HY2_ENABLED:-0} == 1 )) && fw_want_add udp "$HY2_PORT"
   (( ${TROJAN_ENABLED:-0} == 1 )) && fw_want_add tcp "$TROJAN_PORT"
   (( ${TUIC_ENABLED:-0} == 1 )) && fw_want_add udp "$TUIC_PORT"
@@ -936,7 +936,10 @@ fw_print_allows() {
   echo
   printf '  %s  %s  %s\n' "$(ui_pad "协议" 22)" "$(ui_pad "类型" 4)" "端口"
   (( ${REALITY_ENABLED:-0} == 1 )) && fw_allow_row "Reality" tcp "$XRAY_PORT"
-  (( ${XHTTP_ENABLED:-0} == 1 )) && fw_allow_row "XHTTP" tcp "$XHTTP_PORT"
+  if (( ${XHTTP_ENABLED:-0} == 1 )); then
+    if xhttp_shared; then fw_allow_row "XHTTP（共用）" tcp "$XRAY_PORT"
+    else fw_allow_row "XHTTP" tcp "$XHTTP_PORT"; fi
+  fi
   (( ${HY2_ENABLED:-0} == 1 )) && fw_allow_row "Hysteria2" udp "$HY2_PORT"
   (( ${TROJAN_ENABLED:-0} == 1 )) && fw_allow_row "Trojan" tcp "$TROJAN_PORT"
   (( ${TUIC_ENABLED:-0} == 1 )) && fw_allow_row "TUIC" udp "$TUIC_PORT"
@@ -986,7 +989,10 @@ cloud_fw_reminder() {
   if (( NAT_MODE )); then
     printf '%s请确认服务商端口映射%s  地址 %s\n' "$C_WARN" "$C_NONE" "$(server_addr)"
     (( REALITY_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  VLESS-REALITY\n' "$XRAY_EXT_PORT" "$XRAY_PORT"
-    (( XHTTP_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP\n' "$XHTTP_EXT_PORT" "$XHTTP_PORT"
+    if (( XHTTP_ENABLED )); then
+      if xhttp_shared; then printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP（与 Vision 共用）\n' "$XRAY_EXT_PORT" "$XRAY_PORT"
+      else printf 'TCP   %-7s → 本机 %-7s  VLESS-XHTTP\n' "$XHTTP_EXT_PORT" "$XHTTP_PORT"; fi
+    fi
     (( TROJAN_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  Trojan\n' "$TROJAN_EXT_PORT" "$TROJAN_PORT"
     (( ANYTLS_ENABLED )) && printf 'TCP   %-7s → 本机 %-7s  AnyTLS\n' "$ANYTLS_EXT_PORT" "$ANYTLS_PORT"
     if (( HY2_ENABLED )); then

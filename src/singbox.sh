@@ -169,10 +169,23 @@ local_pick() { # $1 proto $2 变量 $3 --xx-port $4 名称 $5 允许的进程名
     return 0
   done
 }
+confirm_xhttp_share() {
+  if (( ! XHTTP_ENABLED || ! REALITY_ENABLED )); then XHTTP_ON_443=0; return 0; fi
+  if [[ -n $OPT_XHTTP_ON_443 ]]; then XHTTP_ON_443=$OPT_XHTTP_ON_443; return 0; fi
+  if (( OPT_AUTO )); then return 0; fi
+  local def=n
+  [[ ${XHTTP_ON_443:-0} == 1 ]] && def=y
+  if confirm "XHTTP 与 Vision 共用 TCP ${XRAY_PORT}？（否则 XHTTP 单独监听 ${XHTTP_PORT:-8443}）" "$def"; then
+    XHTTP_ON_443=1
+  else
+    XHTTP_ON_443=0
+  fi
+}
 choose_extra_local() {
   confirm_xhttp
+  confirm_xhttp_share
   local_seed_used
-  if (( XHTTP_ENABLED )); then local_pick tcp XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then local_pick tcp XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" "${XHTTP_PORT:-8443}"; fi
   if (( TROJAN_ENABLED )); then local_pick tcp TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" "${TROJAN_PORT:-8444}"; fi
   if (( ANYTLS_ENABLED )); then local_pick tcp ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" "${ANYTLS_PORT:-8445}"; fi
   if (( TUIC_ENABLED )); then local_pick udp TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" "${TUIC_PORT:-8446}"; fi
@@ -184,10 +197,36 @@ choose_extra_local() {
   fi
   proto_any_enabled || die "至少需要启用一个协议（Reality / XHTTP / Hysteria2 / Trojan / TUIC / AnyTLS）。"
 }
+nat_usable_count() {
+  local n=0 p
+  while read -r p; do
+    [[ -n $p ]] || continue
+    nat_excluded "$p" && continue
+    n=$(( n + 1 ))
+    (( n > 1 )) && break
+  done < <(nat_all_ext)
+  printf '%s' "$n"
+}
 choose_extra_nat() {
   confirm_xhttp
   nat_seed_used
-  if (( XHTTP_ENABLED )); then nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" || XHTTP_ENABLED=0; fi
+  if (( XHTTP_ENABLED && REALITY_ENABLED )); then
+    if [[ -n $OPT_XHTTP_ON_443 ]]; then XHTTP_ON_443=$OPT_XHTTP_ON_443
+    elif [[ $(nat_usable_count) == 1 ]]; then
+      if (( OPT_AUTO )); then
+        XHTTP_ON_443=1
+        info "只有一个 TCP 映射，XHTTP 与 Vision 共用外部端口 ${XRAY_EXT_PORT}。"
+      elif confirm "只有一个 TCP 映射。让 XHTTP 和 Vision 共用外部端口 ${XRAY_EXT_PORT}？" y; then
+        XHTTP_ON_443=1
+      else
+        XHTTP_ON_443=0
+      fi
+    else
+      confirm_xhttp_share
+    fi
+  fi
+  if xhttp_shared; then XHTTP_EXT_PORT=""; info "XHTTP 链接端口与 Vision 相同：$(pub_xray_port)。"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then nat_pick_mapped tcp XHTTP_EXT_PORT XHTTP_PORT "$OPT_XHTTP_PORT" "VLESS-XHTTP（REALITY）" "xray" || XHTTP_ENABLED=0; fi
   if (( TROJAN_ENABLED )); then nat_pick_mapped tcp TROJAN_EXT_PORT TROJAN_PORT "$OPT_TROJAN_PORT" "Trojan（REALITY）" "xray" || TROJAN_ENABLED=0; fi
   if (( ANYTLS_ENABLED )); then nat_pick_mapped tcp ANYTLS_EXT_PORT ANYTLS_PORT "$OPT_ANYTLS_PORT" "AnyTLS" "sing-box" || ANYTLS_ENABLED=0; fi
   if (( TUIC_ENABLED )); then nat_pick_mapped udp TUIC_EXT_PORT TUIC_PORT "$OPT_TUIC_PORT" "TUIC v5" "sing-box" || TUIC_ENABLED=0; fi
@@ -201,7 +240,7 @@ choose_extra_nat() {
       HOP_RANGE="" HOP_EXT_RANGE="" HOP_BACKEND=""
     fi
   fi
-  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口时放不下 XHTTP，请再加一条映射，或先用 Reality + Hysteria2（--no-xhttp）。"
+  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口、又不共用 443 时放不下 XHTTP，请再加一条映射，或加 --xhttp-on-443。"
 }
 
 ensure_sb_user() {

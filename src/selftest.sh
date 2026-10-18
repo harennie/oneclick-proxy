@@ -75,16 +75,19 @@ reality_selftest() {
 
 xhttp_selftest() {
   (( ${XHTTP_ENABLED:-0} )) || return 0
-  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PORT && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
+  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
+  local dest=${XHTTP_PORT:-}
+  xhttp_shared && dest=$XRAY_PORT
+  [[ -n $dest ]] || { warn "跳过 XHTTP 自检（缺少端口）。"; return 0; }
   mktmp
   local dir port="" i pid code="" url ok_url="" rc=1
   dir=$(mktemp -d "${TMP_DIR}/xhttp-self.XXXXXX") || { warn "跳过 XHTTP 自检（无法创建临时目录）。"; return 0; }
   for i in 1 2 3 4 5 6 7 8 9 10; do
     port=$(( 20000 + RANDOM % 40000 ))
-    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "${HY2_PORT:-}" ]] && continue
+    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "$dest" || $port == "${HY2_PORT:-}" ]] && continue
     port_in_use tcp "$port" || break
   done
-  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$XHTTP_PORT" --arg sni "$SNI" \
+  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$dest" --arg sni "$SNI" \
       --arg pbk "$PUB_KEY" --arg sid "$SHORT_ID" --arg path "$XHTTP_PATH" \
       --arg pqv "$(pqv_active && printf '%s' "$MLDSA_VERIFY")" '
     {
@@ -102,7 +105,11 @@ xhttp_selftest() {
     rm -rf "$dir"; warn "跳过 XHTTP 自检（生成临时配置失败）。"; return 0
   fi
   chmod 600 "${dir}/client.json"
-  info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${XHTTP_PORT}（mode stream-one，SNI ${SNI}）..."
+  if xhttp_shared; then
+    info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${dest}（与 Vision 共用，mode stream-one，SNI ${SNI}）..."
+  else
+    info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${dest}（mode stream-one，SNI ${SNI}）..."
+  fi
   env GOMEMLIMIT=24MiB GOGC=50 "$XRAY_BIN" run -config "${dir}/client.json" >"${dir}/client.log" 2>&1 &
   pid=$!
   for i in 1 2 3 4 5 6 7 8 9 10; do

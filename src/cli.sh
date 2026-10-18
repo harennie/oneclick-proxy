@@ -28,6 +28,21 @@ proto_ensure_port() { # $1 reality|xhttp|hy2|trojan|tuic|anytls ；失败时调�
     esac
   fi
 }
+xhttp_443_apply() { # $1 = 1 共用，0 分开
+  local on=$1
+  (( REALITY_ENABLED && XHTTP_ENABLED )) || { warn "共用端口需要同时打开 Vision 和 XHTTP。"; return 1; }
+  if [[ $on == 1 ]]; then
+    XHTTP_ON_443=1
+    XHTTP_EXT_PORT=""
+  else
+    XHTTP_ON_443=0
+    proto_ensure_port xhttp || { XHTTP_ON_443=1; warn "没有单独的端口，仍与 Vision 共用。"; return 1; }
+  fi
+  apply_proto_services
+  if [[ $on == 1 ]]; then ok "XHTTP 与 Vision 共用 TCP $(pub_xray_port)。"
+  else ok "XHTTP 使用单独端口 $(pub_xhttp_port)。"; fi
+  show_info
+}
 menu_proto() {
   need_node
   [[ -n $OS_ID ]] || detect_os
@@ -48,8 +63,17 @@ menu_proto() {
       "VLESS + WebSocket + TLS（CDN）  $([[ $WS_ENABLED == 1 ]] && echo "$on" || echo "$off")" \
       "CDN 的 VLESS Encryption  $(vless_enc_label)"
     printf '%s第 9 项只给第 7、8 项加密，不影响 REALITY 和 Hysteria2。sing-box 内核的客户端可能不支持。%s\n' "$C_DIM" "$C_NONE"
+    if (( REALITY_ENABLED && XHTTP_ENABLED )); then
+      printf '  s) XHTTP 与 Vision 共用 TCP %s    当前: %s\n' "$(pub_xray_port)" "$(xhttp_shared && echo 开 || echo 关)"
+    fi
+    if [[ -n $OPT_XHTTP_ON_443 ]]; then
+      xhttp_443_apply "$OPT_XHTTP_ON_443" || true
+      OPT_XHTTP_ON_443=""
+      return 0
+    fi
     local c kind var
     ask c "请选择" "0"
+    if [[ $c == s || $c == S ]]; then xhttp_443_apply "$(xhttp_shared && echo 0 || echo 1)"; continue; fi
     if [[ $c == 9 ]]; then
       menu_vless_enc
       continue
@@ -66,6 +90,14 @@ menu_proto() {
       *) return 0 ;;
     esac
     if (( ${!var} )); then
+      if [[ $kind == reality ]] && xhttp_shared; then
+        XHTTP_ON_443=0
+        if ! proto_ensure_port xhttp; then
+          XHTTP_ON_443=1
+          warn "没有单独的端口给 XHTTP，Vision 保持打开。"
+          continue
+        fi
+      fi
       printf -v "$var" 0
       if ! proto_any_enabled; then
         printf -v "$var" 1
@@ -83,10 +115,16 @@ menu_proto() {
           warn "没有打开。REALITY 和原来的协议保持原样。"
           continue
         fi
+      elif [[ $kind == xhttp ]] && (( REALITY_ENABLED )) && confirm "与 Vision 共用 TCP $(pub_xray_port)？" n; then
+        XHTTP_ON_443=1
+        XHTTP_EXT_PORT=""
       elif ! proto_ensure_port "$kind"; then
         printf -v "$var" 0
+        [[ $kind == xhttp ]] && XHTTP_ON_443=0
         warn "没有可用端口，保持关闭。"
         continue
+      else
+        [[ $kind == xhttp ]] && XHTTP_ON_443=0
       fi
       info "已开启。"
     fi
@@ -277,6 +315,8 @@ usage() {
   --no-reality        不启用 VLESS + REALITY + Vision（默认启用）
   --no-xhttp          不启用 VLESS + XHTTP + REALITY（默认启用，免自己的域名）
   --xhttp-port <端口> XHTTP 的 TCP 端口（默认 8443；NAT 模式为外部端口）
+  --xhttp-on-443      XHTTP 与 Vision 共用同一个 TCP 端口（默认仍是分开的 8443）
+  --no-xhttp-on-443   XHTTP 使用单独端口
   --trojan            额外启用 Trojan + REALITY（默认不装）
   --no-trojan         关闭 Trojan
   --trojan-port <端口> Trojan TCP 端口（默认 8444）
@@ -400,6 +440,8 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy vless-enc     查看 CDN 线路的 VLESS Encryption。on / off 开关，rotate 换新钥匙
                       只重写 Xray 并刷新链接和订阅，不重装；REALITY 等不变
   proxy proto         单独打开或关闭协议（不删除已有密钥）
+  proxy proto xhttp-443 on|off
+                      XHTTP 与 Vision 共用 / 分开 TCP 端口
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
   proxy port          修改端口
@@ -464,6 +506,8 @@ parse_args() {
       --no-reality) OPT_REALITY=0 ;;
       --xhttp) OPT_XHTTP=1 ;;
       --no-xhttp) OPT_XHTTP=0 ;;
+      --xhttp-on-443) OPT_XHTTP_ON_443=1; OPT_XHTTP=1 ;;
+      --no-xhttp-on-443) OPT_XHTTP_ON_443=0 ;;
       --xhttp-port) is_port_opt "${2-}" || die "--xhttp-port 参数无效"; OPT_XHTTP_PORT=$2; shift ;;
       --xhttp-port=*) OPT_XHTTP_PORT=${1#*=}; is_port_opt "$OPT_XHTTP_PORT" || die "--xhttp-port 参数无效" ;;
       --trojan) OPT_TROJAN=1 ;;
@@ -650,7 +694,16 @@ parse_args() {
       -v|--version|version) echo "$SCRIPT_VERSION"; exit 0 ;;
       install) OPT_ACTION=install ;;
       info|link|links|qr) OPT_ACTION=info ;;
-      proto|protos|protocol) OPT_ACTION=proto ;;
+      proto|protos|protocol)
+        OPT_ACTION=proto
+        if [[ ${2-} == xhttp-443 ]]; then
+          case ${3-} in
+            on|1|enable) OPT_XHTTP_ON_443=1 ;;
+            off|0|disable) OPT_XHTTP_ON_443=0 ;;
+            *) die "用法: proxy proto xhttp-443 on|off" ;;
+          esac
+          shift 2
+        fi ;;
       sni) OPT_ACTION=sni ;;
       regen|rekey) OPT_ACTION=regen ;;
       port|ports) OPT_ACTION=port ;;
@@ -706,7 +759,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert

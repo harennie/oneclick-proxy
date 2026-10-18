@@ -234,7 +234,7 @@ menu_status() {
     echo
     printf '%s已装协议%s\n' "$C_TITLE" "$C_NONE"
     ui_proto_line "$REALITY_ENABLED" "VLESS + REALITY + Vision" "TCP $(pub_xray_port)"
-    ui_proto_line "$XHTTP_ENABLED" "VLESS + XHTTP + REALITY" "TCP $(pub_xhttp_port)"
+    ui_proto_line "$XHTTP_ENABLED" "VLESS + XHTTP + REALITY" "TCP $(pub_xhttp_port)$(xhttp_shared && echo '（与 Vision 共用）')"
     ui_proto_line "$HY2_ENABLED" "Hysteria2" "UDP $(pub_hy2_port)"
     hr
     printf '%s可选协议%s\n' "$C_TITLE" "$C_NONE"

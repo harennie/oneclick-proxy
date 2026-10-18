@@ -717,10 +717,30 @@ ensure_hy_user() {
 
 # 需要绑定 1024 以下端口时才申请 CAP_NET_BIND_SERVICE（老内核 / OpenVZ 不支持 ambient capabilities）
 need_bind_cap() { (( ${1:-0} > 0 && ${1:-0} < 1024 )); }
+# 1 = XHTTP 走 Vision 的同一个 TCP 端口（fallbacks），不再单独监听 8443
+xhttp_shared() { (( ${XHTTP_ON_443:-0} == 1 && ${XHTTP_ENABLED:-0} == 1 && ${REALITY_ENABLED:-0} == 1 )); }
+xhttp_fallback_prepare() {
+  XHTTP_FB_DEST="" XHTTP_FB_LISTEN="" XHTTP_FB_PORT=0
+  if [[ -d /dev/shm && -w /dev/shm ]]; then
+    rm -f /dev/shm/xray-xhttp.sock
+    XHTTP_FB_DEST="/dev/shm/xray-xhttp.sock"
+    XHTTP_FB_LISTEN="/dev/shm/xray-xhttp.sock,0666"
+    return 0
+  fi
+  local p=32768
+  while (( p < 32820 )); do
+    port_in_use tcp "$p" || break
+    p=$(( p + 1 ))
+  done
+  (( p < 32820 )) || die "没有可用的本机回环端口给 XHTTP 回落。"
+  XHTTP_FB_PORT=$p
+  XHTTP_FB_DEST="127.0.0.1:${p}"
+  XHTTP_FB_LISTEN="127.0.0.1"
+}
 xray_need_cap() {
   if (( ${LAND_MODE:-0} )); then need_bind_cap "$XRAY_PORT"; return; fi
   (( ${REALITY_ENABLED:-1} )) && need_bind_cap "$XRAY_PORT" && return 0
-  (( ${XHTTP_ENABLED:-0} )) && need_bind_cap "$XHTTP_PORT" && return 0
+  (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && need_bind_cap "$XHTTP_PORT" && return 0
   (( ${TROJAN_ENABLED:-0} )) && need_bind_cap "$TROJAN_PORT" && return 0
   (( ${XHTTP_TLS_ENABLED:-0} )) && need_bind_cap "$XHTTP_TLS_PORT" && return 0
   (( ${WS_ENABLED:-0} )) && need_bind_cap "$WS_PORT" && return 0
@@ -1359,12 +1379,15 @@ write_xray_config() {
     ensure_outbound_ip
     land_xray_json >"$tmp" || die "生成落地机 Xray 配置失败。"
   else
+  local share=0
+  if xhttp_shared; then share=1; xhttp_fallback_prepare; fi
   jq -n \
     --argjson port "$XRAY_PORT" --argjson clients "$clients" --argjson cplain "$cplain" --argjson tclients "$tclients" \
     --argjson reality "${REALITY_ENABLED:-0}" --argjson xhttp "${XHTTP_ENABLED:-0}" --argjson trojan "${TROJAN_ENABLED:-0}" \
     --argjson xport "${XHTTP_PORT:-0}" --argjson tport "${TROJAN_PORT:-0}" --arg xpath "${XHTTP_PATH:-/xhttp}" \
     --arg target "${SNI_TARGET:-$SNI:443}" --arg sni "$SNI" \
-    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$seed" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" '
+    --arg priv "$PRIV_KEY" --arg sid "$SHORT_ID" --arg seed "$seed" --argjson nat "${NAT_MODE:-0}" --argjson privnets "$PRIV_NETS_JSON" \
+    --argjson share "$share" --arg fbdest "${XHTTP_FB_DEST:-}" --arg fblisten "${XHTTP_FB_LISTEN:-}" --argjson fbport "${XHTTP_FB_PORT:-0}" '
   def reality: {
     show: false, target: $target, xver: 0,
     serverNames: [$sni], privateKey: $priv, shortIds: [$sid]
@@ -1376,11 +1399,31 @@ write_xray_config() {
       []
       + (if $reality == 1 then [{
           tag: "vless-reality", port: $port, protocol: "vless",
-          settings: {clients: $clients, decryption: "none"},
+          settings: ({clients: $clients, decryption: "none"}
+            + (if $share == 1 then {fallbacks: [{dest: $fbdest, xver: 0}]} else {} end)),
           streamSettings: {network: "raw", security: "reality", realitySettings: reality},
           sniffing: sniff
         }] else [] end)
-      + (if $xhttp == 1 then [{
+      + (if $xhttp == 1 then
+          if $share == 1 then
+            [(if $fbport == 0 then {
+                tag: "vless-xhttp", listen: $fblisten, protocol: "vless",
+                settings: {clients: $cplain, decryption: "none"},
+                streamSettings: {
+                  network: "xhttp", security: "none",
+                  xhttpSettings: {path: $xpath, mode: "stream-one"}
+                },
+                sniffing: sniff
+              } else {
+                tag: "vless-xhttp", listen: $fblisten, port: $fbport, protocol: "vless",
+                settings: {clients: $cplain, decryption: "none"},
+                streamSettings: {
+                  network: "xhttp", security: "none",
+                  xhttpSettings: {path: $xpath, mode: "stream-one"}
+                },
+                sniffing: sniff
+              } end)]
+          else [{
           tag: "vless-xhttp", port: $xport, protocol: "vless",
           settings: {clients: $cplain, decryption: "none"},
           streamSettings: {
@@ -1389,7 +1432,8 @@ write_xray_config() {
             realitySettings: reality
           },
           sniffing: sniff
-        }] else [] end)
+        }] end
+        else [] end)
       + (if $trojan == 1 then [{
           tag: "trojan-reality", port: $tport, protocol: "trojan",
           settings: {clients: $tclients},
