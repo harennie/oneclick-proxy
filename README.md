@@ -107,7 +107,7 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--zerossl-kid <id>` / `--zerossl-hmac <key>` | ZeroSSL 的 EAB 凭据，必须成对。在 <https://app.zerossl.com/developer> 生成 |
 | `--sub-port <端口>` | 订阅 HTTPS 端口，默认 8447（不能是 80，也不能占用已开启协议的 TCP 端口）。源站证书不会打开订阅 |
 | `--no-cert` | 关闭已申请的证书，Hysteria2 / TUIC / AnyTLS 改回自签。开着的 CDN 线路一并关掉（不能改用自签） |
-| `--firewall <模式>` | `strict` 入站默认拒绝；`allow` 只放行代理端口和端口跳跃，不把入站改成默认拒绝，也不改 Docker 的表；`off` 不写 nftables。不写时：干净机器默认 `strict`；检测到 Docker/Podman、WireGuard、已有防火墙或多个非标准端口时，交互安装默认推荐 `allow`，非交互安装直接用 `allow` |
+| `--firewall <模式>` | `strict` 入站默认拒绝；`allow` 只放行代理端口和端口跳跃，不把入站改成默认拒绝，也不改 Docker 的表；`off` 不写 nftables。不写时：干净机器默认 `strict`；检测到 Docker/Podman、WireGuard、已有防火墙或多个非标准端口时，交互安装默认推荐 `allow`，非交互安装直接用 `allow`。`allow` 时若 ufw 或 firewalld 正在运行，会把同样的端口写进去 |
 | `--no-firewall` | 不配置 nftables 防火墙（同 `--firewall off`） |
 | `--no-upgrade` | 跳过系统软件包升级 |
 | `--no-tune` | 跳过 sysctl 调优 |
@@ -184,16 +184,17 @@ proxy proto
   - 以 `nobody` 运行，配置文件 `root:nogroup 640`，私钥/种子只保存在 `/root/.proxy-oneclick/state.env`（600），不会在屏幕上显示；
   - 屏蔽访问服务器内网（geoip:private）与 BT。
   - 官方脚本遇到 GitHub API 限流（403）时，会自动改为“指定最新版本号”重试。
+  - 更新前把当前程序备份为 `/usr/local/bin/xray.bak`。该目录剩余空间不足 50 MB 时跳过备份并警告。直接下载时先在临时文件上跑 `version`，并对当前配置跑 `xray run -test`，通过后才替换。官方安装脚本会自己写入程序，脚本在写完后做同样的检查，不通过就恢复备份。可用 `--xray-ver <标签>` 安装指定的已发布版本。
   - **安装后 REALITY 自检**：用已安装的 xray 在 127.0.0.1 随机端口起一个临时客户端，按生成的链接参数连接本机节点并访问外网，打印通过 / 未通过（不影响安装；更换 SNI 后也会自动自检）。临时客户端限制 `GOMEMLIMIT`，128MB 的 NAT 小鸡也能跑。
 - **REALITY 目标网站自动优选**（见下文「为什么 SNI 规则很重要」）。
-- **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。Cloudflare 源站证书不会交给 Hysteria2。
-- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，不改 Docker / Podman 自己的表。模式为 `strict`（入站默认拒绝，干净机器的默认）、`allow`（只放行代理端口和端口跳跃，不接管入站策略；检测到 Docker/Podman、WireGuard 或其它 UDP、已有 nftables/iptables/ufw/firewalld，或多个非标准监听端口时，交互安装默认推荐它，非交互且未指定 `--firewall` 时直接用它）或 `off`（`--no-firewall`，不写规则）。严格模式放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有 HTTP-01（Let's Encrypt / ZeroSSL 的单域名或多域名）才额外放行 TCP 80。只有公开证书才放行订阅 HTTPS 端口。通配符 DNS-01 和 Cloudflare 源站证书不放行 80，源站证书也不开订阅。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时询问是否停用（卸载时可恢复）。不会关闭 SELinux（写入文件后执行 `restorecon`）。防火墙菜单、运行状态和安装结束时会逐行列出已经放行的端口，以及每一条属于哪个协议（Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS、CDN 的 XHTTP 与 WebSocket、订阅、证书申请的 TCP 80、SSH、端口跳跃，以及额外放行）。严格模式下，没写出来的新连接仍然拒绝；只放行模式不会丢掉其它端口。装好后可用 `proxy firewall strict`、`proxy firewall allow`、`proxy firewall off` 切换。
+- **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。Cloudflare 源站证书不会交给 Hysteria2。更新前备份为 `hysteria.bak`（剩余空间不足 50 MB 时跳过并警告）。Hysteria2 没有配置检查命令，只确认新程序能跑 `version`。可用 `--hy2-ver <标签>`（例如 `v2.6.1`）安装指定版本。
+- **防火墙（nftables）**：独立表 `inet proxy_oneclick`，不改 Docker / Podman 自己的表。模式为 `strict`（入站默认拒绝，干净机器的默认）、`allow`（只放行代理端口和端口跳跃，不接管入站策略；检测到 Docker/Podman、WireGuard 或其它 UDP、已有 nftables/iptables/ufw/firewalld，或多个非标准监听端口时，交互安装默认推荐它，非交互且未指定 `--firewall` 时直接用它；已经装过又没写 `--firewall` 则沿用保存的模式，fail2ban 的 nftables 表不算已有规则）或 `off`（`--no-firewall`，不写规则）。严格模式放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有 HTTP-01（Let's Encrypt / ZeroSSL 的单域名或多域名）才额外放行 TCP 80。只有公开证书才放行订阅 HTTPS 端口。通配符 DNS-01 和 Cloudflare 源站证书不放行 80，源站证书也不开订阅。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时，严格模式会询问是否停用（卸载时可恢复）；只放行模式，或选择保留它们时，会把当前代理端口和 Hysteria2 跳跃范围写进正在运行的 ufw（注释 `proxy-oneclick`）或 firewalld 默认区域，并记在 `/root/.proxy-oneclick/fw-host.list`。已经存在的放行（不论原来的注释）不会改注释，也不会记进这份清单。SSH 不记进清单，清理时也不会删。改端口、关协议、切换模式和卸载时只按清单删除本脚本自己加的规则。本机没有 ufw 也没有 firewalld 时这一步不做。不会关闭 SELinux（写入文件后执行 `restorecon`）。防火墙菜单、运行状态和安装结束时会逐行列出已经放行的端口，以及每一条属于哪个协议（Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS、CDN 的 XHTTP 与 WebSocket、订阅、证书申请的 TCP 80、SSH、端口跳跃，以及额外放行），并写出已经同步到 ufw / firewalld 的条目。严格模式下，没写出来的新连接仍然拒绝；只放行模式不会丢掉其它端口。装好后可用 `proxy firewall strict`、`proxy firewall allow`、`proxy firewall off` 切换。
 - **fail2ban**：sshd 监狱，10 分钟内失败 5 次封禁 1 小时（systemd 日志后端 + nftables 动作）。
-- **XHTTP（默认开启）**：VLESS + XHTTP + REALITY。与 Vision 共用同一把 x25519、ShortId、SNI 和 ML-DSA-65 种子，单独监听 TCP 8443，`flow` 必须为空，路径为随机 `/` + 十六进制。服务端和客户端链接的 `mode` 都是 `stream-one`（REALITY 直连；客户端用 `auto` 时有已知握手失败）。不需要自己的域名，也不把自己的证书挂到 XHTTP 上。这条和下面的「XHTTP + TLS（CDN）」是两条入站，互不替换。
-- **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。Cloudflare 源站证书不会交给它们。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
+- **XHTTP（默认开启）**：VLESS + XHTTP + REALITY。与 Vision 共用同一把 x25519、ShortId、SNI 和 ML-DSA-65 种子，默认单独监听 TCP 8443，`flow` 必须为空，路径为随机 `/` + 十六进制。服务端和客户端链接的 `mode` 都是 `stream-one`（REALITY 直连；客户端用 `auto` 时有已知握手失败）。不需要自己的域名，也不把自己的证书挂到 XHTTP 上。这条和下面的「XHTTP + TLS（CDN）」是两条入站，互不替换。加上 `--xhttp-on-443`（或 `proxy proto xhttp-443 on`）后，Vision 的入站用 Xray fallbacks 把非 Vision 流量交给本机的 XHTTP 入站（优先 `/dev/shm/xray-xhttp.sock`，没有则用 127.0.0.1），链接端口、SNI、公钥和 ShortId 与 Vision 相同，防火墙不再单独放行 8443。已有安装默认仍是分开的 8443。NAT 只有一个 TCP 映射时，安装会建议或直接启用共用。
+- **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。Cloudflare 源站证书不会交给它们。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。更新 sing-box 时同样先备份为 `sing-box.bak`（空间不足 50 MB 则跳过），临时文件要通过 `version` 和 `sing-box check` 才替换。可用 `--singbox-ver <标签>` 安装指定版本。
 - **CDN 上的两条线路（默认关闭）**：VLESS + XHTTP + TLS（TCP 2083，`mode=packet-up`）和 VLESS + WebSocket + TLS（TCP 2087）。用公开证书，或只用这两条时改用 Cloudflare 源站证书。都不是 REALITY。打开时脚本会打印 DNS、橙色云朵、回源端口、加密模式和客户端链接该怎么填。详见「经过 CDN 的两条线路」。
 - **输出**：每个已开启协议单独一块：名称、地址、端口各一行，链接本身最后单独一行。vless://（含 / 不含 pqv）、xhttp 的 vless://（`mode=stream-one`，无 flow）、hysteria2://（未申请证书时带 `mport`、`sni`、`insecure=1`、`pinSHA256`；申请之后地址和 SNI 为自有域名，不再带 insecure / pin）、可选的 trojan:// / tuic:// / anytls://。打开 CDN 线路后另有两条 vless://（`security=tls`，没有 flow / pbk / sid / pqv / insecure）。终端二维码，mihomo（Clash.Meta）YAML 片段。申请公开证书后另有仅 HTTPS 的订阅地址。源站证书没有订阅。
-- **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」，第 17 项是「申请证书」，第 18 项是「回程线路检测」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
+- **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」，第 17 项是「申请证书」，第 18 项是「回程线路检测」，第 19 项是「导出配置」，第 20 项是「导入配置」，第 21 项是「健康检查」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
 - **回程线路检测**：`proxy route` 只测从本机发向大陆的回程（电信 / 联通 / 移动，北京 / 上海 / 广州）。用 nexttrace 的 TCP，缺了会自动装。结果是一张短表和按运营商的汇总，不测国际线路，也不测从家里到本机的去程。不改配置，不重启。详见「回程线路检测」。
 - **落地机 / 落地转发**：`--land` 把本机装成只跑 Shadowsocks 2022 的出口（落地机）；已安装的节点用 `proxy land-add 'ss://...'` 把出口切到落地机（中转），见下文。
 - **健壮性**：`set -o errexit -o pipefail -o errtrace` + 错误陷阱提示出错行；可重复运行（保留已有密钥，只更新组件与配置）；安装前检查端口占用；没有 IPv6 也能正常工作（链接使用 IPv4）；通过 shellcheck 检查。
@@ -780,11 +781,11 @@ bash proxy.sh --auto --firewall allow
 bash proxy.sh --firewall off
 ```
 
-不写 `--firewall` 时，安装会先看这台机器：Docker 或 Podman（含 iptables-nft 里的转发链和发布端口）、WireGuard 或其它 UDP 监听、已经存在的 nftables / iptables / ufw / firewalld，以及多个非标准对外端口。有这些情况时，交互安装默认推荐「只放行」，并写明原因；干净机器默认仍是「严格」。`--auto` 且没有写 `--firewall` 时，发现上述情况就直接用 `allow`，否则用 `strict`。显式写了 `--firewall strict` 时按严格模式执行，并提示可能受影响的服务。
+不写 `--firewall` 时，安装会先看这台机器：Docker 或 Podman（含 iptables-nft 里的转发链和发布端口）、WireGuard 或其它 UDP 监听、已经存在的 nftables / iptables / ufw / firewalld，以及多个非标准对外端口。fail2ban 自己的表（`f2b-table` 以及名字里带 fail2ban 的表）不算「已有 nftables 规则」，本脚本配置 fail2ban 时就会建这张表。有这些情况时，交互安装默认推荐「只放行」，并写明原因；干净机器默认仍是「严格」。`--auto` 且没有写 `--firewall` 时，发现上述情况就直接用 `allow`，否则用 `strict`。已经安装过再执行（重装或带 `--auto` 的更新）且没有写 `--firewall` 时，沿用 `state.env` 里保存的模式，不会因为 fail2ban 的表从严格改成只放行。显式写了 `--firewall strict` 时按严格模式执行，并提示可能受影响的服务。
 
-SSH：严格模式在加载前探测 SSH 端口（`sshd -T`、配置文件、正在监听的 sshd、ssh.socket、当前会话端口）。探测不到时至少放行 22，并且先放行已建立连接。规则里如果缺了当前 SSH 端口，会改成只放行而不是加载默认拒绝。`allow` 和 `off` 不改入站策略，本来就不会把 SSH 关在外面。
+SSH：严格模式在加载前探测 SSH 端口（`sshd -T`、配置文件、正在监听的 sshd、ssh.socket、当前会话端口）。探测不到时至少放行 22，并且先放行已建立连接。规则里如果缺了当前 SSH 端口，会改成只放行而不是加载默认拒绝。`allow` 和 `off` 不改入站策略，本来就不会把 SSH 关在外面。写进 ufw / firewalld 时也不记录、不删除 SSH 规则。重新启用被本脚本停掉的 ufw 之前，会先确认 SSH 端口已经放行。
 
-检测到 firewalld / ufw 时，只有选择严格模式才会询问是否停用（卸载时可恢复）。只放行模式留着它们，需要的端口还要在那边放行。
+检测到 firewalld / ufw 时，只有选择严格模式才会询问是否停用（卸载时可恢复）。Debian 上 fail2ban 带有 `PartOf=firewalld.service`，停用 firewalld 会把 fail2ban 一起停掉；若停用前 fail2ban 正在运行，脚本会再把它拉起来。ufw 也一样处理。只放行模式留着它们，并把当前代理端口和端口跳跃写进去：写入前先看 ufw 里有没有已经盖住该端口的放行（`ufw status numbered` / `ufw show added`，不看注释），有就跳过，避免 `ufw allow` 把用户原来的注释改成 `proxy-oneclick` 后再被清掉。本脚本新加的规则才写注释 `proxy-oneclick`（范围写成 `20000:50000/udp`）。firewalld 用 `--query-port`，已有端口不重复添加；范围写成 `20000-50000/udp`，写完重载一次。记录在 `/root/.proxy-oneclick/fw-host.list`。改端口、关协议、切到严格或关闭、卸载时，只按这份记录删除本脚本自己加的规则，不删用户自己加的，也不删 SSH。从严格切回只放行时，若严格模式停过 ufw，会先放行 SSH 再重新启用。选严格但选择保留 ufw / firewalld 时也走同一套同步。本机没有正在运行的 ufw 或 firewalld（例如 Alpine）时，这一步不做。`apt purge` 之后 systemd 里的 ufw.service / firewalld.service 仍可能显示 active (exited)；命令（`ufw` / `firewall-cmd`）或单元文件已经不在时，不再把它当成正在运行的防火墙。安装结束、`proxy firewall` 和 `proxy status` 会列出已经同步的条目。
 
 装好之后切换，不重装：
 
@@ -795,7 +796,7 @@ proxy firewall allow
 proxy firewall off
 ```
 
-菜单「防火墙管理」里是同样的三项。卸载会删掉本脚本的表和 `proxy-oneclick-fw` 服务。NAT 模式不使用这套入站防火墙。落地机的来源白名单仍是单独的表 `inet proxy_oneclick_land`，只限制落地端口的来源，不是默认拒绝。
+菜单「防火墙管理」里是同样的三项。`proxy firewall off` 会删掉本脚本写进 ufw / firewalld 的放行。这两个防火墙如果还开着，会额外警告：默认拒绝会挡住代理端口，可再执行 `proxy firewall allow`，或自行停用那个防火墙。卸载会删掉本脚本的表和 `proxy-oneclick-fw` 服务。NAT 模式不使用这套入站防火墙。落地机的来源白名单仍是单独的表 `inet proxy_oneclick_land`，只限制落地端口的来源，不是默认拒绝。
 
 </details>
 
@@ -859,7 +860,7 @@ proxy
 █▀▀▀█ █▀▀▀█
 █ 哈 █ █ 人 █
 █▄▄▄█ █▄▄▄█
-oneclick proxy  ·····  v1.5.0
+oneclick proxy  ·····  v1.6.0
 
 IP        ▶ …              Xray      ▶ …
 Hysteria2 ▶ …              sing-box  ▶ 未安装
@@ -877,18 +878,37 @@ Hysteria2 ▶ …              sing-box  ▶ 未安装
  7. 更新 Xray / Hysteria2 / 脚本      16. 协议开关
  8. 运行状态 / 日志                   17. 申请证书
  9. 网络测速 / 延迟提示               18. 回程线路检测
+19. 导出配置（迁到另一台机器）       20. 导入配置
+21. 健康检查
 ────────────────────────────────
   0. 退出
 ════════════════════════════════
 ```
 
-NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 15 项（没有客户端直连协议，第 12 项仍是回程线路检测，第 13–15 项是出口：本机直连 / 加密转发 / 原样转发），框标题同样是 `oneclick proxy`。
+NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 18 项（没有客户端直连协议，第 12 项仍是回程线路检测，第 13–15 项是出口：本机直连 / 加密转发 / 原样转发，第 16–17 项是导出和导入，第 18 项是健康检查），框标题同样是 `oneclick proxy`。
+
+**修改端口**（第 5 项，或 `proxy port`）：可以改 Reality 的 TCP、Hysteria2 的 UDP，以及单独监听的 XHTTP 端口。命令行：`proxy port --xhttp-port 9443`（也可同时写 `--port`、`--hy2-port`）。XHTTP 与 Vision 共用端口时，改 Reality 的端口即可。改完会重写配置并重启；若安装时把代理端口同步进了正在运行的 ufw 或 firewalld，旧端口的本脚本规则会删掉，新端口会补上。NAT 模式改的是外部映射端口。
 
 **协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS，以及 CDN 上的 XHTTP+TLS（第 7 项）、WebSocket+TLS（第 8 项）。第 9 项开关这两条的 VLESS Encryption，并显示当前状态。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径、CDN 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥和 CDN 路径，但不会把已关闭的协议重新打开。已申请公开证书时，重新生成密钥不会把 Hysteria2 / TUIC / AnyTLS 换回自签证书。打开 CDN 线路时会打印教程并做一次检查。想再看教程：`proxy cdn`。
 
 **申请证书**（第 17 项，或 `proxy cert`）：选择种类并申请、续期、查看链接，或关闭证书。默认仍是 Let's Encrypt 单域名。见「申请证书」。
 
 **回程线路检测**（第 18 项，落地机菜单第 12 项，或 `proxy route`）：见「回程线路检测」。只探测，不改已经装好的协议。
+
+**导出 / 导入**（第 19、20 项，落地机菜单第 16、17 项）：把重建同一批节点需要的密钥打成权限 600 的 tar.gz。里面有 UUID、Reality 私钥、ShortId、ML-DSA-65 种子、SNI、监听端口、XHTTP 路径、各协议密码、Shadowsocks 2022 密钥、落地 / 中转配置、调优参数（不含网卡名），以及 Hysteria2 / TUIC / AnyTLS 的自签证书和已经申请的公开证书。不放公网 IPv4 / IPv6、NAT 地址和端口映射、虚拟化类型、内存档位。导入时重新检测这些，并重新检查 SNI、防火墙和证书。
+
+```bash
+proxy export
+proxy export /root/node.tar.gz
+proxy export --password
+PROXY_EXPORT_PASS='...' proxy export /root/node.tar.gz.enc
+proxy import /root/node.tar.gz
+bash proxy.sh --import /root/node.tar.gz --auto
+```
+
+`--password` 会询问密码（不回显），用 `openssl enc -aes-256-cbc -pbkdf2` 加密。也可以把密码放在环境变量 `PROXY_EXPORT_PASS`。没有终端、也没有这个环境变量时，命令会直接退出并提示设置 `PROXY_EXPORT_PASS`，不会停在那里等输入。不会把密钥打成一行 base64 放在命令行里。NAT 机器导入后要重新填映射，例如再加上 `--nat-ports`。
+
+**健康检查**（第 21 项，落地机菜单第 18 项，或 `proxy doctor`）：只读。依次看时间偏差（Cloudflare `cdn-cgi/trace` 的 `ts=`，超过 15 秒提醒）、服务是否在跑、端口是否在听、最近有没有内存不足或崩溃、nftables 表和已放行端口、ufw/firewalld 同步、Hysteria2 端口跳跃的 DNAT 和计数器（没有计数器的旧规则只记 INFO，重新应用防火墙后规则会带上 counter）、SNI 是否还合格、REALITY / XHTTP 回环自检、外部检查命令，以及公开证书是否快到期（不足 7 天提醒）。有失败项时退出码非 0。`proxy doctor --fix` 只做安全修复：拉起已停止的服务、`chronyc makestep` 或重启 timesyncd / OpenRC chronyd、按清单重写 ufw/firewalld、把 `state.env` 改成 600。修好之后会再查一遍，并列出这次修好的项目；原先失败的都已通过时退出码为 0。仍有失败则退出码非 0。不加 `--fix` 时不改任何配置。
 
 **切换 NAT 模式**（第 15 项，落地机菜单为第 11 项）：`自动`（默认：Alpine 强制 NAT、LXC/OpenVZ 容器安装时询问、已安装的沿用原模式）/ `开`（强制 NAT 映射端口流程，等同 `--nat`）/ `关`（强制普通模式，等同 `--no-nat`；Alpine 不可用）。在第 1 或 13 项安装前选择即可；设置保存在 `state.env`（`NAT_PREF`），之后的修改端口等操作都按它执行。已安装时切换到不同模式会提示立即重新安装（保留密钥 / UUID）；命令行 `--nat` / `--no-nat` 优先并同步该设置。
 
@@ -910,11 +930,22 @@ proxy sni
 proxy user
 ```
 
-**更新 Xray / Hysteria2 / 脚本**
+**更新 Xray / Hysteria2 / sing-box / 脚本**
 
 ```bash
 proxy update
+proxy update --xray-ver v26.3.27
+proxy update --hy2-ver v2.6.1
+proxy update --singbox-ver v1.11.0
+proxy update --rollback
+proxy update --rollback xray
 ```
+
+更新 Xray、Hysteria2 或 sing-box 之前，把正在用的程序复制为同目录的 `.bak`（例如 `/usr/local/bin/xray.bak`）。这个目录剩余空间不足 50 MB 时跳过备份，并给出警告。直接下载的新程序先放在临时路径：Xray 要能跑 `version`，并且对当前配置 `xray run -test` 通过；sing-box 要能跑 `version` 和 `sing-box check`；Hysteria2 没有配置检查，只跑 `version`。通过之后才替换原来的文件。未指定版本时，官方安装脚本会自己写入程序，脚本在它写完后立刻做同样的检查，不通过就恢复备份。指定 `--xray-ver` 时不走官方安装脚本：把该版本的发布包下载到临时目录，用当前配置跑过 `version` 和 `xray run -test` 之后，才备份程序和 `geoip.dat` / `geosite.dat` 并替换。校验失败不会改正在使用的文件，也不会用一份和当前程序相同的副本盖掉已有的 `.bak`。回滚 Xray 或启动失败自动换回时，地理数据文件一起恢复。换成新版本后如果服务没有起来，会自动恢复 `.bak`，并写明版本变化。
+
+`--xray-ver`、`--hy2-ver`、`--singbox-ver` 在安装和 `proxy update` 里都能用。版本号必须是 GitHub 上已经发布的标签。Hysteria2 可以写 `v2.6.1` 或 `app/v2.6.1`。`--xray-ver` 下载的是该标签的官方 zip，不是安装脚本；临时程序没通过当前配置的检查时，现有程序、geo 文件和 `.bak` 都保持原样。`proxy update` 带了这些参数或 `--rollback` 时不再进入菜单，只处理写出的内核。
+
+`--rollback` 用 `.bak` 换回程序并重启对应服务（systemd 和 OpenRC 都支持），打印 `旧版本 -> 新版本`。目标是 `xray`、`hy2`、`singbox` 或 `all`，不写就是 `all`。`all` 碰到没有 `.bak` 的组件会跳过并警告。点名了某一个（例如 `--rollback hy2`）但没有对应 `.bak` 时，命令失败退出。菜单第 7 项（落地机菜单第 6 项）里选「回滚到备份」是同一件事。
 
 **只更新本脚本**（proxy 命令）
 
@@ -937,7 +968,7 @@ proxy firewall allow
 proxy firewall off
 ```
 
-`proxy status` 里是同一份列表；选「查看 nftables 原文」才是规则原文。严格模式入站默认拒绝。只放行模式只添加 accept，不把入站改成默认拒绝。
+`proxy status` 里是同一份列表；选「查看 nftables 原文」才是规则原文。严格模式入站默认拒绝。只放行模式只添加 accept，不把入站改成默认拒绝；ufw 或 firewalld 正在运行时，同一份端口会写进它们，并在列表下面标出已同步的条目。
 
 **BBR 状态、到 SNI 的延迟、下载测速**（Cloudflare / CacheFly / OVH 自动切换）
 
@@ -1042,7 +1073,7 @@ proxy uninstall
 proxy uninstall --auto
 ```
 
-会移除：Xray、Hysteria2（含 hysteria 用户）、sing-box（若装过 TUIC / AnyTLS）、nftables 表与 systemd 单元、sysctl / limits / journald 配置（并恢复调优前的参数值）、fail2ban 规则、`proxy` 命令、节点信息；可选择是否删除密钥与备份目录；安装时被停用的 firewalld / ufw 会询问是否恢复。安装时创建的 `/swapfile` 会保留（附删除方法）。NAT 模式还会移除 OpenRC 服务脚本、日志目录、端口跳跃规则，并恢复 `--dns64` 修改前的 `/etc/resolv.conf`。落地机还会移除白名单规则表、原样转发 DNAT 与对应开机服务，并恢复原样转发改过的 IP 转发开关。若申请过证书，还会停掉订阅和续期、删除证书副本与订阅文件、CDN 标记和交给 Xray 的那份证书副本，并删除 certbot 里名为 `proxy-oneclick` 的那张证书；不卸载 certbot 软件包。最后别忘了在云控制台关闭不再需要的端口。
+会移除：Xray、Hysteria2（含 hysteria 用户）、sing-box（若装过 TUIC / AnyTLS）、nftables 表与 systemd 单元、sysctl / limits / journald 配置（并恢复调优前的参数值）、fail2ban 规则、`proxy` 命令、节点信息；可选择是否删除密钥与备份目录；安装时被停用的 firewalld / ufw 会询问是否恢复；恢复 ufw 之前会先放行 SSH 端口。安装时创建的 `/swapfile` 会保留（附删除方法）。NAT 模式还会移除 OpenRC 服务脚本、日志目录、端口跳跃规则，并恢复 `--dns64` 修改前的 `/etc/resolv.conf`。落地机还会移除白名单规则表、原样转发 DNAT 与对应开机服务，并恢复原样转发改过的 IP 转发开关。若申请过证书，还会停掉订阅和续期、删除证书副本与订阅文件、CDN 标记和交给 Xray 的那份证书副本，并删除 certbot 里名为 `proxy-oneclick` 的那张证书；不卸载 certbot 软件包。最后别忘了在云控制台关闭不再需要的端口。
 
 ---
 
@@ -1074,7 +1105,7 @@ proxy uninstall --auto
 - CDN 上的 XHTTP+TLS / WebSocket+TLS 需要自有域名，以及公开证书或 Cloudflare 源站证书，还有 Cloudflare 允许代理的回源端口。源站证书只有 Cloudflare 信任，不能给浏览器和直连客户端。NAT / Alpine / 落地机不能开。域名开了橙色云朵后，不要再用这个名字连接 Hysteria2、TUIC 或订阅。
 - XHTTP 走 CDN 时用 `packet-up`。`stream-one` 只用于直连的 XHTTP+REALITY。WebSocket 需要 CDN 打开 WebSockets，路径必须和链接里逐字相同。
 - `proxy route` 只测从本机发向大陆运营商的回程。它不能代替在自己电脑上做的去程。测试节点和骨干地址特征会变，线路名称只供参考。
-- 严格防火墙会挡住没有写进放行列表的端口，包括 Docker / Podman 发布端口、WireGuard 和其它 UDP。这类机器用 `allow`（只放行）。只放行不修改入站默认策略，也不改 Docker / Podman 自己的表和链。卸载会删掉本脚本的表 `inet proxy_oneclick`，不会清空整个规则集。
+- 严格防火墙会挡住没有写进放行列表的端口，包括 Docker / Podman 发布端口、WireGuard 和其它 UDP。这类机器用 `allow`（只放行）。只放行不修改入站默认策略，也不改 Docker / Podman 自己的表和链。ufw 或 firewalld 若正在运行，只放行模式会把代理端口写进它们；nftables 里的 accept 绕不过它们的默认拒绝。卸载会删掉本脚本的表 `inet proxy_oneclick`，并按记录删掉写进 ufw / firewalld 的条目，不会清空整个规则集。
 
 ---
 

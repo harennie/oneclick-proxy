@@ -3,13 +3,40 @@
 # ============================================================
 install_hysteria() {
   if direct_mode; then install_hysteria_direct; return; fi
+  BIN_UPDATED_HY2=0
+  BIN_BAK_SKIP_HY2=0
   step "安装 / 更新 Hysteria2（官方 get.hy2.sh 脚本）"
   mktmp
-  fetch -o "${TMP_DIR}/hy2-install.sh" "$HY_INSTALL_URL" || die "下载 Hysteria2 安装脚本失败。"
-  TERM=${TERM:-dumb} bash "${TMP_DIR}/hy2-install.sh" >"${TMP_DIR}/hy2-install.log" 2>&1 || {
-    tail -n 20 "${TMP_DIR}/hy2-install.log" >&2; die "Hysteria2 安装失败。"; }
-  [[ -x $HY_BIN ]] || die "未找到 ${HY_BIN}，Hysteria2 安装可能失败。"
-  ok "Hysteria2 已安装: $("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
+  local tag="" cli="" old="" backed=0
+  old=$(bin_version hy2 "$HY_BIN" || true)
+  if [[ -n $OPT_HY2_VER ]]; then
+    tag=$(bin_norm_tag hy2 "$OPT_HY2_VER") || die "Hysteria2 版本号无效: ${OPT_HY2_VER}（例如 v2.6.1 或 app/v2.6.1）"
+    gh_release_ok apernet/hysteria "$tag" || die "找不到 Hysteria2 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag apernet/hysteria)
+    [[ -n $tag ]] || { github_hint; die "获取 Hysteria2 最新版本号失败。"; }
+  fi
+  cli=$(hy_official_ver "$tag")
+  if hy_ver_same "$old" "$tag"; then
+    if [[ -n $OPT_HY2_VER ]]; then ok "Hysteria2 已是指定版本 ${cli}，跳过下载。"
+    else ok "Hysteria2 已是最新版本 ${cli}，跳过下载。"; fi
+    return 0
+  fi
+  # 官方脚本自己覆盖程序。先备份，写完后只检查 version（没有配置检查），不通过就换回。
+  bin_backup "$HY_BIN" hy2
+  backed=$BIN_BAK_MADE
+  fetch -o "${TMP_DIR}/hy2-install.sh" "$HY_INSTALL_URL" || { bin_backup_drop "$HY_BIN"; die "下载 Hysteria2 安装脚本失败。"; }
+  if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/hy2-install.sh" --version "$cli" >"${TMP_DIR}/hy2-install.log" 2>&1; then
+    tail -n 20 "${TMP_DIR}/hy2-install.log" >&2 || true
+    bin_reject_new hy2 "$HY_BIN" hysteria-server "Hysteria2" "$backed" " 安装失败"
+  fi
+  if ! hy_check_bin "$HY_BIN"; then
+    if (( backed )); then bin_restore_prebak hy2 "$HY_BIN" hysteria-server "Hysteria2" " 未通过校验"; fi
+    bin_backup_drop "$HY_BIN"
+    if (( BIN_BAK_SKIP_HY2 )); then die "Hysteria2 未通过校验。剩余空间不足，没有备份可以恢复。"; fi
+    die "Hysteria2 未通过校验。"
+  fi
+  bin_finish_install hy2 "$HY_BIN" "Hysteria2" "$old"
 }
 
 gen_hy2_cert() {
@@ -81,8 +108,14 @@ restart_hy2() {
   sleep 2
   if ! svc_active hysteria-server; then
     svc_logs hysteria-server 20 >&2 || true
+    local rc=0
+    bin_restart_failed hy2 "$HY_BIN" hysteria-server "Hysteria2" || rc=$?
+    if (( rc == 0 )); then die "Hysteria2 更新后没有跑起来，已恢复备份。"
+    elif (( rc == 2 )); then die "Hysteria2 更新后没有跑起来，恢复备份后仍未运行。"
+    fi
     die "Hysteria2 启动失败，请查看上方日志。"
   fi
+  BIN_UPDATED_HY2=0
   if (( NAT_MODE )); then
     ok "Hysteria2 运行中 (UDP ${HY2_PORT}$([[ $HY2_EXT_PORT != "$HY2_PORT" ]] && echo "，外部端口 ${HY2_EXT_PORT}")${HOP_RANGE:+，端口跳跃 ${HOP_EXT_RANGE}})"
   else
@@ -95,7 +128,7 @@ remove_hysteria() { # $1 = purge：连证书目录一起删（卸载）。TUIC/A
   if have systemctl; then systemctl disable --now 'hysteria-server@*' >/dev/null 2>&1 || true; fi
   rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service "$HY_RC"
   rm -rf /etc/systemd/system/hysteria-server.service.d /var/log/hysteria
-  rm -f "$HY_BIN" "$HY_CONF"
+  rm -f "$HY_BIN" "${HY_BIN}.bak" "${HY_BIN}.prebak" "$HY_CONF"
   if [[ $1 == purge ]] || ! sb_needed; then rm -rf "$HY_DIR"; fi
   if id hysteria >/dev/null 2>&1; then userdel hysteria >/dev/null 2>&1 || deluser hysteria >/dev/null 2>&1 || true; fi
   if getent group hysteria >/dev/null 2>&1; then groupdel hysteria >/dev/null 2>&1 || delgroup hysteria >/dev/null 2>&1 || true; fi
