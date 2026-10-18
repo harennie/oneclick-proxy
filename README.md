@@ -939,9 +939,9 @@ proxy update --rollback
 proxy update --rollback xray
 ```
 
-更新 Xray、Hysteria2 或 sing-box 之前，把正在用的程序复制为同目录的 `.bak`（例如 `/usr/local/bin/xray.bak`）。这个目录剩余空间不足 50 MB 时跳过备份，并给出警告。直接下载的新程序先放在临时路径：Xray 要能跑 `version`，并且对当前配置 `xray run -test` 通过；sing-box 要能跑 `version` 和 `sing-box check`；Hysteria2 没有配置检查，只跑 `version`。通过之后才替换原来的文件。官方安装脚本会自己写入程序，脚本在它写完后立刻做同样的检查，不通过就恢复备份。换成新版本后如果服务没有起来，会自动恢复 `.bak`，并写明版本变化。
+更新 Xray、Hysteria2 或 sing-box 之前，把正在用的程序复制为同目录的 `.bak`（例如 `/usr/local/bin/xray.bak`）。这个目录剩余空间不足 50 MB 时跳过备份，并给出警告。直接下载的新程序先放在临时路径：Xray 要能跑 `version`，并且对当前配置 `xray run -test` 通过；sing-box 要能跑 `version` 和 `sing-box check`；Hysteria2 没有配置检查，只跑 `version`。通过之后才替换原来的文件。未指定版本时，官方安装脚本会自己写入程序，脚本在它写完后立刻做同样的检查，不通过就恢复备份。指定 `--xray-ver` 时不走官方安装脚本：把该版本的发布包下载到临时目录，用当前配置跑过 `version` 和 `xray run -test` 之后，才备份程序和 `geoip.dat` / `geosite.dat` 并替换。校验失败不会改正在使用的文件，也不会用一份和当前程序相同的副本盖掉已有的 `.bak`。回滚 Xray 或启动失败自动换回时，地理数据文件一起恢复。换成新版本后如果服务没有起来，会自动恢复 `.bak`，并写明版本变化。
 
-`--xray-ver`、`--hy2-ver`、`--singbox-ver` 在安装和 `proxy update` 里都能用。版本号必须是 GitHub 上已经发布的标签。Hysteria2 可以写 `v2.6.1` 或 `app/v2.6.1`。`proxy update` 带了这些参数或 `--rollback` 时不再进入菜单，只处理写出的内核。
+`--xray-ver`、`--hy2-ver`、`--singbox-ver` 在安装和 `proxy update` 里都能用。版本号必须是 GitHub 上已经发布的标签。Hysteria2 可以写 `v2.6.1` 或 `app/v2.6.1`。`--xray-ver` 下载的是该标签的官方 zip，不是安装脚本；临时程序没通过当前配置的检查时，现有程序、geo 文件和 `.bak` 都保持原样。`proxy update` 带了这些参数或 `--rollback` 时不再进入菜单，只处理写出的内核。
 
 `--rollback` 用 `.bak` 换回程序并重启对应服务（systemd 和 OpenRC 都支持），打印 `旧版本 -> 新版本`。目标是 `xray`、`hy2`、`singbox` 或 `all`，不写就是 `all`。没有 `.bak` 时跳过并警告。菜单第 7 项（落地机菜单第 6 项）里选「回滚到备份」是同一件事。
 

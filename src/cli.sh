@@ -368,7 +368,7 @@ usage() {
                       会把代理端口写进它们。--no-firewall 同 off
   --no-firewall       不配置 nftables 防火墙（同 --firewall off）
   --no-upgrade        跳过系统软件包升级
-  --xray-ver <版本>   安装指定的 Xray 发布标签（例如 v26.3.27），须在 GitHub 上存在
+  --xray-ver <版本>   安装指定的 Xray 发布标签（例如 v26.3.27）。直接下载该版本，校验通过后才替换
   --hy2-ver <版本>    安装指定的 Hysteria2 发布标签（例如 v2.6.1 或 app/v2.6.1）
   --singbox-ver <版本> 安装指定的 sing-box 发布标签（例如 v1.11.0）
   --no-tune           跳过 sysctl 网络调优

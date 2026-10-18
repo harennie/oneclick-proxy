@@ -369,7 +369,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5275:src/cert.sh:1;7307:src/cdn.sh:1;8292:src/link.sh:1;8681:src/singbox.sh:1;9259:src/nat.sh:1;9897:src/selftest.sh:1;10042:src/land.sh:1;11488:src/menu.sh:1;12057:src/route.sh:1;12572:src/export.sh:1;12773:src/doctor.sh:1;13108:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;4044:src/hy2.sh:1;4183:src/firewall.sh:1;5420:src/cert.sh:1;7452:src/cdn.sh:1;8437:src/link.sh:1;8826:src/singbox.sh:1;9404:src/nat.sh:1;10042:src/selftest.sh:1;10187:src/land.sh:1;11633:src/menu.sh:1;12202:src/route.sh:1;12717:src/export.sh:1;12918:src/doctor.sh:1;13253:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -2625,6 +2625,11 @@ bin_backup() { # $1 程序路径  $2 xray|hy2|singbox。先写成 .prebak，替�
 bin_backup_keep() { # $1 程序路径  $2 xray|hy2|singbox。新程序已经放好，把临时备份收成 .bak
   local p=$1 kind=$2
   [[ -f ${p}.prebak ]] || return 0
+  # 临时备份和当前程序相同就丢掉。不能拿它盖掉已有的 .bak，否则更早的版本没了。
+  if [[ -e $p ]] && cmp -s "${p}.prebak" "$p"; then
+    rm -f "${p}.prebak"
+    return 0
+  fi
   mv -f "${p}.prebak" "${p}.bak"
   case $kind in
     xray) BIN_UPDATED_XRAY=1 ;;
@@ -2759,7 +2764,8 @@ bin_restore_prebak() { # $1 种类 $2 程序 $3 服务 $4 显示名 $5 原因（
   bakv=$(bin_version "$kind" "${bin}.prebak" || true)
   warn "${name}${why}，正在恢复备份 ..."
   install -m 755 "${bin}.prebak" "$bin" || die "恢复 ${bin}.prebak 失败。"
-  mv -f "${bin}.prebak" "${bin}.bak"
+  rm -f "${bin}.prebak"
+  if [[ $kind == xray ]]; then xray_geo_restore; fi
   if svc_exists "$svc"; then svc_restart "$svc" || true; sleep 1; fi
   die "${name}${why}，已恢复备份（${cur:-未知} -> ${bakv:-未知}）。"
 }
@@ -2771,12 +2777,14 @@ bin_reject_new() { # $1 种类 $2 程序 $3 服务 $4 显示名 $5 是否有本�
     if [[ ! -x $bin || $cur != "$bakv" ]]; then
       warn "${name}${why}，正在恢复备份 ..."
       install -m 755 "${bin}.prebak" "$bin" || die "恢复 ${bin}.prebak 失败。"
-      mv -f "${bin}.prebak" "${bin}.bak"
+      rm -f "${bin}.prebak"
+      if [[ $kind == xray ]]; then xray_geo_restore; fi
       if svc_exists "$svc"; then svc_restart "$svc" || true; sleep 1; fi
       die "${name}${why}，已恢复备份（${cur:-未知} -> ${bakv:-未知}）。"
     fi
     bin_backup_drop "$bin"
   fi
+  if [[ $kind == xray ]]; then xray_geo_restore; fi
   die "${name}${why}。"
 }
 bin_restart_failed() { # 启动失败且这次换过程序：用 .bak 盖回去再拉起。0=已恢复且在跑 1=没有备份可换 2=换了仍没起来
@@ -2795,6 +2803,7 @@ bin_restart_failed() { # 启动失败且这次换过程序：用 .bak 盖回去�
   new=$(bin_version "$kind" "${bin}.bak" || true)
   warn "${name} 启动失败，正在恢复 ${bin}.bak ..."
   install -m 755 "${bin}.bak" "$bin" || { warn "恢复 ${bin}.bak 失败。"; return 2; }
+  if [[ $kind == xray ]]; then xray_geo_restore_bak; fi
   case $kind in
     xray) BIN_UPDATED_XRAY=0 ;;
     hy2) BIN_UPDATED_HY2=0 ;;
@@ -2845,6 +2854,7 @@ rollback_one() { # $1 xray|hy2|singbox
   old=$(bin_version "$kind" "$bin" || true)
   new=$(bin_version "$kind" "${bin}.bak" || true)
   bin_swap_bak "$bin" || die "换回 ${bin}.bak 失败。"
+  if [[ $kind == xray ]]; then xray_geo_swap_bak; fi
   if [[ $kind == xray ]] && land_raw_active; then
     svc_disable_stop xray || true
     ok "${name} ${old:-未知} -> ${new:-未知}（原样转发中，未启动 Xray）"
@@ -2859,6 +2869,7 @@ rollback_one() { # $1 xray|hy2|singbox
   if ! svc_active "$svc"; then
     warn "${name} 换回 ${new:-未知} 后没有跑起来，正在换回刚才的程序 ..."
     bin_swap_bak "$bin" || true
+    if [[ $kind == xray ]]; then xray_geo_swap_bak; fi
     svc_restart "$svc" || true
     die "${name} 回滚失败，已换回 ${old:-未知}。"
   fi
@@ -2881,7 +2892,171 @@ do_rollback() { # $1 xray|hy2|singbox|all
 # ============================================================
 #                        Xray 安装与配置
 # ============================================================
+# 地理数据文件和程序一起换。失败或回滚时按 .prebak / .bak 换回去。
+xray_geo_snapshot() {
+  local f
+  mkdir -p "$XRAY_ASSET_DIR"
+  for f in geoip.dat geosite.dat; do
+    rm -f "${XRAY_ASSET_DIR}/${f}.prebak"
+    [[ -s ${XRAY_ASSET_DIR}/$f ]] || continue
+    cp -a "${XRAY_ASSET_DIR}/$f" "${XRAY_ASSET_DIR}/${f}.prebak" || warn "备份 ${f} 失败。"
+  done
+}
+xray_geo_commit() {
+  local f src live bak
+  for f in geoip.dat geosite.dat; do
+    src="${XRAY_ASSET_DIR}/${f}.prebak"
+    live="${XRAY_ASSET_DIR}/$f"
+    bak="${live}.bak"
+    [[ -f $src ]] || continue
+    if [[ -f $live ]] && cmp -s "$src" "$live"; then rm -f "$src"; continue; fi
+    if [[ -f $bak ]] && cmp -s "$src" "$bak"; then rm -f "$src"; continue; fi
+    mv -f "$src" "$bak"
+  done
+}
+xray_geo_restore() {
+  local f src
+  for f in geoip.dat geosite.dat; do
+    src="${XRAY_ASSET_DIR}/${f}.prebak"
+    [[ -f $src ]] || continue
+    mkdir -p "$XRAY_ASSET_DIR"
+    install -m 644 "$src" "${XRAY_ASSET_DIR}/$f" || warn "恢复 ${f} 失败。"
+    rm -f "$src"
+  done
+}
+xray_geo_restore_bak() {
+  local f live bak
+  for f in geoip.dat geosite.dat; do
+    live="${XRAY_ASSET_DIR}/$f"
+    bak="${live}.bak"
+    [[ -f $bak ]] || continue
+    if [[ -f $live ]] && cmp -s "$live" "$bak"; then continue; fi
+    mkdir -p "$XRAY_ASSET_DIR"
+    install -m 644 "$bak" "$live" || warn "恢复 ${f} 失败。"
+  done
+}
+xray_geo_swap_bak() {
+  local f live bak tmp
+  for f in geoip.dat geosite.dat; do
+    live="${XRAY_ASSET_DIR}/$f"
+    bak="${live}.bak"
+    [[ -f $bak ]] || continue
+    if [[ ! -e $live ]]; then
+      mkdir -p "$XRAY_ASSET_DIR"
+      install -m 644 "$bak" "$live" || warn "恢复 ${f} 失败。"
+      continue
+    fi
+    if cmp -s "$live" "$bak"; then continue; fi
+    tmp="${live}.swaptmp"
+    rm -f "$tmp"
+    mv -f "$live" "$tmp" || continue
+    if ! mv -f "$bak" "$live"; then
+      mv -f "$tmp" "$live" || true
+      warn "换回 ${f} 失败。"
+      continue
+    fi
+    mv -f "$tmp" "$bak" || warn "已换回 ${f}，但没能留下刚才的文件。"
+  done
+}
+xray_abort_swap() {
+  if [[ -f ${XRAY_BIN}.prebak ]]; then
+    install -m 755 "${XRAY_BIN}.prebak" "$XRAY_BIN" || warn "恢复 Xray 程序失败。"
+    rm -f "${XRAY_BIN}.prebak"
+  fi
+  rm -f "${XRAY_BIN}.new"
+  xray_geo_restore
+}
+# 下载并解压到临时目录。不改正在使用的程序。
+xray_fetch_release() { # $1 标签 vX  $2 解压目录
+  local tag=$1 dg=$2 asset="" base="" want="" sum=""
+  asset=$(xray_asset_name)
+  [[ -n $asset ]] || die "当前架构不支持下载 Xray: ${ARCH:-未知}"
+  base="https://github.com/XTLS/Xray-core/releases/download/${tag}"
+  info "下载 ${asset} (${tag}) ..."
+  fetch -o "${TMP_DIR}/${asset}" "${base}/${asset}" || { github_hint; die "下载 Xray 失败。"; }
+  if fetch -o "${TMP_DIR}/${asset}.dgst" "${base}/${asset}.dgst" 2>/dev/null; then
+    want=$(awk -F'= *' '/^SHA2-256/{print tolower($2); exit}' "${TMP_DIR}/${asset}.dgst" | tr -d '[:space:]')
+    sum=$(sha256sum "${TMP_DIR}/${asset}" | awk '{print $1}')
+    if [[ -n $want ]]; then
+      [[ $want == "$sum" ]] || die "Xray 压缩包 SHA256 校验失败（期望 ${want}，实际 ${sum}），已中止。"
+      ok "SHA256 校验通过。"
+    else
+      warn "无法解析 .dgst 文件，跳过 SHA256 校验。"
+    fi
+  else
+    warn "未能下载 .dgst 校验文件，跳过 SHA256 校验。"
+  fi
+  rm -rf "$dg"
+  mkdir -p "$dg"
+  if (( NAT_MODE || LAND_MODE )); then
+    unzip -qo "${TMP_DIR}/${asset}" xray -d "$dg" || die "解压 Xray 失败。"
+  else
+    unzip -qo "${TMP_DIR}/${asset}" -d "$dg" || die "解压 Xray 失败。"
+  fi
+  rm -f "${TMP_DIR}/${asset}" "${TMP_DIR}/${asset}.dgst"
+  [[ -f $dg/xray ]] || die "压缩包中没有 xray 可执行文件。"
+}
+# 先用临时程序对当前配置做检查。通过之后才备份并替换程序和 geo 文件。检查失败返回 1，什么都不改。
+xray_install_tree() { # $1 解压目录
+  local dg=$1 old="" newv="" f
+  [[ -f $dg/xray ]] || return 1
+  chmod 755 "$dg/xray"
+  if ! xray_check_bin "$dg/xray"; then return 1; fi
+  old=$(bin_version xray "$XRAY_BIN" || true)
+  newv=$(bin_version xray "$dg/xray" || true)
+  if ! xray_ver_same "$old" "$newv"; then bin_backup "$XRAY_BIN" xray; fi
+  if [[ -f $dg/geoip.dat || -f $dg/geosite.dat ]]; then xray_geo_snapshot; fi
+  if ! install -m 755 "$dg/xray" "${XRAY_BIN}.new"; then
+    xray_abort_swap
+    die "写入 Xray 失败，已恢复原程序。"
+  fi
+  if ! mv -f "${XRAY_BIN}.new" "$XRAY_BIN"; then
+    xray_abort_swap
+    die "替换 Xray 失败，已恢复原程序。"
+  fi
+  mkdir -p "$XRAY_ASSET_DIR"
+  for f in geoip.dat geosite.dat; do
+    [[ -f $dg/$f ]] || continue
+    if ! install -m 644 "$dg/$f" "${XRAY_ASSET_DIR}/$f"; then
+      xray_abort_swap
+      die "写入 ${f} 失败，已恢复原程序和地理数据。"
+    fi
+  done
+  bin_finish_install xray "$XRAY_BIN" "Xray" "$old"
+  xray_geo_commit
+  return 0
+}
+xray_ensure_service() {
+  if direct_mode || [[ ! -f $XRAY_UNIT ]] || grep -q '由 proxy-oneclick 生成' "$XRAY_UNIT"; then
+    write_xray_service
+  else
+    ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
+  fi
+}
+install_xray_pinned() {
+  BIN_UPDATED_XRAY=0
+  BIN_BAK_SKIP_XRAY=0
+  step "安装 / 更新 Xray-core（指定版本，直接下载发布包）"
+  mktmp
+  local tag="" old="" dg=""
+  tag=$(bin_norm_tag xray "$OPT_XRAY_VER") || die "Xray 版本号无效: ${OPT_XRAY_VER}（例如 v26.3.27）"
+  gh_release_ok XTLS/Xray-core "$tag" || die "找不到 Xray 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  old=$(bin_version xray "$XRAY_BIN" || true)
+  if xray_ver_same "$old" "$tag" && [[ -x $XRAY_BIN ]] && { (( NAT_MODE || LAND_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
+    ok "Xray 已是指定版本 ${tag}，跳过下载。"
+  else
+    dg="${TMP_DIR}/xray-unzip"
+    xray_fetch_release "$tag" "$dg"
+    if ! xray_install_tree "$dg"; then
+      rm -rf "$dg"
+      die "下载的 Xray 未通过校验，未替换现有程序。"
+    fi
+    rm -rf "$dg"
+  fi
+  xray_ensure_service
+}
 install_xray() {
+  if [[ -n ${OPT_XRAY_VER:-} ]]; then install_xray_pinned; return; fi
   if direct_mode; then install_xray_direct; return; fi
   BIN_UPDATED_XRAY=0
   BIN_BAK_SKIP_XRAY=0
@@ -2911,16 +3086,18 @@ install_xray() {
     ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
     return 0
   fi
-  # 官方脚本自己下载并覆盖程序，没法先在临时路径校验。先备份，写完立刻检查，不通过就换回。
+  # 未指定版本时仍用官方脚本，它会自己覆盖程序。先备份程序和 geo，写完立刻检查，不通过就换回。
   if (( ! same )); then bin_backup "$XRAY_BIN" xray; backed=$BIN_BAK_MADE; fi
   fetch -o "${TMP_DIR}/xray-install.sh" "$XRAY_INSTALL_URL" || { bin_backup_drop "$XRAY_BIN"; die "下载 Xray 安装脚本失败，请检查网络（GitHub 可达性）。"; }
   if (( same )); then force=(--force); fi
+  xray_geo_snapshot
   if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install --version "$tag" "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1; then
     tail -n 20 "${TMP_DIR}/xray-install.log" >&2 || true
     bin_reject_new xray "$XRAY_BIN" xray "Xray" "$backed" " 安装失败"
   fi
   [[ -x $XRAY_BIN ]] || bin_reject_new xray "$XRAY_BIN" xray "Xray" "$backed" " 安装失败"
   if ! xray_check_bin "$XRAY_BIN"; then
+    xray_geo_restore
     if (( backed )); then bin_restore_prebak xray "$XRAY_BIN" xray "Xray" " 未通过校验"; fi
     bin_backup_drop "$XRAY_BIN"
     if (( BIN_BAK_SKIP_XRAY )); then die "Xray 未通过校验。剩余空间不足，没有备份可以恢复。"; fi
@@ -2929,6 +3106,7 @@ install_xray() {
   # 官方脚本会沿用已有 User=（常见为 xray）。配置是 root:nobody 组 640，必须在启动前改成 nobody。
   ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
   bin_finish_install xray "$XRAY_BIN" "Xray" "$old"
+  xray_geo_commit
 }
 
 # 不依赖 GitHub API，从 releases/latest 的跳转地址解析最新版本号（跟随仓库改名等多次跳转）
@@ -2971,7 +3149,7 @@ install_xray_direct() {
   BIN_BAK_SKIP_XRAY=0
   step "安装 / 更新 Xray-core（直接下载 XTLS/Xray-core 官方 Release）"
   mktmp
-  local tag="" asset base cur="" want dg sum old="" replaced=0
+  local tag="" dg="" old=""
   old=$(bin_version xray "$XRAY_BIN" || true)
   if [[ -n $OPT_XRAY_VER ]]; then
     tag=$(bin_norm_tag xray "$OPT_XRAY_VER") || die "Xray 版本号无效: ${OPT_XRAY_VER}（例如 v26.3.27）"
@@ -2980,53 +3158,20 @@ install_xray_direct() {
     tag=$(gh_latest_tag XTLS/Xray-core)
     [[ -n $tag ]] || { github_hint; die "获取 Xray 最新版本号失败。"; }
   fi
-  cur=$old
-  if xray_ver_same "$cur" "$tag" && { (( NAT_MODE || LAND_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
+  if xray_ver_same "$old" "$tag" && { (( NAT_MODE || LAND_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
     if [[ -n $OPT_XRAY_VER ]]; then ok "Xray 已是指定版本 ${tag}，跳过下载。"
     else ok "Xray 已是最新版本 ${tag}，跳过下载。"; fi
   else
-    asset=$(xray_asset_name)
-    base="https://github.com/XTLS/Xray-core/releases/download/${tag}"
-    info "下载 ${asset} (${tag}) ..."
-    fetch -o "${TMP_DIR}/${asset}" "${base}/${asset}" || { github_hint; die "下载 Xray 失败。"; }
-    if fetch -o "${TMP_DIR}/${asset}.dgst" "${base}/${asset}.dgst" 2>/dev/null; then
-      want=$(awk -F'= *' '/^SHA2-256/{print tolower($2); exit}' "${TMP_DIR}/${asset}.dgst" | tr -d '[:space:]')
-      sum=$(sha256sum "${TMP_DIR}/${asset}" | awk '{print $1}')
-      if [[ -n $want ]]; then
-        [[ $want == "$sum" ]] || die "Xray 压缩包 SHA256 校验失败（期望 ${want}，实际 ${sum}），已中止。"
-        ok "SHA256 校验通过。"
-      else
-        warn "无法解析 .dgst 文件，跳过 SHA256 校验。"
-      fi
-    else
-      warn "未能下载 .dgst 校验文件，跳过 SHA256 校验。"
-    fi
-    dg="${TMP_DIR}/xray-unzip"; rm -rf "$dg"; mkdir -p "$dg"
-    # NAT 小鸡 / 落地机：只解压 xray 本体（配置不使用 geoip/geosite，内网段直接写 CIDR），解压后立即删除压缩包
-    if (( NAT_MODE || LAND_MODE )); then
-      unzip -qo "${TMP_DIR}/${asset}" xray -d "$dg" || die "解压 Xray 失败。"
-    else
-      unzip -qo "${TMP_DIR}/${asset}" -d "$dg" || die "解压 Xray 失败。"
-    fi
-    rm -f "${TMP_DIR}/${asset}"
-    [[ -f $dg/xray ]] || die "压缩包中没有 xray 可执行文件。"
-    chmod 755 "$dg/xray"
-    # 先在临时路径校验，通过后才备份并替换正在使用的程序
-    if ! xray_check_bin "$dg/xray"; then
+    dg="${TMP_DIR}/xray-unzip"
+    xray_fetch_release "$tag" "$dg"
+    if ! xray_install_tree "$dg"; then
       rm -rf "$dg"
       die "下载的 Xray 未通过校验，未替换现有程序。"
     fi
-    if ! xray_ver_same "$cur" "$tag"; then bin_backup "$XRAY_BIN" xray; fi
-    install -m 755 "$dg/xray" "${XRAY_BIN}.new" && mv -f "${XRAY_BIN}.new" "$XRAY_BIN"
-    mkdir -p "$XRAY_ASSET_DIR"
-    local f
-    for f in geoip.dat geosite.dat; do [[ -f $dg/$f ]] && install -m 644 "$dg/$f" "${XRAY_ASSET_DIR}/$f"; done
     rm -rf "$dg"
-    replaced=1
   fi
   write_xray_service
   [[ -x $XRAY_BIN ]] || die "未找到 ${XRAY_BIN}，Xray 安装可能失败。"
-  if (( replaced )); then bin_finish_install xray "$XRAY_BIN" "Xray" "$old"; fi
 }
 
 install_hysteria_direct() {
@@ -13475,7 +13620,7 @@ usage() {
                       会把代理端口写进它们。--no-firewall 同 off
   --no-firewall       不配置 nftables 防火墙（同 --firewall off）
   --no-upgrade        跳过系统软件包升级
-  --xray-ver <版本>   安装指定的 Xray 发布标签（例如 v26.3.27），须在 GitHub 上存在
+  --xray-ver <版本>   安装指定的 Xray 发布标签（例如 v26.3.27）。直接下载该版本，校验通过后才替换
   --hy2-ver <版本>    安装指定的 Hysteria2 发布标签（例如 v2.6.1 或 app/v2.6.1）
   --singbox-ver <版本> 安装指定的 sing-box 发布标签（例如 v1.11.0）
   --no-tune           跳过 sysctl 网络调优
