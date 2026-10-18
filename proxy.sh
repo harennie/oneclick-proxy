@@ -369,7 +369,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;4044:src/hy2.sh:1;4183:src/firewall.sh:1;5420:src/cert.sh:1;7452:src/cdn.sh:1;8437:src/link.sh:1;8826:src/singbox.sh:1;9404:src/nat.sh:1;10042:src/selftest.sh:1;10187:src/land.sh:1;11633:src/menu.sh:1;12202:src/route.sh:1;12717:src/export.sh:1;12918:src/doctor.sh:1;13253:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;719:src/os.sh:1;1228:src/tune.sh:1;2028:src/xray.sh:1;4051:src/hy2.sh:1;4190:src/firewall.sh:1;5427:src/cert.sh:1;7459:src/cdn.sh:1;8444:src/link.sh:1;8833:src/singbox.sh:1;9411:src/nat.sh:1;10049:src/selftest.sh:1;10194:src/land.sh:1;11640:src/menu.sh:1;12213:src/route.sh:1;12728:src/export.sh:1;12942:src/doctor.sh:1;13277:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -409,18 +409,23 @@ err_loc() { # $1 合并后的行号
   if [[ -n $loc ]]; then printf '%s' "$loc"; else printf '第 %s 行' "$1"; fi
 }
 err_print_stack() {
-  local i fn bl loc n=0
+  local i fn bl loc n=0 row
+  local -a rows=()
   (( ${#FUNCNAME[@]} > 1 )) || return 0
-  printf '%s调用栈：%s\n' "$C_YELLOW" "$C_NONE" >&2
   for (( i=1; i<${#FUNCNAME[@]}; i++ )); do
     fn=${FUNCNAME[$i]}
-    [[ $fn == on_error || $fn == err_print_stack || $fn == main || $fn == err_loc ]] && continue
+    # main 留着：顶层失败时栈里往往只剩它，丢掉就会只打出一个空的「调用栈」标题。
+    [[ $fn == on_error || $fn == err_print_stack || $fn == err_loc ]] && continue
     bl=${BASH_LINENO[$(( i - 1 ))]:-0}
     [[ $bl =~ ^[0-9]+$ ]] || bl=0
-    loc=$(err_loc "$bl")
+    if [[ $bl == 0 ]]; then loc="脚本入口"
+    else loc=$(err_loc "$bl"); fi
     n=$(( n + 1 ))
-    printf '  [%s] %s() <- %s\n' "$n" "$fn" "$loc" >&2
+    rows+=("$(printf '  [%s] %s() <- %s' "$n" "$fn" "$loc")")
   done
+  (( n > 0 )) || return 0
+  printf '%s调用栈：%s\n' "$C_YELLOW" "$C_NONE" >&2
+  for row in "${rows[@]}"; do printf '%s\n' "$row" >&2; done
   return 0
 }
 on_error() {
@@ -2848,6 +2853,8 @@ rollback_one() { # $1 xray|hy2|singbox
     *) die "未知组件: ${kind}（可选 xray、hy2、singbox、all）" ;;
   esac
   if [[ ! -f ${bin}.bak ]]; then
+    # 点名回滚某一个时必须失败。all 仍跳过没有备份的组件。
+    if [[ ${2-} == 1 ]]; then die "没有 ${bin}.bak，无法回滚 ${name}。"; fi
     warn "没有 ${bin}.bak，跳过 ${name}。"
     return 0
   fi
@@ -2881,7 +2888,7 @@ do_rollback() { # $1 xray|hy2|singbox|all
   (( INSTALLED )) || die "尚未安装，请先选择「安装」。"
   [[ -n $INIT_SYS ]] || detect_init
   case $which in
-    xray|hy2|singbox) rollback_one "$which" ;;
+    xray|hy2|singbox) rollback_one "$which" 1 ;;
     all)
       for part in xray hy2 singbox; do rollback_one "$part"; done
       ;;
@@ -11690,38 +11697,42 @@ menu_change_ports() {
   if (( LAND_MODE )); then land_menu_port; return; fi
   nat_pref_guard || return 0
   if (( NAT_MODE )); then menu_change_ports_nat; return; fi
-  local oldx=$XRAY_PORT oldh=$HY2_PORT
+  local oldx=$XRAY_PORT oldh=$HY2_PORT oldxh=${XHTTP_PORT:-}
   choose_ports_interactive
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
   if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
   if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
-  ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}$( ((HY2_ENABLED)) && echo "，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}")"
+  local extra=""
+  if (( HY2_ENABLED )); then extra+="，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then extra+="，XHTTP TCP ${oldxh} -> ${XHTTP_PORT}"; fi
+  ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}${extra}"
   cloud_fw_reminder
 }
 menu_change_ports_nat() {
-  local oldx=$XRAY_EXT_PORT oldh=$HY2_EXT_PORT
+  local oldx=$XRAY_EXT_PORT oldh=$HY2_EXT_PORT oldxh=${XHTTP_EXT_PORT:-}
   detect_os; detect_virt
-  local s1=$OPT_PORT s2=$OPT_HY2_PORT s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
-  OPT_PORT="" OPT_HY2_PORT="" OPT_NAT_EXT="" OPT_NAT_ADDR=""
+  local s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
+  # 保留 --port / --hy2-port / --xhttp-port，命令行可以直接改。映射列表仍按已保存的重新确认。
+  OPT_NAT_EXT="" OPT_NAT_ADDR=""
   choose_nat_addr
   choose_nat_ports
-  OPT_PORT=$s1 OPT_HY2_PORT=$s2 OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
+  OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
   if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
   if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
-  ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}$( ((HY2_ENABLED)) && echo "，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}")"
+  local extra=""
+  if (( HY2_ENABLED )); then extra+="，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then extra+="，XHTTP 外部端口 ${oldxh:-无} -> ${XHTTP_EXT_PORT}"; fi
+  ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}${extra}"
   cloud_fw_reminder
 }
 choose_ports_interactive() {
-  # 修改端口时允许当前服务占用自身端口
-  local save_opt=$OPT_PORT save_h=$OPT_HY2_PORT
-  OPT_PORT="" OPT_HY2_PORT=""
+  # 保留 --port / --hy2-port / --xhttp-port。没写的那些会在 choose_ports 里询问。
   choose_ports
-  OPT_PORT=$save_opt OPT_HY2_PORT=$save_h
 }
 
 menu_users() {
@@ -12748,6 +12759,17 @@ export_put() { # $1 源文件 $2 包内相对路径
   mkdir -p "$(dirname "$dest")"
   install -m 600 "$1" "$dest"
 }
+export_have_tty() { # /dev/tty 打得开、并且真是终端
+  local fd
+  [[ -r /dev/tty && -w /dev/tty ]] || return 1
+  exec {fd}</dev/tty || return 1
+  if [[ -t $fd ]]; then
+    exec {fd}<&-
+    return 0
+  fi
+  exec {fd}<&-
+  return 1
+}
 export_read_pass() { # $1 变量名 $2 提示。优先用环境变量，不回显。
   local __p=""
   if [[ -n ${PROXY_EXPORT_PASS:-} ]]; then
@@ -12757,11 +12779,13 @@ export_read_pass() { # $1 变量名 $2 提示。优先用环境变量，不回�
   if [[ -t 0 ]]; then
     read -r -s -p "$2" __p || true
     echo
-  elif [[ -r /dev/tty ]]; then
-    read -r -s -p "$2" __p </dev/tty || true
+  elif export_have_tty; then
+    if ! read -r -s -p "$2" __p </dev/tty; then
+      die "需要密码。请设置环境变量 PROXY_EXPORT_PASS。"
+    fi
     echo
   else
-    die "需要密码。请设置环境变量 PROXY_EXPORT_PASS，或在终端里运行。"
+    die "需要密码。请设置环境变量 PROXY_EXPORT_PASS。"
   fi
   [[ -n $__p ]] || die "密码不能为空。"
   printf -v "$1" '%s' "$__p"
@@ -13703,16 +13727,17 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
                       XHTTP 与 Vision 共用 / 分开 TCP 端口
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
-  proxy port          修改端口
+  proxy port          修改端口。可带 --port、--hy2-port、--xhttp-port；同步开启时 ufw/firewalld 跟着改
   proxy user          用户管理
   proxy update        更新组件。菜单里可以回滚到 .bak
   proxy update --xray-ver <版本> [--hy2-ver <版本>] [--singbox-ver <版本>]
                       只把写出的内核换成这个已经发布的版本
   proxy update --rollback [xray|hy2|singbox|all]
                       用 <程序>.bak 换回并重启服务，打印 旧版本 -> 新版本
-                      不写目标时回滚这三个。systemd 和 OpenRC 都用同一套重启
+                      不写目标时回滚这三个，没有 .bak 的跳过。点名某一个却没有 .bak 时失败退出
+                      systemd 和 OpenRC 都用同一套重启
   proxy update-script 只更新本脚本
-  proxy export [文件]  导出密钥和证书（权限 600）。--password 加密，密码不回显
+  proxy export [文件]  导出密钥和证书（权限 600）。--password 加密；没有终端时请设置 PROXY_EXPORT_PASS
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
   bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口

@@ -451,16 +451,17 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
                       XHTTP 与 Vision 共用 / 分开 TCP 端口
   proxy sni           重新优选 / 更换 SNI
   proxy regen         重新生成全部密钥
-  proxy port          修改端口
+  proxy port          修改端口。可带 --port、--hy2-port、--xhttp-port；同步开启时 ufw/firewalld 跟着改
   proxy user          用户管理
   proxy update        更新组件。菜单里可以回滚到 .bak
   proxy update --xray-ver <版本> [--hy2-ver <版本>] [--singbox-ver <版本>]
                       只把写出的内核换成这个已经发布的版本
   proxy update --rollback [xray|hy2|singbox|all]
                       用 <程序>.bak 换回并重启服务，打印 旧版本 -> 新版本
-                      不写目标时回滚这三个。systemd 和 OpenRC 都用同一套重启
+                      不写目标时回滚这三个，没有 .bak 的跳过。点名某一个却没有 .bak 时失败退出
+                      systemd 和 OpenRC 都用同一套重启
   proxy update-script 只更新本脚本
-  proxy export [文件]  导出密钥和证书（权限 600）。--password 加密，密码不回显
+  proxy export [文件]  导出密钥和证书（权限 600）。--password 加密；没有终端时请设置 PROXY_EXPORT_PASS
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
   bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口

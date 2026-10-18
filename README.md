@@ -887,6 +887,8 @@ Hysteria2 ▶ …              sing-box  ▶ 未安装
 
 NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 18 项（没有客户端直连协议，第 12 项仍是回程线路检测，第 13–15 项是出口：本机直连 / 加密转发 / 原样转发，第 16–17 项是导出和导入，第 18 项是健康检查），框标题同样是 `oneclick proxy`。
 
+**修改端口**（第 5 项，或 `proxy port`）：可以改 Reality 的 TCP、Hysteria2 的 UDP，以及单独监听的 XHTTP 端口。命令行：`proxy port --xhttp-port 9443`（也可同时写 `--port`、`--hy2-port`）。XHTTP 与 Vision 共用端口时，改 Reality 的端口即可。改完会重写配置并重启；若安装时把代理端口同步进了正在运行的 ufw 或 firewalld，旧端口的本脚本规则会删掉，新端口会补上。NAT 模式改的是外部映射端口。
+
 **协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS，以及 CDN 上的 XHTTP+TLS（第 7 项）、WebSocket+TLS（第 8 项）。第 9 项开关这两条的 VLESS Encryption，并显示当前状态。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径、CDN 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥和 CDN 路径，但不会把已关闭的协议重新打开。已申请公开证书时，重新生成密钥不会把 Hysteria2 / TUIC / AnyTLS 换回自签证书。打开 CDN 线路时会打印教程并做一次检查。想再看教程：`proxy cdn`。
 
 **申请证书**（第 17 项，或 `proxy cert`）：选择种类并申请、续期、查看链接，或关闭证书。默认仍是 Let's Encrypt 单域名。见「申请证书」。
@@ -904,7 +906,7 @@ proxy import /root/node.tar.gz
 bash proxy.sh --import /root/node.tar.gz --auto
 ```
 
-`--password` 会询问密码（不回显），用 `openssl enc -aes-256-cbc -pbkdf2` 加密。也可以把密码放在环境变量 `PROXY_EXPORT_PASS`。不会把密钥打成一行 base64 放在命令行里。NAT 机器导入后要重新填映射，例如再加上 `--nat-ports`。
+`--password` 会询问密码（不回显），用 `openssl enc -aes-256-cbc -pbkdf2` 加密。也可以把密码放在环境变量 `PROXY_EXPORT_PASS`。没有终端、也没有这个环境变量时，命令会直接退出并提示设置 `PROXY_EXPORT_PASS`，不会停在那里等输入。不会把密钥打成一行 base64 放在命令行里。NAT 机器导入后要重新填映射，例如再加上 `--nat-ports`。
 
 **健康检查**（第 21 项，落地机菜单第 18 项，或 `proxy doctor`）：只读。依次看时间偏差（Cloudflare `cdn-cgi/trace` 的 `ts=`，超过 15 秒提醒）、服务是否在跑、端口是否在听、最近有没有内存不足或崩溃、nftables 表和已放行端口、ufw/firewalld 同步、Hysteria2 端口跳跃的 DNAT 和计数器（没有计数器的旧规则只记 INFO，重新应用防火墙后规则会带上 counter）、SNI 是否还合格、REALITY / XHTTP 回环自检、外部检查命令，以及公开证书是否快到期（不足 7 天提醒）。有失败项时退出码非 0。`proxy doctor --fix` 只做安全修复：拉起已停止的服务、`chronyc makestep` 或重启 timesyncd / OpenRC chronyd、按清单重写 ufw/firewalld、把 `state.env` 改成 600。修好之后会再查一遍，并列出这次修好的项目；原先失败的都已通过时退出码为 0。仍有失败则退出码非 0。不加 `--fix` 时不改任何配置。
 
@@ -943,7 +945,7 @@ proxy update --rollback xray
 
 `--xray-ver`、`--hy2-ver`、`--singbox-ver` 在安装和 `proxy update` 里都能用。版本号必须是 GitHub 上已经发布的标签。Hysteria2 可以写 `v2.6.1` 或 `app/v2.6.1`。`--xray-ver` 下载的是该标签的官方 zip，不是安装脚本；临时程序没通过当前配置的检查时，现有程序、geo 文件和 `.bak` 都保持原样。`proxy update` 带了这些参数或 `--rollback` 时不再进入菜单，只处理写出的内核。
 
-`--rollback` 用 `.bak` 换回程序并重启对应服务（systemd 和 OpenRC 都支持），打印 `旧版本 -> 新版本`。目标是 `xray`、`hy2`、`singbox` 或 `all`，不写就是 `all`。没有 `.bak` 时跳过并警告。菜单第 7 项（落地机菜单第 6 项）里选「回滚到备份」是同一件事。
+`--rollback` 用 `.bak` 换回程序并重启对应服务（systemd 和 OpenRC 都支持），打印 `旧版本 -> 新版本`。目标是 `xray`、`hy2`、`singbox` 或 `all`，不写就是 `all`。`all` 碰到没有 `.bak` 的组件会跳过并警告。点名了某一个（例如 `--rollback hy2`）但没有对应 `.bak` 时，命令失败退出。菜单第 7 项（落地机菜单第 6 项）里选「回滚到备份」是同一件事。
 
 **只更新本脚本**（proxy 命令）
 

@@ -826,6 +826,8 @@ rollback_one() { # $1 xray|hy2|singbox
     *) die "未知组件: ${kind}（可选 xray、hy2、singbox、all）" ;;
   esac
   if [[ ! -f ${bin}.bak ]]; then
+    # 点名回滚某一个时必须失败。all 仍跳过没有备份的组件。
+    if [[ ${2-} == 1 ]]; then die "没有 ${bin}.bak，无法回滚 ${name}。"; fi
     warn "没有 ${bin}.bak，跳过 ${name}。"
     return 0
   fi
@@ -859,7 +861,7 @@ do_rollback() { # $1 xray|hy2|singbox|all
   (( INSTALLED )) || die "尚未安装，请先选择「安装」。"
   [[ -n $INIT_SYS ]] || detect_init
   case $which in
-    xray|hy2|singbox) rollback_one "$which" ;;
+    xray|hy2|singbox) rollback_one "$which" 1 ;;
     all)
       for part in xray hy2 singbox; do rollback_one "$part"; done
       ;;

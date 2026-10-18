@@ -58,38 +58,42 @@ menu_change_ports() {
   if (( LAND_MODE )); then land_menu_port; return; fi
   nat_pref_guard || return 0
   if (( NAT_MODE )); then menu_change_ports_nat; return; fi
-  local oldx=$XRAY_PORT oldh=$HY2_PORT
+  local oldx=$XRAY_PORT oldh=$HY2_PORT oldxh=${XHTTP_PORT:-}
   choose_ports_interactive
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
   if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
   if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
-  ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}$( ((HY2_ENABLED)) && echo "，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}")"
+  local extra=""
+  if (( HY2_ENABLED )); then extra+="，UDP ${oldh} -> ${HY2_PORT}，跳跃 ${HOP_RANGE:-关闭}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then extra+="，XHTTP TCP ${oldxh} -> ${XHTTP_PORT}"; fi
+  ok "端口已更新：TCP ${oldx} -> ${XRAY_PORT}${extra}"
   cloud_fw_reminder
 }
 menu_change_ports_nat() {
-  local oldx=$XRAY_EXT_PORT oldh=$HY2_EXT_PORT
+  local oldx=$XRAY_EXT_PORT oldh=$HY2_EXT_PORT oldxh=${XHTTP_EXT_PORT:-}
   detect_os; detect_virt
-  local s1=$OPT_PORT s2=$OPT_HY2_PORT s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
-  OPT_PORT="" OPT_HY2_PORT="" OPT_NAT_EXT="" OPT_NAT_ADDR=""
+  local s3=$OPT_NAT_EXT s4=$OPT_NAT_ADDR
+  # 保留 --port / --hy2-port / --xhttp-port，命令行可以直接改。映射列表仍按已保存的重新确认。
+  OPT_NAT_EXT="" OPT_NAT_ADDR=""
   choose_nat_addr
   choose_nat_ports
-  OPT_PORT=$s1 OPT_HY2_PORT=$s2 OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
+  OPT_NAT_EXT=$s3 OPT_NAT_ADDR=$s4
   if (( HY2_ENABLED )) && [[ ! -x $HY_BIN ]]; then install_hysteria; fi
   if (( ! HY2_ENABLED )) && [[ -x $HY_BIN ]]; then remove_hysteria; fi
   if sb_needed && [[ ! -x $SB_BIN ]]; then install_singbox; fi
   if ! sb_needed && [[ -x $SB_BIN ]]; then svc_disable_stop sing-box; fi
   apply_all
-  ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}$( ((HY2_ENABLED)) && echo "，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}")"
+  local extra=""
+  if (( HY2_ENABLED )); then extra+="，Hy2 外部端口 ${oldh:-无} -> ${HY2_EXT_PORT}，跳跃 ${HOP_EXT_RANGE:-关闭}"; fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then extra+="，XHTTP 外部端口 ${oldxh:-无} -> ${XHTTP_EXT_PORT}"; fi
+  ok "已更新：Reality 外部端口 ${oldx} -> ${XRAY_EXT_PORT}${extra}"
   cloud_fw_reminder
 }
 choose_ports_interactive() {
-  # 修改端口时允许当前服务占用自身端口
-  local save_opt=$OPT_PORT save_h=$OPT_HY2_PORT
-  OPT_PORT="" OPT_HY2_PORT=""
+  # 保留 --port / --hy2-port / --xhttp-port。没写的那些会在 choose_ports 里询问。
   choose_ports
-  OPT_PORT=$save_opt OPT_HY2_PORT=$save_h
 }
 
 menu_users() {

@@ -32,6 +32,17 @@ export_put() { # $1 源文件 $2 包内相对路径
   mkdir -p "$(dirname "$dest")"
   install -m 600 "$1" "$dest"
 }
+export_have_tty() { # /dev/tty 打得开、并且真是终端
+  local fd
+  [[ -r /dev/tty && -w /dev/tty ]] || return 1
+  exec {fd}</dev/tty || return 1
+  if [[ -t $fd ]]; then
+    exec {fd}<&-
+    return 0
+  fi
+  exec {fd}<&-
+  return 1
+}
 export_read_pass() { # $1 变量名 $2 提示。优先用环境变量，不回显。
   local __p=""
   if [[ -n ${PROXY_EXPORT_PASS:-} ]]; then
@@ -41,11 +52,13 @@ export_read_pass() { # $1 变量名 $2 提示。优先用环境变量，不回�
   if [[ -t 0 ]]; then
     read -r -s -p "$2" __p || true
     echo
-  elif [[ -r /dev/tty ]]; then
-    read -r -s -p "$2" __p </dev/tty || true
+  elif export_have_tty; then
+    if ! read -r -s -p "$2" __p </dev/tty; then
+      die "需要密码。请设置环境变量 PROXY_EXPORT_PASS。"
+    fi
     echo
   else
-    die "需要密码。请设置环境变量 PROXY_EXPORT_PASS，或在终端里运行。"
+    die "需要密码。请设置环境变量 PROXY_EXPORT_PASS。"
   fi
   [[ -n $__p ]] || die "密码不能为空。"
   printf -v "$1" '%s' "$__p"

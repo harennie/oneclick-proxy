@@ -408,18 +408,23 @@ err_loc() { # $1 合并后的行号
   if [[ -n $loc ]]; then printf '%s' "$loc"; else printf '第 %s 行' "$1"; fi
 }
 err_print_stack() {
-  local i fn bl loc n=0
+  local i fn bl loc n=0 row
+  local -a rows=()
   (( ${#FUNCNAME[@]} > 1 )) || return 0
-  printf '%s调用栈：%s\n' "$C_YELLOW" "$C_NONE" >&2
   for (( i=1; i<${#FUNCNAME[@]}; i++ )); do
     fn=${FUNCNAME[$i]}
-    [[ $fn == on_error || $fn == err_print_stack || $fn == main || $fn == err_loc ]] && continue
+    # main 留着：顶层失败时栈里往往只剩它，丢掉就会只打出一个空的「调用栈」标题。
+    [[ $fn == on_error || $fn == err_print_stack || $fn == err_loc ]] && continue
     bl=${BASH_LINENO[$(( i - 1 ))]:-0}
     [[ $bl =~ ^[0-9]+$ ]] || bl=0
-    loc=$(err_loc "$bl")
+    if [[ $bl == 0 ]]; then loc="脚本入口"
+    else loc=$(err_loc "$bl"); fi
     n=$(( n + 1 ))
-    printf '  [%s] %s() <- %s\n' "$n" "$fn" "$loc" >&2
+    rows+=("$(printf '  [%s] %s() <- %s' "$n" "$fn" "$loc")")
   done
+  (( n > 0 )) || return 0
+  printf '%s调用栈：%s\n' "$C_YELLOW" "$C_NONE" >&2
+  for row in "${rows[@]}"; do printf '%s\n' "$row" >&2; done
   return 0
 }
 on_error() {
