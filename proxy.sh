@@ -72,7 +72,7 @@ readonly SB_RC="/etc/init.d/sing-box"
 readonly SB_LOG="/var/log/sing-box/sing-box.log"
 readonly FW_FILE="${STATE_DIR}/firewall.nft"
 readonly FW_UNIT="/etc/systemd/system/proxy-oneclick-fw.service"
-# 写进 ufw / firewalld 的条目。只删除这份清单里的规则，不动用户原来就有的放行。
+# 写进 ufw / firewalld 的条目。只删除这份清单里、且确为本脚本新建的规则。不记录 SSH，也不改用户原来就有的放行。
 readonly FW_HOST_FILE="${STATE_DIR}/fw-host.list"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-proxy-tune.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-proxy-tune.conf"
@@ -369,7 +369,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5082:src/cert.sh:1;7114:src/cdn.sh:1;8099:src/link.sh:1;8488:src/singbox.sh:1;9066:src/nat.sh:1;9704:src/selftest.sh:1;9849:src/land.sh:1;11295:src/menu.sh:1;11861:src/route.sh:1;12376:src/export.sh:1;12574:src/doctor.sh:1;12869:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5254:src/cert.sh:1;7286:src/cdn.sh:1;8271:src/link.sh:1;8660:src/singbox.sh:1;9238:src/nat.sh:1;9876:src/selftest.sh:1;10021:src/land.sh:1;11467:src/menu.sh:1;12036:src/route.sh:1;12551:src/export.sh:1;12749:src/doctor.sh:1;13044:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -4105,8 +4105,12 @@ fw_wireguard_present() {
   return 1
 }
 fw_ufw_active() {
+  local st=""
   svc_active ufw && return 0
-  have ufw && ufw status 2>/dev/null | grep -q 'Status: active'
+  have ufw || return 1
+  # 不用 grep -q 接管道：pipefail 下 ufw 写到一半会被 SIGPIPE，活动状态会误判。
+  st=$(ufw status 2>/dev/null || true)
+  [[ $st == *'Status: active'* ]]
 }
 fw_firewalld_active() {
   svc_active firewalld && return 0
@@ -4321,6 +4325,8 @@ fw_switch_mode() { # strict|allow|off。已安装后从菜单或 proxy firewall 
     allow)
       FW_MODE=allow
       FW_ENABLED=1
+      # 严格模式停过的 ufw 要先放行 SSH 再打开，否则默认拒绝会把登录关在外面。
+      fw_reenable_disabled
       if fw_ufw_active || fw_firewalld_active; then FW_HOST_SYNC=1; else FW_HOST_SYNC=0; fi
       save_state
       apply_firewall
@@ -4370,7 +4376,7 @@ handle_other_firewalls() {
   local fw
   FW_HOST_SYNC=0
   for fw in firewalld ufw; do
-    if svc_active "$fw" || { [[ $fw == ufw ]] && have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; }; then
+    if { [[ $fw == ufw ]] && fw_ufw_active; } || { [[ $fw == firewalld ]] && fw_firewalld_active; }; then
       warn "检测到 ${fw} 正在运行。严格模式会把入站改成默认拒绝，和它叠在一起容易互相挡住。"
       if confirm "是否停用 ${fw}（严格模式由本脚本放行 SSH 和现有端口；卸载时可恢复）？" y; then
         fw_host_clear
@@ -4803,12 +4809,159 @@ fw_collect_want() {
   (( ${XHTTP_TLS_ENABLED:-0} == 1 )) && fw_want_add tcp "$XHTTP_TLS_PORT"
   (( ${WS_ENABLED:-0} == 1 )) && fw_want_add tcp "$WS_PORT"
   cert_is_public && fw_want_add tcp "$SUB_PORT"
-  for p in $SSH_PORTS; do fw_want_add tcp "$p"; done
+  # SSH 不进这份清单。ufw 对已有规则再 allow 只会改注释，记下来之后清理时会把用户自己的 SSH 删掉。
   if (( ${HY2_ENABLED:-0} == 1 )) && [[ -n ${HOP_RANGE:-} ]]; then
     for seg in ${HOP_RANGE//,/ }; do fw_want_add udp "$seg"; done
   fi
   for p in ${EXTRA_TCP-}; do fw_want_add tcp "$p"; done
   for p in ${EXTRA_UDP-}; do fw_want_add udp "$p"; done
+}
+# 22，以及已保存的 SSH 端口、当前会话端口。主机防火墙不记录、不删除这些规则。
+fw_is_ssh_port() {
+  local p=$1 cur=""
+  [[ $p =~ ^[0-9]+$ ]] || return 1
+  [[ $p == 22 ]] && return 0
+  [[ " ${SSH_PORTS:-} " == *" $p "* ]] && return 0
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    cur=$(awk '{print $4}' <<<"$SSH_CONNECTION")
+    [[ $cur == "$p" ]] && return 0
+  fi
+  return 1
+}
+fw_host_port_is_ssh() { # 22、22:80、22-80 都按起始端口判断
+  local p=${1//:/-}
+  p=${p%%-*}
+  fw_is_ssh_port "$p"
+}
+fw_disabled_has() { [[ " ${DISABLED_FW:-} " == *" $1 "* ]]; }
+fw_disabled_drop() {
+  local fw=$1 out="" x
+  for x in ${DISABLED_FW:-}; do
+    [[ $x == "$fw" ]] && continue
+    out+="${x} "
+  done
+  DISABLED_FW=${out% }
+}
+# 一条已有规则的端口部分是否盖住想放行的端口或范围。
+fw_one_span_covers() { # $1 已有（22 或 20000:50000） $2 想要的
+  local span=$1 want=$2 a b wa wb
+  if [[ $want == *:* ]]; then
+    wa=${want%%:*}; wb=${want##*:}
+    [[ $wa =~ ^[0-9]+$ && $wb =~ ^[0-9]+$ ]] || return 1
+    [[ $span == *:* ]] || return 1
+    a=${span%%:*}; b=${span##*:}
+    [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]] || return 1
+    if (( 10#$a <= 10#$wa && 10#$b >= 10#$wb )); then return 0; fi
+    return 1
+  fi
+  [[ $want =~ ^[0-9]+$ ]] || return 1
+  if [[ $span == *:* ]]; then
+    a=${span%%:*}; b=${span##*:}
+    [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]] || return 1
+    if (( 10#$a <= 10#$want && 10#$want <= 10#$b )); then return 0; fi
+    return 1
+  fi
+  [[ $span == "$want" ]]
+}
+fw_token_covers_port() { # $1 可能带逗号的端口 $2 想要的端口或冒号范围
+  local tok=$1 want=$2 part rest
+  rest=$tok
+  while [[ -n $rest ]]; do
+    part=${rest%%,*}
+    if [[ $rest == *","* ]]; then rest=${rest#*,}; else rest=""; fi
+    fw_one_span_covers "$part" "$want" && return 0
+  done
+  return 1
+}
+# $1 规则目标（22/tcp、22、20000:50000/udp） $2 动作 $3 想放行的 spec
+fw_ufw_rule_covers() {
+  local to=${1,,} act=${2,,} spec=${3,,} wproto wport rproto rports
+  [[ $act == allow || $act == limit ]] || return 1
+  to=${to%%$'\r'}
+  to=${to//" (v6)"/}
+  to=${to%% }
+  [[ -n $to ]] || return 1
+  # OpenSSH、Anywhere 这类名字不含端口，不拿来凑。
+  [[ $to == *[!0-9]* && $to != *[:/,]* ]] && return 1
+  wproto=${spec##*/}
+  wport=${spec%/*}
+  if [[ $to == */* ]]; then
+    rproto=${to##*/}
+    rports=${to%/*}
+  else
+    rproto=any
+    rports=$to
+  fi
+  [[ $rproto == "$wproto" || $rproto == any ]] || return 1
+  fw_token_covers_port "$rports" "$wport"
+}
+# 不论注释，只要已有放行盖住这条端口/协议就不算我们新加的。
+fw_ufw_covers() { # $1 = 443/tcp 或 20000:50000/udp
+  local spec=${1,,} blob="" line="" to="" act="" mode=status rest="" pproto="" pport=""
+  have ufw || return 1
+  blob=$( { ufw status numbered; printf '\n--SHOW-ADDED--\n'; ufw show added; } 2>/dev/null || true)
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == '--SHOW-ADDED--' ]]; then mode=added; continue; fi
+    if [[ $mode == status ]]; then
+      [[ $line =~ ^[[:space:]]*\[[[:space:]]*[0-9]+\][[:space:]]*(.*)$ ]] || continue
+      rest=${BASH_REMATCH[1]}
+      [[ $rest =~ ^([^[:space:]]+)([[:space:]]+\(v6\))?[[:space:]]+(ALLOW|DENY|REJECT|LIMIT)([[:space:]]|$) ]] || continue
+      to=${BASH_REMATCH[1]}
+      act=${BASH_REMATCH[3]}
+      fw_ufw_rule_covers "$to" "$act" "$spec" && return 0
+    elif [[ $line =~ ^ufw[[:space:]]+(allow|limit|deny|reject)[[:space:]]+ ]]; then
+      act=${BASH_REMATCH[1]}
+      if [[ $line =~ ^ufw[[:space:]]+(allow|limit|deny|reject)[[:space:]]+([0-9][^[:space:]]*) ]]; then
+        to=${BASH_REMATCH[2]}
+        fw_ufw_rule_covers "$to" "$act" "$spec" && return 0
+      fi
+      pproto=""; pport=""
+      [[ $line =~ proto[[:space:]]+(tcp|udp) ]] && pproto=${BASH_REMATCH[1]}
+      [[ $line =~ port[[:space:]]+([0-9][0-9]*(:[0-9]+)?) ]] && pport=${BASH_REMATCH[1]}
+      if [[ -n $pport ]]; then
+        [[ -n $pproto ]] || pproto=any
+        fw_ufw_rule_covers "${pport}/${pproto}" "$act" "$spec" && return 0
+      fi
+    fi
+  done <<<"$blob"
+  return 1
+}
+fw_ufw_ensure_ssh() {
+  local p spec seen=""
+  have ufw || return 0
+  detect_ssh_ports
+  for p in ${SSH_PORTS:-} 22; do
+    is_port "$p" || continue
+    [[ " $seen " == *" $p "* ]] && continue
+    seen+=" $p"
+    spec="${p}/tcp"
+    if fw_ufw_covers "$spec"; then continue; fi
+    # 不写 proxy-oneclick，也不记入清单，避免以后被当成自己的规则删掉。
+    ufw allow "$spec" >/dev/null 2>&1 || warn "放行 SSH ${spec} 失败。"
+  done
+  return 0
+}
+fw_ufw_enable_kept() {
+  have ufw || return 0
+  fw_ufw_ensure_ssh
+  if have systemctl; then systemctl enable --now ufw >/dev/null 2>&1 || true; fi
+  if ! ufw --force enable >/dev/null 2>&1; then
+    warn "重新启用 ufw 失败。"
+    return 1
+  fi
+  return 0
+}
+fw_reenable_disabled() {
+  if fw_disabled_has ufw && have ufw; then
+    if fw_ufw_enable_kept; then ok "已重新启用 ufw（已先放行 SSH）。"; fi
+    fw_disabled_drop ufw
+  fi
+  if fw_disabled_has firewalld; then
+    if have systemctl; then systemctl enable --now firewalld >/dev/null 2>&1 || true; fi
+    fw_disabled_drop firewalld
+    ok "已重新启用 firewalld。"
+  fi
+  return 0
 }
 # ufw 编号规则里，只删带本脚本注释的那一条
 # 按整条端口匹配，避免 443 命中 8443
@@ -4816,13 +4969,20 @@ fw_ufw_line_ours() { # $1 = 443/tcp 或 20000:50000/udp
   grep -E "(^|[^0-9:])${1}([^0-9:]|$)" | grep -F 'proxy-oneclick'
 }
 fw_ufw_delete_ours() {
-  local spec=$1 n i
+  local spec=$1 n="" i port
   have ufw || return 0
+  port=${spec%%/*}
+  fw_host_port_is_ssh "$port" && return 0
   for i in 1 2 3 4 5 6 7 8; do
     n=$(ufw status numbered 2>/dev/null | fw_ufw_line_ours "$spec" | head -n1 | sed -n 's/^[[:space:]]*\[ *\([0-9][0-9]*\)\].*/\1/p') || true
-    [[ -n $n ]] || return 0
+    [[ -n $n ]] || break
     ufw --force delete "$n" >/dev/null 2>&1 || return 0
   done
+  # 停用时编号列表是空的，规则仍在 show added 里。
+  if ufw show added 2>/dev/null | fw_ufw_line_ours "$spec" >/dev/null; then
+    ufw --force delete allow "$spec" >/dev/null 2>&1 || true
+  fi
+  return 0
 }
 fw_ufw_ours_present() {
   ufw status 2>/dev/null | fw_ufw_line_ours "$1" >/dev/null
@@ -4844,8 +5004,12 @@ fw_host_clear() {
   while read -r kind a b c _; do
     [[ -n $kind ]] || continue
     case $kind in
-      ufw) fw_ufw_delete_ours "${b}/${a}" ;;
+      ufw)
+        fw_host_port_is_ssh "$b" && continue
+        fw_ufw_delete_ours "${b}/${a}"
+        ;;
       firewalld)
+        fw_host_port_is_ssh "$c" && continue
         have firewall-cmd || continue
         firewall-cmd --permanent --zone="$a" --remove-port="${c}/${b}" >/dev/null 2>&1 || true
         reload=1
@@ -4877,10 +5041,12 @@ fw_host_sync() {
       [[ -n $kind ]] || continue
       case $kind in
         ufw)
+          fw_host_port_is_ssh "$b" && continue
           key="${a} ${b//:/-}"
           if (( ! ufw_on )) || ! fw_want_has "$key"; then fw_ufw_delete_ours "${b}/${a}"; fi
           ;;
         firewalld)
+          fw_host_port_is_ssh "$c" && continue
           key="${b} ${c}"
           if (( ! fwd_on )) || [[ $a != "$zone" ]] || ! fw_want_has "$key"; then
             firewall-cmd --permanent --zone="$a" --remove-port="${c}/${b}" >/dev/null 2>&1 || true
@@ -4897,8 +5063,14 @@ fw_host_sync() {
     if (( ufw_on )); then
       uport=${port//-/:}
       spec="${uport}/${proto}"
-      if fw_ufw_ours_present "$spec"; then
-        new+="ufw ${proto} ${uport}"$'\n'
+      if fw_host_port_is_ssh "$port"; then
+        :
+      elif fw_ufw_covers "$spec"; then
+        # 已有放行就别再 allow：ufw 会改掉原注释，随后清理会把用户的规则删掉。
+        # 只有清单里本来就有、而且注释仍是本脚本的，才继续记着。
+        if fw_ufw_ours_present "$spec" && fw_line_has "$old" "ufw ${proto} ${uport}"; then
+          new+="ufw ${proto} ${uport}"$'\n'
+        fi
       elif ufw allow "$spec" comment proxy-oneclick >/dev/null 2>&1; then
         new+="ufw ${proto} ${uport}"$'\n'
       else
@@ -11843,9 +12015,12 @@ do_uninstall() {
   local fw
   for fw in $DISABLED_FW; do
     if confirm "安装时停用了 ${fw}，是否重新启用？" y; then
-      systemctl enable --now "$fw" >/dev/null 2>&1 || true
-      [[ $fw == ufw ]] && { ufw --force enable >/dev/null 2>&1 || true; }
-      ok "已重新启用 ${fw}"
+      if [[ $fw == ufw ]]; then
+        if fw_ufw_enable_kept; then ok "已重新启用 ${fw}"; fi
+      else
+        systemctl enable --now "$fw" >/dev/null 2>&1 || true
+        ok "已重新启用 ${fw}"
+      fi
     fi
   done
   (( SWAP_CREATED )) && info "安装时创建的 /swapfile 已保留（如需删除: swapoff /swapfile && rm /swapfile 并编辑 /etc/fstab）。"

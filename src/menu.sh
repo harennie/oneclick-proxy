@@ -549,9 +549,12 @@ do_uninstall() {
   local fw
   for fw in $DISABLED_FW; do
     if confirm "安装时停用了 ${fw}，是否重新启用？" y; then
-      systemctl enable --now "$fw" >/dev/null 2>&1 || true
-      [[ $fw == ufw ]] && { ufw --force enable >/dev/null 2>&1 || true; }
-      ok "已重新启用 ${fw}"
+      if [[ $fw == ufw ]]; then
+        if fw_ufw_enable_kept; then ok "已重新启用 ${fw}"; fi
+      else
+        systemctl enable --now "$fw" >/dev/null 2>&1 || true
+        ok "已重新启用 ${fw}"
+      fi
     fi
   done
   (( SWAP_CREATED )) && info "安装时创建的 /swapfile 已保留（如需删除: swapoff /swapfile && rm /swapfile 并编辑 /etc/fstab）。"

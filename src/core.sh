@@ -71,7 +71,7 @@ readonly SB_RC="/etc/init.d/sing-box"
 readonly SB_LOG="/var/log/sing-box/sing-box.log"
 readonly FW_FILE="${STATE_DIR}/firewall.nft"
 readonly FW_UNIT="/etc/systemd/system/proxy-oneclick-fw.service"
-# 写进 ufw / firewalld 的条目。只删除这份清单里的规则，不动用户原来就有的放行。
+# 写进 ufw / firewalld 的条目。只删除这份清单里、且确为本脚本新建的规则。不记录 SSH，也不改用户原来就有的放行。
 readonly FW_HOST_FILE="${STATE_DIR}/fw-host.list"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-proxy-tune.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-proxy-tune.conf"
