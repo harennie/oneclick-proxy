@@ -193,7 +193,7 @@ proxy proto
 - **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。Cloudflare 源站证书不会交给它们。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
 - **CDN 上的两条线路（默认关闭）**：VLESS + XHTTP + TLS（TCP 2083，`mode=packet-up`）和 VLESS + WebSocket + TLS（TCP 2087）。用公开证书，或只用这两条时改用 Cloudflare 源站证书。都不是 REALITY。打开时脚本会打印 DNS、橙色云朵、回源端口、加密模式和客户端链接该怎么填。详见「经过 CDN 的两条线路」。
 - **输出**：每个已开启协议单独一块：名称、地址、端口各一行，链接本身最后单独一行。vless://（含 / 不含 pqv）、xhttp 的 vless://（`mode=stream-one`，无 flow）、hysteria2://（未申请证书时带 `mport`、`sni`、`insecure=1`、`pinSHA256`；申请之后地址和 SNI 为自有域名，不再带 insecure / pin）、可选的 trojan:// / tuic:// / anytls://。打开 CDN 线路后另有两条 vless://（`security=tls`，没有 flow / pbk / sid / pqv / insecure）。终端二维码，mihomo（Clash.Meta）YAML 片段。申请公开证书后另有仅 HTTPS 的订阅地址。源站证书没有订阅。
-- **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」，第 17 项是「申请证书」，第 18 项是「回程线路检测」，第 19 项是「导出配置」，第 20 项是「导入配置」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
+- **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」，第 17 项是「申请证书」，第 18 项是「回程线路检测」，第 19 项是「导出配置」，第 20 项是「导入配置」，第 21 项是「健康检查」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
 - **回程线路检测**：`proxy route` 只测从本机发向大陆的回程（电信 / 联通 / 移动，北京 / 上海 / 广州）。用 nexttrace 的 TCP，缺了会自动装。结果是一张短表和按运营商的汇总，不测国际线路，也不测从家里到本机的去程。不改配置，不重启。详见「回程线路检测」。
 - **落地机 / 落地转发**：`--land` 把本机装成只跑 Shadowsocks 2022 的出口（落地机）；已安装的节点用 `proxy land-add 'ss://...'` 把出口切到落地机（中转），见下文。
 - **健壮性**：`set -o errexit -o pipefail -o errtrace` + 错误陷阱提示出错行；可重复运行（保留已有密钥，只更新组件与配置）；安装前检查端口占用；没有 IPv6 也能正常工作（链接使用 IPv4）；通过 shellcheck 检查。
@@ -878,12 +878,13 @@ Hysteria2 ▶ …              sing-box  ▶ 未安装
  8. 运行状态 / 日志                   17. 申请证书
  9. 网络测速 / 延迟提示               18. 回程线路检测
 19. 导出配置（迁到另一台机器）       20. 导入配置
+21. 健康检查
 ────────────────────────────────
   0. 退出
 ════════════════════════════════
 ```
 
-NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 17 项（没有客户端直连协议，第 12 项仍是回程线路检测，第 13–15 项是出口：本机直连 / 加密转发 / 原样转发，第 16–17 项是导出和导入），框标题同样是 `oneclick proxy`。
+NAT 模式下第 10 项显示为「NAT 信息 / 端口跳跃」。落地机菜单是 18 项（没有客户端直连协议，第 12 项仍是回程线路检测，第 13–15 项是出口：本机直连 / 加密转发 / 原样转发，第 16–17 项是导出和导入，第 18 项是健康检查），框标题同样是 `oneclick proxy`。
 
 **协议开关**（第 16 项，或 `proxy proto`）：逐个打开 / 关闭 Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS，以及 CDN 上的 XHTTP+TLS（第 7 项）、WebSocket+TLS（第 8 项）。第 9 项开关这两条的 VLESS Encryption，并显示当前状态。关掉只停止监听，UUID、x25519、ShortId、ML-DSA 种子、XHTTP 路径、CDN 路径和各协议密码都留着。至少保留一个协议。重新生成密钥（第 4 项）会换掉这些密钥和 CDN 路径，但不会把已关闭的协议重新打开。已申请公开证书时，重新生成密钥不会把 Hysteria2 / TUIC / AnyTLS 换回自签证书。打开 CDN 线路时会打印教程并做一次检查。想再看教程：`proxy cdn`。
 
@@ -903,6 +904,8 @@ bash proxy.sh --import /root/node.tar.gz --auto
 ```
 
 `--password` 会询问密码（不回显），用 `openssl enc -aes-256-cbc -pbkdf2` 加密。也可以把密码放在环境变量 `PROXY_EXPORT_PASS`。不会把密钥打成一行 base64 放在命令行里。NAT 机器导入后要重新填映射，例如再加上 `--nat-ports`。
+
+**健康检查**（第 21 项，落地机菜单第 18 项，或 `proxy doctor`）：只读。依次看时间偏差（Cloudflare `cdn-cgi/trace` 的 `ts=`，超过 15 秒提醒）、服务是否在跑、端口是否在听、最近有没有内存不足或崩溃、nftables 表和已放行端口、ufw/firewalld 同步、Hysteria2 端口跳跃的 DNAT 和计数器、SNI 是否还合格、REALITY / XHTTP 回环自检、外部检查命令，以及公开证书是否快到期（不足 7 天提醒）。有失败项时退出码非 0。`proxy doctor --fix` 只做安全修复：拉起已停止的服务、`chronyc makestep` 或重启 timesyncd / OpenRC chronyd、按清单重写 ufw/firewalld、把 `state.env` 改成 600。不加 `--fix` 时不改任何配置。
 
 **切换 NAT 模式**（第 15 项，落地机菜单为第 11 项）：`自动`（默认：Alpine 强制 NAT、LXC/OpenVZ 容器安装时询问、已安装的沿用原模式）/ `开`（强制 NAT 映射端口流程，等同 `--nat`）/ `关`（强制普通模式，等同 `--no-nat`；Alpine 不可用）。在第 1 或 13 项安装前选择即可；设置保存在 `state.env`（`NAT_PREF`），之后的修改端口等操作都按它执行。已安装时切换到不同模式会提示立即重新安装（保留密钥 / UUID）；命令行 `--nat` / `--no-nat` 优先并同步该设置。
 

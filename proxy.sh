@@ -209,6 +209,7 @@ OPT_FORCE=0         # land-add 测试不通过也强制启用
 OPT_IMPORT=""       # --import / proxy import 的文件
 OPT_EXPORT_PATH=""  # proxy export 的输出路径，空则用默认
 OPT_EXPORT_ENC=0    # 1 = 导出时用 openssl 加密
+OPT_DOCTOR_FIX=0    # 1 = proxy doctor --fix
 IMPORT_MODE=0       # 1 = 本次安装来自导入，要重新检测 IP / NAT / SNI / 防火墙
 OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
 OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）
@@ -360,7 +361,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;705:src/os.sh:1;1214:src/tune.sh:1;2014:src/xray.sh:1;3531:src/hy2.sh:1;3637:src/firewall.sh:1;4681:src/cert.sh:1;6713:src/cdn.sh:1;7698:src/link.sh:1;8087:src/singbox.sh:1;8643:src/nat.sh:1;9281:src/selftest.sh:1;9420:src/land.sh:1;10866:src/menu.sh:1;11386:src/route.sh:1;11901:src/export.sh:1;12099:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;706:src/os.sh:1;1215:src/tune.sh:1;2015:src/xray.sh:1;3532:src/hy2.sh:1;3638:src/firewall.sh:1;4682:src/cert.sh:1;6714:src/cdn.sh:1;7699:src/link.sh:1;8088:src/singbox.sh:1;8644:src/nat.sh:1;9282:src/selftest.sh:1;9427:src/land.sh:1;10873:src/menu.sh:1;11393:src/route.sh:1;11908:src/export.sh:1;12106:src/doctor.sh:1;12401:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -9285,6 +9286,7 @@ do_install() {
 # （VLESS + Vision + REALITY + pqv）连接本机 127.0.0.1:XRAY_PORT，再经它访问外网。
 # 只打印结果，不影响安装；客户端限制 GOMEMLIMIT，128MB 小鸡也可运行。
 reality_selftest() {
+  REALITY_SELFTEST=skip
   (( ${REALITY_ENABLED:-1} )) || return 0
   [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XRAY_PORT ]] || { warn "跳过 REALITY 自检（缺少 xray 或参数）。"; return 0; }
   mktmp
@@ -9332,6 +9334,7 @@ reality_selftest() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   if (( rc == 0 )); then
+    REALITY_SELFTEST=ok
     local h=${ok_url#https://}; h=${h%%/*}
     ok "REALITY 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
     if relay_active; then
@@ -9339,6 +9342,7 @@ reality_selftest() {
       else warn "经落地转发查询出口 IP 失败。"; fi
     fi
   else
+    REALITY_SELFTEST=fail
     local direct=""
     direct=$(curl -s -o /dev/null --connect-timeout 8 -m 12 -w '%{http_code}' "https://www.gstatic.com/generate_204" 2>/dev/null) || true
     if [[ ! $direct =~ ^[23][0-9][0-9]$ ]]; then
@@ -9354,6 +9358,7 @@ reality_selftest() {
 }
 
 xhttp_selftest() {
+  XHTTP_SELFTEST=skip
   (( ${XHTTP_ENABLED:-0} )) || return 0
   [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
   local dest=${XHTTP_PORT:-}
@@ -9406,9 +9411,11 @@ xhttp_selftest() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   if (( rc == 0 )); then
+    XHTTP_SELFTEST=ok
     local h=${ok_url#https://}; h=${h%%/*}
     ok "XHTTP 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
   else
+    XHTTP_SELFTEST=fail
     warn "XHTTP 自检未通过。可查看 proxy status；客户端链接里的 mode 必须是 stream-one，path 必须与服务端一致。"
     grep -vi 'privatekey\|seed' "${dir}/client.log" 2>/dev/null | tail -n 3 | sed 's/^/    /' || true
   fi
@@ -12095,6 +12102,301 @@ menu_import() {
   confirm "导入会用文件里的密钥重新安装，并重新检测 IP、NAT 和防火墙。继续？" y || return 0
   do_import
 }
+# @module src/doctor.sh
+# ============================================================
+#                    proxy doctor 健康检查
+# ============================================================
+# 不加 --fix 时只读。--fix 只做这几件：拉起已停止的服务、步进对时、
+# 按清单重写 ufw/firewalld、把 state.env 改为 600。
+DOCTOR_FIX=0
+DOCTOR_FAIL=0
+doc_line() { printf '  %-6s %s\n' "$1" "$2"; }
+doc_ok() { doc_line OK "$*"; }
+doc_warn() { doc_line WARN "$*"; }
+doc_fail() { doc_line FAIL "$*"; DOCTOR_FAIL=1; }
+doctor_fix_time() {
+  if have chronyc && chronyc makestep >/dev/null 2>&1; then
+    doc_ok "已执行 chronyc makestep。"
+    return 0
+  fi
+  if [[ $INIT_SYS == systemd ]] && systemctl cat systemd-timesyncd >/dev/null 2>&1; then
+    systemctl restart systemd-timesyncd >/dev/null 2>&1 && { doc_ok "已重启 systemd-timesyncd。"; return 0; }
+  fi
+  if is_openrc && [[ -x /etc/init.d/chronyd ]]; then
+    rc-service chronyd restart >/dev/null 2>&1 9>&- && { doc_ok "已重启 OpenRC chronyd。"; return 0; }
+  fi
+  doc_warn "没有可用的对时命令（chronyc / timesyncd / chronyd）。"
+}
+doctor_clock() {
+  local body="" ts="" now off
+  body=$(curl -fsS --connect-timeout 5 -m 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || body=""
+  [[ $body == *ts=* ]] || body=$(curl -fsS --connect-timeout 5 -m 8 https://1.1.1.1/cdn-cgi/trace 2>/dev/null) || body=""
+  ts=$(sed -n 's/^ts=\([0-9][0-9]*\).*/\1/p' <<<"$body" | head -n1)
+  if [[ -z $ts ]]; then
+    doc_warn "对不上时间：Cloudflare trace 不可达，已跳过。"
+    return 0
+  fi
+  now=$(date +%s)
+  off=$(( now - ts ))
+  (( off < 0 )) && off=$(( -off ))
+  if (( off > 15 )); then
+    doc_warn "本机时间与 Cloudflare 相差 ${off} 秒（超过 15 秒）。REALITY 可能握手失败。"
+    if (( DOCTOR_FIX )); then doctor_fix_time; else echo "        可执行: proxy doctor --fix"; fi
+  else
+    doc_ok "时间偏差 ${off} 秒。"
+  fi
+}
+doctor_crash_scan() {
+  local svc=$1 hits="" log
+  if have journalctl; then
+    hits=$(journalctl -u "$svc" --since "24 hours ago" -n 300 --no-pager 2>/dev/null | grep -Ei 'out of memory|oom-kill|segfault|panic' | tail -n 3) || true
+  fi
+  log=$(svc_log_file "$svc" 2>/dev/null || true)
+  if [[ -n $log && -f $log ]]; then
+    hits+=$'\n'$(grep -Ei 'out of memory|oom-kill|segfault|panic' "$log" 2>/dev/null | tail -n 3 || true)
+  fi
+  hits=$(printf '%s\n' "$hits" | sed '/^$/d')
+  if [[ -n $hits ]]; then
+    doc_warn "${svc} 最近日志里有崩溃或内存不足记录。"
+    printf '%s\n' "$hits" | sed 's/^/        /'
+  fi
+}
+doctor_one_svc() { # $1 服务名 $2 是否必须（1/0）
+  local svc=$1 must=$2
+  if ! svc_exists "$svc"; then
+    if (( must )); then doc_fail "没有 ${svc} 服务。"; else return 0; fi
+    return 0
+  fi
+  if svc_active "$svc"; then
+    doc_ok "${svc} 正在运行。"
+  else
+    doc_fail "${svc} 没有在运行（$(svc_state "$svc")）。"
+    if (( DOCTOR_FIX )); then
+      if svc_restart "$svc" && sleep 1 && svc_active "$svc"; then doc_ok "已重新拉起 ${svc}。"
+      else doc_fail "重新拉起 ${svc} 失败。可查看: proxy status"; fi
+    else
+      echo "        可执行: proxy doctor --fix"
+    fi
+  fi
+  doctor_crash_scan "$svc"
+}
+doctor_port() { # $1 tcp|udp $2 port $3 名称
+  local proto=$1 port=$2 name=$3
+  [[ -n $port && $port != 0 ]] || return 0
+  if port_in_use "$proto" "$port"; then doc_ok "${name} 正在监听 ${proto^^}/${port}。"
+  else doc_fail "${name} 没有监听 ${proto^^}/${port}。可查看: proxy status"; fi
+}
+doctor_services() {
+  local need_x=0
+  if declare -F xray_inbound_needed >/dev/null && xray_inbound_needed; then need_x=1; fi
+  (( LAND_MODE )) && need_x=1
+  doctor_one_svc xray "$need_x"
+  if (( need_x )); then doctor_port tcp "$XRAY_PORT" "Xray"; fi
+  if (( HY2_ENABLED )); then
+    doctor_one_svc hysteria-server 1
+    doctor_port udp "$HY2_PORT" "Hysteria2"
+  fi
+  if sb_needed; then
+    doctor_one_svc sing-box 1
+    (( TUIC_ENABLED )) && doctor_port udp "$TUIC_PORT" "TUIC"
+    (( ANYTLS_ENABLED )) && doctor_port tcp "$ANYTLS_PORT" "AnyTLS"
+  fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then doctor_port tcp "$XHTTP_PORT" "XHTTP"; fi
+  if [[ -f $STATE_FILE ]]; then
+    local mode
+    mode=$(stat -c %a "$STATE_FILE" 2>/dev/null || true)
+    if [[ $mode == 600 ]]; then doc_ok "state.env 权限是 600。"
+    elif [[ -n $mode ]]; then
+      doc_warn "state.env 权限是 ${mode}，应为 600。"
+      if (( DOCTOR_FIX )); then chmod 600 "$STATE_FILE" && doc_ok "已把 state.env 改为 600。"; fi
+    fi
+  fi
+}
+doctor_fw_ports_present() {
+  local text=$1 miss=0 p
+  if (( REALITY_ENABLED )); then
+    grep -Eq "dport .*${XRAY_PORT}([^0-9]|$)" <<<"$text" || miss=1
+  fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then
+    grep -Eq "dport .*${XHTTP_PORT}([^0-9]|$)" <<<"$text" || miss=1
+  fi
+  if (( HY2_ENABLED )); then
+    grep -Eq "dport .*${HY2_PORT}([^0-9]|$)" <<<"$text" || miss=1
+  fi
+  (( miss )) && return 1
+  return 0
+}
+doctor_host_sync() {
+  if ! fw_ufw_active && ! fw_firewalld_active; then
+    doc_ok "本机没有正在运行的 ufw 或 firewalld。"
+    return 0
+  fi
+  if [[ ${FW_HOST_SYNC:-0} != 1 ]]; then
+    doc_warn "ufw 或 firewalld 正在运行，当前没有同步代理端口。只放行模式可执行: proxy firewall allow"
+    return 0
+  fi
+  local kind a b c miss=0
+  if [[ ! -s $FW_HOST_FILE ]]; then
+    doc_fail "应该同步到 ufw/firewalld，但 fw-host.list 是空的。"
+    miss=1
+  else
+    while read -r kind a b c _; do
+      [[ -n $kind ]] || continue
+      case $kind in
+        ufw) fw_ufw_ours_present "${b}/${a}" || miss=1 ;;
+        firewalld)
+          firewall-cmd --zone="$a" --query-port="${c}/${b}" >/dev/null 2>&1 || miss=1
+          ;;
+      esac
+    done <"$FW_HOST_FILE"
+    if (( miss )); then doc_fail "ufw/firewalld 里缺了已记录的放行。"
+    else doc_ok "ufw/firewalld 的同步记录还在。"; fi
+  fi
+  if (( miss && DOCTOR_FIX )); then
+    fw_host_sync || true
+    doc_ok "已按清单重新同步 ufw/firewalld。"
+  elif (( miss )); then
+    echo "        可执行: proxy doctor --fix"
+  fi
+}
+doctor_hop() {
+  (( HY2_ENABLED )) || return 0
+  [[ -n ${HOP_RANGE:-} ]] || return 0
+  local rules pkts
+  rules=$(nft list ruleset 2>/dev/null | grep -F 'redirect' | grep -F ":${HY2_PORT}" || true)
+  if [[ -z $rules ]]; then
+    doc_fail "没有找到 Hysteria2 端口跳跃的 DNAT（UDP ${HOP_RANGE} → ${HY2_PORT}）。"
+    return 0
+  fi
+  doc_ok "端口跳跃 DNAT 已加载。"
+  if [[ $rules == *counter* ]]; then
+    pkts=$(sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' <<<"$rules" | head -n1)
+    if [[ ${pkts:-0} == 0 ]]; then doc_warn "端口跳跃计数器仍是 0，还没有流量经过。"
+    else doc_ok "端口跳跃计数器 packets=${pkts}。"; fi
+  else
+    doc_warn "这条跳跃规则没有计数器，看不出有没有流量经过。"
+  fi
+}
+doctor_firewall() {
+  if (( NAT_MODE )); then
+    doc_ok "NAT 模式不写本机入站默认拒绝。外部是否通，看服务商的端口映射。"
+    doctor_hop
+    return 0
+  fi
+  if (( LAND_MODE )); then
+    doc_ok "落地机使用单独的来源白名单，不走节点这套默认拒绝。"
+    return 0
+  fi
+  if [[ ${FW_MODE:-off} == off || ${FW_ENABLED:-0} == 0 ]]; then
+    doc_warn "本脚本没有接管 nftables。系统防火墙和云安全组需要自己放行。"
+  elif have nft && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    local text
+    text=$(nft list table inet "$NFT_TABLE" 2>/dev/null || true)
+    doc_ok "nftables 表 inet ${NFT_TABLE} 已加载（$(fw_mode_label)）。"
+    if doctor_fw_ports_present "$text"; then doc_ok "表里能看到当前协议端口。"
+    else doc_fail "表已加载，但没有看到当前协议端口。可执行: proxy firewall ${FW_MODE}"; fi
+  else
+    doc_fail "防火墙模式是 $(fw_mode_label)，但表 inet ${NFT_TABLE} 没有加载。"
+    echo "        可执行: proxy firewall ${FW_MODE:-allow}"
+  fi
+  doctor_host_sync
+  doctor_hop
+}
+doctor_sni() {
+  (( REALITY_ENABLED || XHTTP_ENABLED )) || return 0
+  [[ -n $SNI ]] || { doc_fail "没有 SNI。可执行: proxy sni"; return 0; }
+  local res
+  res=$(sni_probe "$SNI") || true
+  if [[ $res == PASS* ]]; then doc_ok "SNI ${SNI} 仍然可用。"
+  elif [[ $res == FAIL* ]]; then
+    doc_warn "SNI ${SNI} 现在不合格（${res##*|}）。建议: proxy sni"
+  else
+    doc_warn "SNI 检查没有得到结果。可稍后执行: proxy sni"
+  fi
+}
+doctor_selftests() {
+  if (( REALITY_ENABLED )); then
+    reality_selftest || true
+    case ${REALITY_SELFTEST:-skip} in
+      ok) doc_ok "REALITY 回环自检通过。" ;;
+      fail) doc_fail "REALITY 回环自检未通过。可看上面的原因，或执行 proxy sni。" ;;
+      *) doc_warn "跳过了 REALITY 回环自检。" ;;
+    esac
+  fi
+  if (( XHTTP_ENABLED )); then
+    xhttp_selftest || true
+    case ${XHTTP_SELFTEST:-skip} in
+      ok) doc_ok "XHTTP 回环自检通过。" ;;
+      fail) doc_fail "XHTTP 回环自检未通过。" ;;
+      *) doc_warn "跳过了 XHTTP 回环自检。" ;;
+    esac
+  fi
+  if (( HY2_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )); then
+    doc_ok "Hysteria2 / TUIC / AnyTLS 只核对了本机是否在监听，没有单独的回环握手。"
+  fi
+}
+doctor_reach() {
+  local addr
+  addr=$(server_addr 2>/dev/null || true)
+  [[ -n $addr ]] || addr="<服务器地址>"
+  doc_ok "外部是否通，需要在自己的电脑上检查。云安全组要放行同一批端口。"
+  if (( REALITY_ENABLED )); then
+    echo "        nc -vz ${addr} $(pub_xray_port)"
+    echo "        curl -v --connect-timeout 5 telnet://${addr}:$(pub_xray_port)"
+  fi
+  if (( XHTTP_ENABLED )) && ! xhttp_shared; then
+    echo "        nc -vz ${addr} $(pub_xhttp_port)"
+  fi
+  if (( HY2_ENABLED )); then
+    echo "        nc -uvz ${addr} $(pub_hy2_port)"
+  fi
+}
+doctor_cert() {
+  cert_is_public || return 0
+  [[ -s $CERT_FULLCHAIN ]] || { doc_fail "状态里开了公开证书，但文件不在。"; return 0; }
+  if ! openssl x509 -checkend 0 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+    doc_fail "公开证书已经过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。"
+    return 0
+  fi
+  if ! openssl x509 -checkend $(( 7 * 86400 )) -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+    doc_warn "公开证书不到 7 天就要过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。可执行: proxy cert"
+    return 0
+  fi
+  doc_ok "公开证书未过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。"
+}
+do_doctor() {
+  load_state
+  (( INSTALLED )) || die "还没有安装。"
+  [[ -n $INIT_SYS ]] || detect_init
+  [[ -n $OS_ID ]] || detect_os
+  DOCTOR_FAIL=0
+  [[ ${OPT_DOCTOR_FIX:-0} == 1 ]] && DOCTOR_FIX=1 || DOCTOR_FIX=0
+  echo
+  if (( DOCTOR_FIX )); then hr; _green "  健康检查（会做安全修复）"; hr
+  else hr; _green "  健康检查（只读）"; hr; fi
+  doctor_clock
+  doctor_services
+  doctor_firewall
+  doctor_sni
+  doctor_selftests
+  doctor_reach
+  doctor_cert
+  echo
+  if (( DOCTOR_FAIL )); then
+    warn "有检查未通过。"
+    exit 1
+  fi
+  ok "检查完成，没有失败项。"
+}
+menu_doctor() {
+  need_installed
+  if confirm "顺手做安全修复（拉起停止的服务、对时、同步防火墙、修正 state.env 权限）？" n; then
+    OPT_DOCTOR_FIX=1
+  else
+    OPT_DOCTOR_FIX=0
+  fi
+  do_doctor
+}
 # @module src/cli.sh
 # ============================================================
 #                        菜单 / 参数
@@ -12294,7 +12596,8 @@ show_menu() {
     "申请证书" \
     "回程线路检测" \
     "导出配置（迁到另一台机器）" \
-    "导入配置"
+    "导入配置" \
+    "健康检查"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -12318,6 +12621,7 @@ show_menu() {
     18) act=do_route ;;
     19) act=menu_export ;;
     20) act=menu_import ;;
+    21) act=menu_doctor ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -12367,7 +12671,8 @@ show_land_menu() {
     "出口：加密转发（SS2022 再加密到下一跳）" \
     "出口：原样转发（不解密，DNAT 到最终落地）" \
     "导出配置（迁到另一台机器）" \
-    "导入配置"
+    "导入配置" \
+    "健康检查"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -12388,6 +12693,7 @@ show_land_menu() {
     15) act=menu_land_raw ;;
     16) act=menu_export ;;
     17) act=menu_import ;;
+    18) act=menu_doctor ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -12550,6 +12856,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
   bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
+  proxy doctor        只读健康检查。--fix 只做安全修复（拉起服务、对时、同步防火墙、修正权限）
   proxy speed         测速 / 延迟提示
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
   proxy firewall strict|allow|off
@@ -12816,6 +13123,9 @@ parse_args() {
         OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
       update-script) OPT_ACTION=update-script ;;
       status|log|logs) OPT_ACTION=status ;;
+      doctor)
+        OPT_ACTION=doctor
+        if [[ ${2-} == --fix ]]; then OPT_DOCTOR_FIX=1; shift; fi ;;
       speed) OPT_ACTION=speed ;;
       firewall|fw)
         OPT_ACTION=firewall
@@ -12914,6 +13224,7 @@ main() {
     update) menu_update ;;
     update-script) update_script ;;
     status) menu_status ;;
+    doctor) do_doctor ;;
     speed) menu_speed ;;
     firewall) menu_firewall ;;
     nat) menu_nat ;;

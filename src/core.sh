@@ -208,6 +208,7 @@ OPT_FORCE=0         # land-add 测试不通过也强制启用
 OPT_IMPORT=""       # --import / proxy import 的文件
 OPT_EXPORT_PATH=""  # proxy export 的输出路径，空则用默认
 OPT_EXPORT_ENC=0    # 1 = 导出时用 openssl 加密
+OPT_DOCTOR_FIX=0    # 1 = proxy doctor --fix
 IMPORT_MODE=0       # 1 = 本次安装来自导入，要重新检测 IP / NAT / SNI / 防火墙
 OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
 OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）

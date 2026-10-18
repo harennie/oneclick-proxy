@@ -196,7 +196,8 @@ show_menu() {
     "申请证书" \
     "回程线路检测" \
     "导出配置（迁到另一台机器）" \
-    "导入配置"
+    "导入配置" \
+    "健康检查"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -220,6 +221,7 @@ show_menu() {
     18) act=do_route ;;
     19) act=menu_export ;;
     20) act=menu_import ;;
+    21) act=menu_doctor ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -269,7 +271,8 @@ show_land_menu() {
     "出口：加密转发（SS2022 再加密到下一跳）" \
     "出口：原样转发（不解密，DNAT 到最终落地）" \
     "导出配置（迁到另一台机器）" \
-    "导入配置"
+    "导入配置" \
+    "健康检查"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -290,6 +293,7 @@ show_land_menu() {
     15) act=menu_land_raw ;;
     16) act=menu_export ;;
     17) act=menu_import ;;
+    18) act=menu_doctor ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -452,6 +456,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
   bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
   proxy status        运行状态 / 日志 / 防火墙放行了哪些端口
+  proxy doctor        只读健康检查。--fix 只做安全修复（拉起服务、对时、同步防火墙、修正权限）
   proxy speed         测速 / 延迟提示
   proxy firewall      查看已放行端口并管理防火墙（NAT 模式为端口映射）
   proxy firewall strict|allow|off
@@ -718,6 +723,9 @@ parse_args() {
         OPT_IMPORT=$2; OPT_ACTION=import; shift ;;
       update-script) OPT_ACTION=update-script ;;
       status|log|logs) OPT_ACTION=status ;;
+      doctor)
+        OPT_ACTION=doctor
+        if [[ ${2-} == --fix ]]; then OPT_DOCTOR_FIX=1; shift; fi ;;
       speed) OPT_ACTION=speed ;;
       firewall|fw)
         OPT_ACTION=firewall
@@ -816,6 +824,7 @@ main() {
     update) menu_update ;;
     update-script) update_script ;;
     status) menu_status ;;
+    doctor) do_doctor ;;
     speed) menu_speed ;;
     firewall) menu_firewall ;;
     nat) menu_nat ;;

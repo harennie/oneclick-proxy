@@ -21,6 +21,7 @@ files=(
   src/menu.sh
   src/route.sh
   src/export.sh
+  src/doctor.sh
   src/cli.sh
 )
 

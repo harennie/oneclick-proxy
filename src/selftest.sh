@@ -5,6 +5,7 @@
 # （VLESS + Vision + REALITY + pqv）连接本机 127.0.0.1:XRAY_PORT，再经它访问外网。
 # 只打印结果，不影响安装；客户端限制 GOMEMLIMIT，128MB 小鸡也可运行。
 reality_selftest() {
+  REALITY_SELFTEST=skip
   (( ${REALITY_ENABLED:-1} )) || return 0
   [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XRAY_PORT ]] || { warn "跳过 REALITY 自检（缺少 xray 或参数）。"; return 0; }
   mktmp
@@ -52,6 +53,7 @@ reality_selftest() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   if (( rc == 0 )); then
+    REALITY_SELFTEST=ok
     local h=${ok_url#https://}; h=${h%%/*}
     ok "REALITY 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
     if relay_active; then
@@ -59,6 +61,7 @@ reality_selftest() {
       else warn "经落地转发查询出口 IP 失败。"; fi
     fi
   else
+    REALITY_SELFTEST=fail
     local direct=""
     direct=$(curl -s -o /dev/null --connect-timeout 8 -m 12 -w '%{http_code}' "https://www.gstatic.com/generate_204" 2>/dev/null) || true
     if [[ ! $direct =~ ^[23][0-9][0-9]$ ]]; then
@@ -74,6 +77,7 @@ reality_selftest() {
 }
 
 xhttp_selftest() {
+  XHTTP_SELFTEST=skip
   (( ${XHTTP_ENABLED:-0} )) || return 0
   [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
   local dest=${XHTTP_PORT:-}
@@ -126,9 +130,11 @@ xhttp_selftest() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   if (( rc == 0 )); then
+    XHTTP_SELFTEST=ok
     local h=${ok_url#https://}; h=${h%%/*}
     ok "XHTTP 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
   else
+    XHTTP_SELFTEST=fail
     warn "XHTTP 自检未通过。可查看 proxy status；客户端链接里的 mode 必须是 stream-one，path 必须与服务端一致。"
     grep -vi 'privatekey\|seed' "${dir}/client.log" 2>/dev/null | tail -n 3 | sed 's/^/    /' || true
   fi
