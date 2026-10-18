@@ -26,6 +26,10 @@
 #   bash proxy.sh route           # 回程线路检测（不改配置）
 #   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
 #   bash proxy.sh --help          # 查看全部参数
+#   bash proxy.sh --xray-ver v26.3.27 --hy2-ver v2.6.1 --singbox-ver v1.11.0
+#                                 # 安装指定的已发布版本
+#   proxy update --rollback [xray|hy2|singbox|all]
+#                                 # 用 .bak 换回内核并重启
 # 安装完成后可直接使用命令: proxy
 #
 # 支持: Debian 11/12/13, Ubuntu 20.04+, Rocky/Alma/CentOS Stream 8/9(+), RHEL, Fedora (systemd, amd64/arm64)
@@ -210,6 +214,10 @@ OPT_IMPORT=""       # --import / proxy import 的文件
 OPT_EXPORT_PATH=""  # proxy export 的输出路径，空则用默认
 OPT_EXPORT_ENC=0    # 1 = 导出时用 openssl 加密
 OPT_DOCTOR_FIX=0    # 1 = proxy doctor --fix
+OPT_XRAY_VER=""     # 安装 / proxy update：指定 Xray 发布标签
+OPT_HY2_VER=""      # 安装 / proxy update：指定 Hysteria2 发布标签
+OPT_SINGBOX_VER=""  # 安装 / proxy update：指定 sing-box 发布标签
+OPT_ROLLBACK=""     # proxy update --rollback：xray | hy2 | singbox | all
 IMPORT_MODE=0       # 1 = 本次安装来自导入，要重新检测 IP / NAT / SNI / 防火墙
 OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
 OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）
@@ -361,7 +369,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;706:src/os.sh:1;1215:src/tune.sh:1;2015:src/xray.sh:1;3532:src/hy2.sh:1;3638:src/firewall.sh:1;4682:src/cert.sh:1;6714:src/cdn.sh:1;7699:src/link.sh:1;8088:src/singbox.sh:1;8644:src/nat.sh:1;9282:src/selftest.sh:1;9427:src/land.sh:1;10873:src/menu.sh:1;11393:src/route.sh:1;11908:src/export.sh:1;12106:src/doctor.sh:1;12401:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5082:src/cert.sh:1;7114:src/cdn.sh:1;8099:src/link.sh:1;8488:src/singbox.sh:1;9066:src/nat.sh:1;9704:src/selftest.sh:1;9849:src/land.sh:1;11295:src/menu.sh:1;11861:src/route.sh:1;12376:src/export.sh:1;12574:src/doctor.sh:1;12869:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -2566,38 +2574,361 @@ other_listen_ports() { # $1 = tcp|udp
 }
 
 # ============================================================
+#           内核备份 / 指定版本 / 回滚（xray、hysteria、sing-box）
+# ============================================================
+# 本次进程里换过程序时才在启动失败后自动换回。跳过备份时单独记住，避免被下一次覆盖。
+BIN_UPDATED_XRAY=0
+BIN_UPDATED_HY2=0
+BIN_UPDATED_SB=0
+BIN_BAK_MADE=0
+BIN_BAK_SKIP_XRAY=0
+BIN_BAK_SKIP_HY2=0
+BIN_BAK_SKIP_SB=0
+# 50 MB = 51200 KiB。df -Pk 的第 4 列是可用的 1 KiB 块。
+readonly BIN_FREE_MIN_KB=51200
+
+bin_free_kb() { # $1 目录。失败时输出空
+  df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+bin_backup() { # $1 程序路径  $2 xray|hy2|singbox。先写成 .prebak，替换成功后再收成 .bak
+  BIN_BAK_MADE=0
+  local p=$1 kind=$2 kb="" dir
+  [[ -f $p && -s $p ]] || return 0
+  dir=$(dirname "$p")
+  kb=$(bin_free_kb "$dir") || kb=""
+  if [[ $kb =~ ^[0-9]+$ ]] && (( kb < BIN_FREE_MIN_KB )); then
+    if (( kb >= 1024 )); then
+      warn "剩余空间不足 50 MB（${dir} 可用约 $((kb / 1024)) MB），跳过备份 ${p##*/}.bak。"
+    else
+      warn "剩余空间不足 50 MB（${dir} 可用不足 1 MB），跳过备份 ${p##*/}.bak。"
+    fi
+    case $kind in
+      xray) BIN_BAK_SKIP_XRAY=1 ;;
+      hy2) BIN_BAK_SKIP_HY2=1 ;;
+      singbox) BIN_BAK_SKIP_SB=1 ;;
+    esac
+    return 0
+  fi
+  rm -f "${p}.prebak"
+  if ! cp -a "$p" "${p}.prebak"; then
+    warn "备份 ${p} 失败，继续更新（这次失败时无法自动换回）。"
+    rm -f "${p}.prebak"
+    case $kind in
+      xray) BIN_BAK_SKIP_XRAY=1 ;;
+      hy2) BIN_BAK_SKIP_HY2=1 ;;
+      singbox) BIN_BAK_SKIP_SB=1 ;;
+    esac
+    return 0
+  fi
+  BIN_BAK_MADE=1
+}
+bin_backup_keep() { # $1 程序路径  $2 xray|hy2|singbox。新程序已经放好，把临时备份收成 .bak
+  local p=$1 kind=$2
+  [[ -f ${p}.prebak ]] || return 0
+  mv -f "${p}.prebak" "${p}.bak"
+  case $kind in
+    xray) BIN_UPDATED_XRAY=1 ;;
+    hy2) BIN_UPDATED_HY2=1 ;;
+    singbox) BIN_UPDATED_SB=1 ;;
+  esac
+  info "已备份当前程序: ${p}.bak"
+}
+bin_backup_drop() { rm -f "${1}.prebak"; }
+bin_version() { # $1 xray|hy2|singbox  $2 程序路径
+  local kind=$1 p=$2
+  [[ -x $p ]] || return 0
+  case $kind in
+    xray) "$p" version 2>/dev/null | awk 'NR==1{print $2}' || true ;;
+    hy2) "$p" version 2>/dev/null | awk '/^Version:/{print $2}' || true ;;
+    singbox) "$p" version 2>/dev/null | awk 'NR==1{print $NF}' || true ;;
+  esac
+}
+bin_norm_tag() { # $1 xray|hy2|singbox  $2 用户写的版本。输出 GitHub 标签
+  local kind=$1 raw=$2 t
+  t=${raw#refs/tags/}
+  t=${t// /}
+  [[ -n $t ]] || return 1
+  case $kind in
+    xray|singbox)
+      if [[ $t == [Vv]* ]]; then t="v${t:1}"; else t="v${t}"; fi
+      [[ $t =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$ ]] || return 1
+      ;;
+    hy2)
+      t=${t#app/}
+      if [[ $t == [Vv]* ]]; then t="v${t:1}"; else t="v${t}"; fi
+      t="app/${t}"
+      [[ $t =~ ^app/v[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$ ]] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$t"
+}
+hy_official_ver() { # app/v2.6.1 -> v2.6.1（get.hy2.sh 的 --version 必须带 v，不能带 app/）
+  local t=${1#app/}
+  [[ $t == v* ]] || t="v${t}"
+  printf '%s' "$t"
+}
+xray_ver_same() { # $1 程序打出的版本  $2 标签 vX
+  local a=$1 b=$2
+  [[ -n $a && -n $b ]] || return 1
+  a=v${a#v}; b=v${b#v}
+  [[ $a == "$b" ]]
+}
+hy_ver_same() { # $1 程序打出的版本  $2 标签 app/vX 或 vX
+  local a=$1 b=$2
+  [[ -n $a && -n $b ]] || return 1
+  a=${a#app/}; a=${a#v}
+  b=${b#app/}; b=${b#v}
+  [[ $a == "$b" ]]
+}
+gh_release_ok() { # $1 仓库（owner/name）  $2 标签。存在返回 0
+  local repo=$1 tag=$2 code="" enc
+  enc=${tag//\//%2F}
+  code=$(gh_curl -sS -o /dev/null -w '%{http_code}' "${FETCH_IP[@]}" --connect-timeout 10 -m 20 \
+    -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/${repo}/releases/tags/${enc}" 2>/dev/null) || code=""
+  [[ $code == 200 ]] && return 0
+  # 接口被限流或不可达时，再看发布页本身在不在。令牌不会出现在这条命令里。
+  curl -fsSIL "${FETCH_IP[@]}" --connect-timeout 10 -m 20 -o /dev/null \
+    "https://github.com/${repo}/releases/tag/${tag}" 2>/dev/null
+}
+xray_check_bin() { # $1 程序路径。version，有当前配置时再 run -test
+  local b=$1 log
+  [[ -x $b ]] || { warn "无法执行 ${b}。"; return 1; }
+  "$b" version >/dev/null 2>&1 || { warn "xray version 没有成功（${b}）。"; return 1; }
+  [[ -s $XRAY_CONF ]] || return 0
+  log=$(mktemp)
+  if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$b" run -test -config "$XRAY_CONF" >"$log" 2>&1; then
+    warn "xray run -test 未通过（${b}）。"
+    tail -n 20 "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
+  rm -f "$log"
+}
+sb_check_bin() { # $1 程序路径。version，有当前配置时再 check
+  local b=$1 log
+  [[ -x $b ]] || { warn "无法执行 ${b}。"; return 1; }
+  "$b" version >/dev/null 2>&1 || { warn "sing-box version 没有成功（${b}）。"; return 1; }
+  [[ -s $SB_CONF ]] || return 0
+  log=$(mktemp)
+  if ! "$b" check -c "$SB_CONF" >"$log" 2>&1; then
+    warn "sing-box check 未通过（${b}）。"
+    tail -n 20 "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
+  rm -f "$log"
+}
+hy_check_bin() { # hysteria 没有配置检查，只确认 version 能跑
+  local b=$1
+  [[ -x $b ]] || { warn "无法执行 ${b}。"; return 1; }
+  "$b" version >/dev/null 2>&1 || { warn "hysteria version 没有成功（${b}）。"; return 1; }
+}
+bin_finish_install() { # $1 种类  $2 程序  $3 显示名  $4 替换前的版本。版本变了才记「已更新」
+  local kind=$1 bin=$2 name=$3 old=$4 new=""
+  new=$(bin_version "$kind" "$bin" || true)
+  if [[ -z $new ]]; then bin_backup_drop "$bin"; die "安装后无法读取 ${name} 的版本。"; fi
+  if [[ -n $old && $old == "$new" ]]; then
+    # 版本没变。丢掉这次的临时备份，原来的 .bak 还在。
+    bin_backup_drop "$bin"
+    case $kind in
+      xray) BIN_UPDATED_XRAY=0 ;;
+      hy2) BIN_UPDATED_HY2=0 ;;
+      singbox) BIN_UPDATED_SB=0 ;;
+    esac
+    ok "${name} 已安装: ${new}"
+    return 0
+  fi
+  if [[ -f ${bin}.prebak ]]; then bin_backup_keep "$bin" "$kind"; fi
+  if [[ -n $old ]]; then
+    case $kind in
+      xray) BIN_UPDATED_XRAY=1 ;;
+      hy2) BIN_UPDATED_HY2=1 ;;
+      singbox) BIN_UPDATED_SB=1 ;;
+    esac
+    ok "${name} ${old} -> ${new}"
+  else
+    ok "${name} 已安装: ${new}"
+  fi
+}
+bin_restore_prebak() { # $1 种类 $2 程序 $3 服务 $4 显示名 $5 原因（带前导空格）
+  local kind=$1 bin=$2 svc=$3 name=$4 why=$5 cur="" bakv=""
+  if [[ ! -f ${bin}.prebak ]]; then die "${name}${why}。"; fi
+  cur=$(bin_version "$kind" "$bin" || true)
+  bakv=$(bin_version "$kind" "${bin}.prebak" || true)
+  warn "${name}${why}，正在恢复备份 ..."
+  install -m 755 "${bin}.prebak" "$bin" || die "恢复 ${bin}.prebak 失败。"
+  mv -f "${bin}.prebak" "${bin}.bak"
+  if svc_exists "$svc"; then svc_restart "$svc" || true; sleep 1; fi
+  die "${name}${why}，已恢复备份（${cur:-未知} -> ${bakv:-未知}）。"
+}
+bin_reject_new() { # $1 种类 $2 程序 $3 服务 $4 显示名 $5 是否有本次备份 $6 原因（带前导空格）
+  local kind=$1 bin=$2 svc=$3 name=$4 made=$5 why=$6 cur="" bakv=""
+  if [[ $made == 1 && -f ${bin}.prebak ]]; then
+    cur=$(bin_version "$kind" "$bin" || true)
+    bakv=$(bin_version "$kind" "${bin}.prebak" || true)
+    if [[ ! -x $bin || $cur != "$bakv" ]]; then
+      warn "${name}${why}，正在恢复备份 ..."
+      install -m 755 "${bin}.prebak" "$bin" || die "恢复 ${bin}.prebak 失败。"
+      mv -f "${bin}.prebak" "${bin}.bak"
+      if svc_exists "$svc"; then svc_restart "$svc" || true; sleep 1; fi
+      die "${name}${why}，已恢复备份（${cur:-未知} -> ${bakv:-未知}）。"
+    fi
+    bin_backup_drop "$bin"
+  fi
+  die "${name}${why}。"
+}
+bin_restart_failed() { # 启动失败且这次换过程序：用 .bak 盖回去再拉起。0=已恢复且在跑 1=没有备份可换 2=换了仍没起来
+  local kind=$1 bin=$2 svc=$3 name=$4 updated=0 skipped=0 old="" new=""
+  case $kind in
+    xray) updated=${BIN_UPDATED_XRAY:-0}; skipped=${BIN_BAK_SKIP_XRAY:-0} ;;
+    hy2) updated=${BIN_UPDATED_HY2:-0}; skipped=${BIN_BAK_SKIP_HY2:-0} ;;
+    singbox) updated=${BIN_UPDATED_SB:-0}; skipped=${BIN_BAK_SKIP_SB:-0} ;;
+  esac
+  [[ $updated == 1 ]] || return 1
+  if [[ ! -f ${bin}.bak ]]; then
+    if (( skipped )); then warn "${name} 没有备份（更新前剩余空间不足 50 MB），无法自动换回。"; fi
+    return 1
+  fi
+  old=$(bin_version "$kind" "$bin" || true)
+  new=$(bin_version "$kind" "${bin}.bak" || true)
+  warn "${name} 启动失败，正在恢复 ${bin}.bak ..."
+  install -m 755 "${bin}.bak" "$bin" || { warn "恢复 ${bin}.bak 失败。"; return 2; }
+  case $kind in
+    xray) BIN_UPDATED_XRAY=0 ;;
+    hy2) BIN_UPDATED_HY2=0 ;;
+    singbox) BIN_UPDATED_SB=0 ;;
+  esac
+  svc_restart "$svc" || true
+  sleep 1
+  if svc_active "$svc"; then
+    ok "${name} 已自动回滚: ${old:-未知} -> ${new:-未知}"
+    return 0
+  fi
+  warn "${name} 回滚后仍未运行。"
+  return 2
+}
+bin_swap_bak() { # 当前程序和 .bak 对调，这样再执行一次回滚可以换回去
+  local p=$1 tmp
+  [[ -f ${p}.bak ]] || return 1
+  if [[ ! -e $p ]]; then
+    install -m 755 "${p}.bak" "$p" || return 1
+    return 0
+  fi
+  tmp="${p}.swaptmp"
+  rm -f "$tmp"
+  mv -f "$p" "$tmp" || return 1
+  if ! mv -f "${p}.bak" "$p"; then
+    mv -f "$tmp" "$p" || true
+    return 1
+  fi
+  if ! mv -f "$tmp" "${p}.bak"; then
+    warn "已换回 ${p}，但没能把刚才的程序留作 .bak。"
+  fi
+  chmod 755 "$p" 2>/dev/null || true
+  if [[ -f ${p}.bak ]]; then chmod 755 "${p}.bak" 2>/dev/null || true; fi
+  return 0
+}
+rollback_one() { # $1 xray|hy2|singbox
+  local kind=$1 bin svc name old="" new=""
+  case $kind in
+    xray) bin=$XRAY_BIN; svc=xray; name=Xray ;;
+    hy2) bin=$HY_BIN; svc=hysteria-server; name=Hysteria2 ;;
+    singbox) bin=$SB_BIN; svc=sing-box; name=sing-box ;;
+    *) die "未知组件: ${kind}（可选 xray、hy2、singbox、all）" ;;
+  esac
+  if [[ ! -f ${bin}.bak ]]; then
+    warn "没有 ${bin}.bak，跳过 ${name}。"
+    return 0
+  fi
+  old=$(bin_version "$kind" "$bin" || true)
+  new=$(bin_version "$kind" "${bin}.bak" || true)
+  bin_swap_bak "$bin" || die "换回 ${bin}.bak 失败。"
+  if [[ $kind == xray ]] && land_raw_active; then
+    svc_disable_stop xray || true
+    ok "${name} ${old:-未知} -> ${new:-未知}（原样转发中，未启动 Xray）"
+    return 0
+  fi
+  if ! svc_exists "$svc"; then
+    ok "${name} ${old:-未知} -> ${new:-未知}（服务未安装，只换回了程序）"
+    return 0
+  fi
+  svc_restart "$svc" || true
+  sleep 1
+  if ! svc_active "$svc"; then
+    warn "${name} 换回 ${new:-未知} 后没有跑起来，正在换回刚才的程序 ..."
+    bin_swap_bak "$bin" || true
+    svc_restart "$svc" || true
+    die "${name} 回滚失败，已换回 ${old:-未知}。"
+  fi
+  ok "${name} ${old:-未知} -> ${new:-未知}"
+}
+do_rollback() { # $1 xray|hy2|singbox|all
+  local which=${1:-all} part
+  load_state
+  (( INSTALLED )) || die "尚未安装，请先选择「安装」。"
+  [[ -n $INIT_SYS ]] || detect_init
+  case $which in
+    xray|hy2|singbox) rollback_one "$which" ;;
+    all)
+      for part in xray hy2 singbox; do rollback_one "$part"; done
+      ;;
+    *) die "回滚目标无效: ${which}（可选 xray、hy2、singbox、all）" ;;
+  esac
+}
+
+# ============================================================
 #                        Xray 安装与配置
 # ============================================================
 install_xray() {
   if direct_mode; then install_xray_direct; return; fi
+  BIN_UPDATED_XRAY=0
+  BIN_BAK_SKIP_XRAY=0
   step "安装 / 更新 Xray-core（官方 XTLS/Xray-install 脚本）"
   mktmp
   # 之前以 NAT / 落地机模式安装过：删除本脚本自建的服务文件，让官方脚本重新安装它的 xray.service
   # （自建服务只在端口 < 1024 时才有 CAP_NET_BIND_SERVICE，官方脚本不会覆盖已存在的服务文件）
-  local force=()
+  local force=() tag="" old="" backed=0 same=0
   if [[ -f $XRAY_UNIT ]] && grep -q '由 proxy-oneclick 生成' "$XRAY_UNIT"; then
     systemctl stop xray >/dev/null 2>&1 || true
     rm -f "$XRAY_UNIT"; systemctl daemon-reload
   fi
   # 已有 xray 但没有服务文件时，官方脚本会因「版本相同」直接退出而不安装服务：强制重装
   [[ ! -f $XRAY_UNIT && -x $XRAY_BIN ]] && force=(--force)
-  fetch -o "${TMP_DIR}/xray-install.sh" "$XRAY_INSTALL_URL" || die "下载 Xray 安装脚本失败，请检查网络（GitHub 可达性）。"
-  if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1; then
-    # GitHub API 限流(403)时：通过 releases/latest 跳转获取版本号后重试
-    local tag
-    tag=$(latest_tag XTLS/Xray-core)
-    if [[ -n $tag ]]; then
-      warn "官方脚本获取版本列表失败（可能是 GitHub API 限流），改为指定版本 ${tag} 重试 ..."
-      TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install --version "$tag" "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1 || {
-        tail -n 20 "${TMP_DIR}/xray-install.log" >&2; die "Xray 安装失败。"; }
-    else
-      tail -n 20 "${TMP_DIR}/xray-install.log" >&2; die "Xray 安装失败。"
-    fi
+  old=$(bin_version xray "$XRAY_BIN" || true)
+  if [[ -n $OPT_XRAY_VER ]]; then
+    tag=$(bin_norm_tag xray "$OPT_XRAY_VER") || die "Xray 版本号无效: ${OPT_XRAY_VER}（例如 v26.3.27）"
+    gh_release_ok XTLS/Xray-core "$tag" || die "找不到 Xray 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag XTLS/Xray-core)
+    [[ -n $tag ]] || { github_hint; die "获取 Xray 最新版本号失败。"; }
   fi
-  [[ -x $XRAY_BIN ]] || die "未找到 ${XRAY_BIN}，Xray 安装可能失败。"
+  xray_ver_same "$old" "$tag" && same=1
+  if (( same && ${#force[@]} == 0 )); then
+    if [[ -n $OPT_XRAY_VER ]]; then ok "Xray 已是指定版本 ${tag}，跳过下载。"
+    else ok "Xray 已是最新版本 ${tag}，跳过下载。"; fi
+    ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
+    return 0
+  fi
+  # 官方脚本自己下载并覆盖程序，没法先在临时路径校验。先备份，写完立刻检查，不通过就换回。
+  if (( ! same )); then bin_backup "$XRAY_BIN" xray; backed=$BIN_BAK_MADE; fi
+  fetch -o "${TMP_DIR}/xray-install.sh" "$XRAY_INSTALL_URL" || { bin_backup_drop "$XRAY_BIN"; die "下载 Xray 安装脚本失败，请检查网络（GitHub 可达性）。"; }
+  if (( same )); then force=(--force); fi
+  if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install --version "$tag" "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1; then
+    tail -n 20 "${TMP_DIR}/xray-install.log" >&2 || true
+    bin_reject_new xray "$XRAY_BIN" xray "Xray" "$backed" " 安装失败"
+  fi
+  [[ -x $XRAY_BIN ]] || bin_reject_new xray "$XRAY_BIN" xray "Xray" "$backed" " 安装失败"
+  if ! xray_check_bin "$XRAY_BIN"; then
+    if (( backed )); then bin_restore_prebak xray "$XRAY_BIN" xray "Xray" " 未通过校验"; fi
+    bin_backup_drop "$XRAY_BIN"
+    if (( BIN_BAK_SKIP_XRAY )); then die "Xray 未通过校验。剩余空间不足，没有备份可以恢复。"; fi
+    die "Xray 未通过校验。"
+  fi
   # 官方脚本会沿用已有 User=（常见为 xray）。配置是 root:nobody 组 640，必须在启动前改成 nobody。
   ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
-  ok "Xray 已安装: $("$XRAY_BIN" version | awk 'NR==1{print $2}')"
+  bin_finish_install xray "$XRAY_BIN" "Xray" "$old"
 }
 
 # 不依赖 GitHub API，从 releases/latest 的跳转地址解析最新版本号（跟随仓库改名等多次跳转）
@@ -2636,14 +2967,23 @@ github_hint() {
 }
 
 install_xray_direct() {
+  BIN_UPDATED_XRAY=0
+  BIN_BAK_SKIP_XRAY=0
   step "安装 / 更新 Xray-core（直接下载 XTLS/Xray-core 官方 Release）"
   mktmp
-  local tag asset base cur="" want dg sum
-  tag=$(gh_latest_tag XTLS/Xray-core)
-  [[ -n $tag ]] || { github_hint; die "获取 Xray 最新版本号失败。"; }
-  [[ -x $XRAY_BIN ]] && cur=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}')
-  if [[ -n $cur && "v${cur#v}" == "$tag" ]] && { (( NAT_MODE || LAND_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
-    ok "Xray 已是最新版本 ${tag}，跳过下载。"
+  local tag="" asset base cur="" want dg sum old="" replaced=0
+  old=$(bin_version xray "$XRAY_BIN" || true)
+  if [[ -n $OPT_XRAY_VER ]]; then
+    tag=$(bin_norm_tag xray "$OPT_XRAY_VER") || die "Xray 版本号无效: ${OPT_XRAY_VER}（例如 v26.3.27）"
+    gh_release_ok XTLS/Xray-core "$tag" || die "找不到 Xray 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag XTLS/Xray-core)
+    [[ -n $tag ]] || { github_hint; die "获取 Xray 最新版本号失败。"; }
+  fi
+  cur=$old
+  if xray_ver_same "$cur" "$tag" && { (( NAT_MODE || LAND_MODE )) || [[ -f ${XRAY_ASSET_DIR}/geoip.dat ]]; }; then
+    if [[ -n $OPT_XRAY_VER ]]; then ok "Xray 已是指定版本 ${tag}，跳过下载。"
+    else ok "Xray 已是最新版本 ${tag}，跳过下载。"; fi
   else
     asset=$(xray_asset_name)
     base="https://github.com/XTLS/Xray-core/releases/download/${tag}"
@@ -2671,27 +3011,42 @@ install_xray_direct() {
     rm -f "${TMP_DIR}/${asset}"
     [[ -f $dg/xray ]] || die "压缩包中没有 xray 可执行文件。"
     chmod 755 "$dg/xray"
-    "$dg/xray" version >/dev/null 2>&1 || die "下载的 xray 无法运行（架构不匹配？当前 ${ARCH}）。"
+    # 先在临时路径校验，通过后才备份并替换正在使用的程序
+    if ! xray_check_bin "$dg/xray"; then
+      rm -rf "$dg"
+      die "下载的 Xray 未通过校验，未替换现有程序。"
+    fi
+    if ! xray_ver_same "$cur" "$tag"; then bin_backup "$XRAY_BIN" xray; fi
     install -m 755 "$dg/xray" "${XRAY_BIN}.new" && mv -f "${XRAY_BIN}.new" "$XRAY_BIN"
     mkdir -p "$XRAY_ASSET_DIR"
     local f
     for f in geoip.dat geosite.dat; do [[ -f $dg/$f ]] && install -m 644 "$dg/$f" "${XRAY_ASSET_DIR}/$f"; done
     rm -rf "$dg"
+    replaced=1
   fi
   write_xray_service
   [[ -x $XRAY_BIN ]] || die "未找到 ${XRAY_BIN}，Xray 安装可能失败。"
-  ok "Xray 已安装: $("$XRAY_BIN" version | awk 'NR==1{print $2}')"
+  if (( replaced )); then bin_finish_install xray "$XRAY_BIN" "Xray" "$old"; fi
 }
 
 install_hysteria_direct() {
+  BIN_UPDATED_HY2=0
+  BIN_BAK_SKIP_HY2=0
   step "安装 / 更新 Hysteria2（直接下载 apernet/hysteria 官方 Release）"
   mktmp
-  local tag asset base cur="" want sum
-  tag=$(gh_latest_tag apernet/hysteria)
-  [[ -n $tag ]] || { github_hint; die "获取 Hysteria2 最新版本号失败。"; }
-  [[ -x $HY_BIN ]] && cur=$("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')
-  if [[ -n $cur && "app/${cur}" == "$tag" ]]; then
-    ok "Hysteria2 已是最新版本 ${tag#app/}，跳过下载。"
+  local tag="" asset base cur="" want sum old="" replaced=0
+  old=$(bin_version hy2 "$HY_BIN" || true)
+  if [[ -n $OPT_HY2_VER ]]; then
+    tag=$(bin_norm_tag hy2 "$OPT_HY2_VER") || die "Hysteria2 版本号无效: ${OPT_HY2_VER}（例如 v2.6.1 或 app/v2.6.1）"
+    gh_release_ok apernet/hysteria "$tag" || die "找不到 Hysteria2 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag apernet/hysteria)
+    [[ -n $tag ]] || { github_hint; die "获取 Hysteria2 最新版本号失败。"; }
+  fi
+  cur=$old
+  if hy_ver_same "$cur" "$tag"; then
+    if [[ -n $OPT_HY2_VER ]]; then ok "Hysteria2 已是指定版本 $(hy_official_ver "$tag")，跳过下载。"
+    else ok "Hysteria2 已是最新版本 ${tag#app/}，跳过下载。"; fi
   else
     asset=$(hy_asset_name)
     base="https://github.com/apernet/hysteria/releases/download/${tag}"
@@ -2710,12 +3065,17 @@ install_hysteria_direct() {
       warn "未能下载 hashes.txt，跳过 SHA256 校验。"
     fi
     chmod 755 "${TMP_DIR}/${asset}"
-    "${TMP_DIR}/${asset}" version >/dev/null 2>&1 || die "下载的 hysteria 无法运行（架构不匹配？当前 ${ARCH}）。"
+    # hysteria 没有配置检查命令，只确认临时文件能打出 version，再替换
+    if ! hy_check_bin "${TMP_DIR}/${asset}"; then
+      die "下载的 Hysteria2 未通过校验，未替换现有程序。"
+    fi
+    bin_backup "$HY_BIN" hy2
     install -m 755 "${TMP_DIR}/${asset}" "${HY_BIN}.new" && mv -f "${HY_BIN}.new" "$HY_BIN"
+    replaced=1
   fi
   ensure_hy_user
   write_hy2_service
-  ok "Hysteria2 已安装: $("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
+  if (( replaced )); then bin_finish_install hy2 "$HY_BIN" "Hysteria2" "$old"; fi
 }
 
 ensure_hy_user() {
@@ -3504,6 +3864,7 @@ write_xray_config() {
 restart_xray() {
   # 原样转发时本机不终止 SS。停掉并取消开机自启，避免 Xray 占住落地端口。
   if land_raw_active; then
+    BIN_UPDATED_XRAY=0
     svc_disable_stop xray
     ok "原样转发中：Xray 已停止，不监听 ${XRAY_PORT}（对外端口 $(pub_xray_port)）。"
     return 0
@@ -3514,8 +3875,14 @@ restart_xray() {
   sleep 1
   if ! svc_active xray; then
     svc_logs xray 20 >&2 || true
+    local rc=0
+    bin_restart_failed xray "$XRAY_BIN" xray "Xray" || rc=$?
+    if (( rc == 0 )); then die "Xray 更新后没有跑起来，已恢复备份。"
+    elif (( rc == 2 )); then die "Xray 更新后没有跑起来，恢复备份后仍未运行。"
+    fi
     die "Xray 启动失败，请查看上方日志。"
   fi
+  BIN_UPDATED_XRAY=0
   if (( LAND_MODE )); then
     ok "Xray 运行中 (Shadowsocks 2022 TCP+UDP ${XRAY_PORT}$( ((NAT_MODE)) && [[ $XRAY_EXT_PORT != "$XRAY_PORT" ]] && echo "，外部端口 ${XRAY_EXT_PORT}"))"
   else
@@ -3534,13 +3901,40 @@ selinux_fix() {
 # ============================================================
 install_hysteria() {
   if direct_mode; then install_hysteria_direct; return; fi
+  BIN_UPDATED_HY2=0
+  BIN_BAK_SKIP_HY2=0
   step "安装 / 更新 Hysteria2（官方 get.hy2.sh 脚本）"
   mktmp
-  fetch -o "${TMP_DIR}/hy2-install.sh" "$HY_INSTALL_URL" || die "下载 Hysteria2 安装脚本失败。"
-  TERM=${TERM:-dumb} bash "${TMP_DIR}/hy2-install.sh" >"${TMP_DIR}/hy2-install.log" 2>&1 || {
-    tail -n 20 "${TMP_DIR}/hy2-install.log" >&2; die "Hysteria2 安装失败。"; }
-  [[ -x $HY_BIN ]] || die "未找到 ${HY_BIN}，Hysteria2 安装可能失败。"
-  ok "Hysteria2 已安装: $("$HY_BIN" version 2>/dev/null | awk '/^Version:/{print $2}')"
+  local tag="" cli="" old="" backed=0
+  old=$(bin_version hy2 "$HY_BIN" || true)
+  if [[ -n $OPT_HY2_VER ]]; then
+    tag=$(bin_norm_tag hy2 "$OPT_HY2_VER") || die "Hysteria2 版本号无效: ${OPT_HY2_VER}（例如 v2.6.1 或 app/v2.6.1）"
+    gh_release_ok apernet/hysteria "$tag" || die "找不到 Hysteria2 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag apernet/hysteria)
+    [[ -n $tag ]] || { github_hint; die "获取 Hysteria2 最新版本号失败。"; }
+  fi
+  cli=$(hy_official_ver "$tag")
+  if hy_ver_same "$old" "$tag"; then
+    if [[ -n $OPT_HY2_VER ]]; then ok "Hysteria2 已是指定版本 ${cli}，跳过下载。"
+    else ok "Hysteria2 已是最新版本 ${cli}，跳过下载。"; fi
+    return 0
+  fi
+  # 官方脚本自己覆盖程序。先备份，写完后只检查 version（没有配置检查），不通过就换回。
+  bin_backup "$HY_BIN" hy2
+  backed=$BIN_BAK_MADE
+  fetch -o "${TMP_DIR}/hy2-install.sh" "$HY_INSTALL_URL" || { bin_backup_drop "$HY_BIN"; die "下载 Hysteria2 安装脚本失败。"; }
+  if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/hy2-install.sh" --version "$cli" >"${TMP_DIR}/hy2-install.log" 2>&1; then
+    tail -n 20 "${TMP_DIR}/hy2-install.log" >&2 || true
+    bin_reject_new hy2 "$HY_BIN" hysteria-server "Hysteria2" "$backed" " 安装失败"
+  fi
+  if ! hy_check_bin "$HY_BIN"; then
+    if (( backed )); then bin_restore_prebak hy2 "$HY_BIN" hysteria-server "Hysteria2" " 未通过校验"; fi
+    bin_backup_drop "$HY_BIN"
+    if (( BIN_BAK_SKIP_HY2 )); then die "Hysteria2 未通过校验。剩余空间不足，没有备份可以恢复。"; fi
+    die "Hysteria2 未通过校验。"
+  fi
+  bin_finish_install hy2 "$HY_BIN" "Hysteria2" "$old"
 }
 
 gen_hy2_cert() {
@@ -3612,8 +4006,14 @@ restart_hy2() {
   sleep 2
   if ! svc_active hysteria-server; then
     svc_logs hysteria-server 20 >&2 || true
+    local rc=0
+    bin_restart_failed hy2 "$HY_BIN" hysteria-server "Hysteria2" || rc=$?
+    if (( rc == 0 )); then die "Hysteria2 更新后没有跑起来，已恢复备份。"
+    elif (( rc == 2 )); then die "Hysteria2 更新后没有跑起来，恢复备份后仍未运行。"
+    fi
     die "Hysteria2 启动失败，请查看上方日志。"
   fi
+  BIN_UPDATED_HY2=0
   if (( NAT_MODE )); then
     ok "Hysteria2 运行中 (UDP ${HY2_PORT}$([[ $HY2_EXT_PORT != "$HY2_PORT" ]] && echo "，外部端口 ${HY2_EXT_PORT}")${HOP_RANGE:+，端口跳跃 ${HOP_EXT_RANGE}})"
   else
@@ -3626,7 +4026,7 @@ remove_hysteria() { # $1 = purge：连证书目录一起删（卸载）。TUIC/A
   if have systemctl; then systemctl disable --now 'hysteria-server@*' >/dev/null 2>&1 || true; fi
   rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service "$HY_RC"
   rm -rf /etc/systemd/system/hysteria-server.service.d /var/log/hysteria
-  rm -f "$HY_BIN" "$HY_CONF"
+  rm -f "$HY_BIN" "${HY_BIN}.bak" "${HY_BIN}.prebak" "$HY_CONF"
   if [[ $1 == purge ]] || ! sb_needed; then rm -rf "$HY_DIR"; fi
   if id hysteria >/dev/null 2>&1; then userdel hysteria >/dev/null 2>&1 || deluser hysteria >/dev/null 2>&1 || true; fi
   if getent group hysteria >/dev/null 2>&1; then groupdel hysteria >/dev/null 2>&1 || delgroup hysteria >/dev/null 2>&1 || true; fi
@@ -8424,15 +8824,24 @@ RC
   fi
 }
 install_singbox() {
+  BIN_UPDATED_SB=0
+  BIN_BAK_SKIP_SB=0
   step "安装 / 更新 sing-box（TUIC v5 / AnyTLS）"
   mktmp
-  local tag ver asset url sum want cur="" bin dg
-  tag=$(gh_latest_tag SagerNet/sing-box)
-  [[ -n $tag ]] || { github_hint; die "获取 sing-box 最新版本号失败。"; }
+  local tag="" ver asset url sum want cur="" bin dg old="" replaced=0
+  old=$(bin_version singbox "$SB_BIN" || true)
+  if [[ -n $OPT_SINGBOX_VER ]]; then
+    tag=$(bin_norm_tag singbox "$OPT_SINGBOX_VER") || die "sing-box 版本号无效: ${OPT_SINGBOX_VER}（例如 v1.11.0）"
+    gh_release_ok SagerNet/sing-box "$tag" || die "找不到 sing-box 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag SagerNet/sing-box)
+    [[ -n $tag ]] || { github_hint; die "获取 sing-box 最新版本号失败。"; }
+  fi
   ver=${tag#v}
-  [[ -x $SB_BIN ]] && cur=$("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')
-  if [[ $cur == "$ver" ]]; then
-    ok "sing-box 已是最新版本 ${ver}，跳过下载。"
+  cur=$old
+  if [[ -n $cur && $cur == "$ver" ]]; then
+    if [[ -n $OPT_SINGBOX_VER ]]; then ok "sing-box 已是指定版本 ${ver}，跳过下载。"
+    else ok "sing-box 已是最新版本 ${ver}，跳过下载。"; fi
   else
     asset=$(sb_asset_name "$ver")
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
@@ -8454,12 +8863,19 @@ install_singbox() {
     bin=$(find "$dg" -type f -name sing-box | head -n1)
     [[ -n $bin ]] || die "压缩包中没有 sing-box 可执行文件。"
     chmod 755 "$bin"
-    "$bin" version >/dev/null 2>&1 || die "下载的 sing-box 无法运行（架构或 musl/glibc 不匹配？当前 ${ARCH} / ${OS_ID:-未知}）。"
+    # 先在临时路径校验，通过后才备份并替换正在使用的程序
+    if ! sb_check_bin "$bin"; then
+      rm -rf "$dg"
+      die "下载的 sing-box 未通过校验，未替换现有程序。"
+    fi
+    if [[ $cur != "$ver" ]]; then bin_backup "$SB_BIN" singbox; fi
     install -m 755 "$bin" "${SB_BIN}.new" && mv -f "${SB_BIN}.new" "$SB_BIN"
+    rm -rf "$dg"
+    replaced=1
   fi
   ensure_sb_user
   write_singbox_service
-  ok "sing-box 已安装: $("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')"
+  if (( replaced )); then bin_finish_install singbox "$SB_BIN" "sing-box" "$old"; fi
 }
 sb_copy_cert() {
   mkdir -p "$HY_DIR" "$SB_DIR"
@@ -8539,13 +8955,19 @@ restart_singbox() {
   sleep 1
   if ! svc_active sing-box; then
     svc_logs sing-box 20 >&2 || true
+    local rc=0
+    bin_restart_failed singbox "$SB_BIN" sing-box "sing-box" || rc=$?
+    if (( rc == 0 )); then die "sing-box 更新后没有跑起来，已恢复备份。"
+    elif (( rc == 2 )); then die "sing-box 更新后没有跑起来，恢复备份后仍未运行。"
+    fi
     die "sing-box 启动失败，请查看上方日志。"
   fi
+  BIN_UPDATED_SB=0
   ok "sing-box 运行中 ($( ((TUIC_ENABLED)) && echo -n "TUIC UDP $([[ -n $TUIC_EXT_PORT && $NAT_MODE == 1 ]] && echo "$TUIC_EXT_PORT" || echo "$TUIC_PORT")")$( ((TUIC_ENABLED && ANYTLS_ENABLED)) && echo -n " / ")$( ((ANYTLS_ENABLED)) && echo -n "AnyTLS TCP $([[ -n $ANYTLS_EXT_PORT && $NAT_MODE == 1 ]] && echo "$ANYTLS_EXT_PORT" || echo "$ANYTLS_PORT")"))"
 }
 remove_singbox() {
   svc_disable_stop sing-box
-  rm -f "$SB_UNIT" "$SB_RC" "$SB_BIN"
+  rm -f "$SB_UNIT" "$SB_RC" "$SB_BIN" "${SB_BIN}.bak" "${SB_BIN}.prebak"
   rm -rf "$SB_DIR" /etc/systemd/system/sing-box.service.d /var/log/sing-box
   if id sing-box >/dev/null 2>&1; then userdel sing-box >/dev/null 2>&1 || deluser sing-box >/dev/null 2>&1 || true; fi
   if getent group sing-box >/dev/null 2>&1; then groupdel sing-box >/dev/null 2>&1 || delgroup sing-box >/dev/null 2>&1 || true; fi
@@ -11043,9 +11465,20 @@ menu_users() {
 }
 
 menu_update() {
+  if [[ -n ${OPT_ROLLBACK:-} ]]; then
+    [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]] && die "回滚和指定版本不能一起用。"
+    do_rollback "$OPT_ROLLBACK"
+    return 0
+  fi
   need_installed
+  if [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]]; then
+    do_pinned_update
+    return 0
+  fi
   preflight
-  echo "  1) 更新 Xray-core   2) 更新 Hysteria2   3) 更新本脚本   4) 全部更新   0) 返回"
+  echo "  1) 更新 Xray-core    2) 更新 Hysteria2    3) 更新本脚本"
+  echo "  4) 全部更新（含 sing-box）    5) 回滚到备份    0) 返回"
+  echo "  指定版本: proxy update --xray-ver <版本>  --hy2-ver <版本>  --singbox-ver <版本>"
   local c; ask c "请选择" "4"
   case $c in
     1) install_xray; if xray_inbound_needed; then write_xray_config; restart_xray; else info "当前没有 Xray 入站，已跳过。"; fi ;;
@@ -11056,8 +11489,43 @@ menu_update() {
        if (( HY2_ENABLED )); then install_hysteria; write_hy2_config; restart_hy2; fi
        if sb_needed; then install_singbox; write_singbox_config; restart_singbox; fi
        update_script ;;
+    5) echo "  1) Xray    2) Hysteria2    3) sing-box    4) 全部    0) 返回"
+       local w; ask w "回滚哪一个" "0"
+       case $w in
+         1) do_rollback xray ;;
+         2) do_rollback hy2 ;;
+         3) do_rollback singbox ;;
+         4) do_rollback all ;;
+         *) return 0 ;;
+       esac ;;
     *) return 0 ;;
   esac
+}
+do_pinned_update() { # proxy update --xray-ver / --hy2-ver / --singbox-ver，不进菜单
+  need_installed
+  preflight
+  local did=0
+  if [[ -n ${OPT_XRAY_VER:-} ]]; then
+    install_xray
+    if xray_inbound_needed; then write_xray_config; restart_xray
+    else info "当前没有 Xray 入站，已跳过重启。"; fi
+    did=1
+  fi
+  if [[ -n ${OPT_HY2_VER:-} ]]; then
+    (( HY2_ENABLED )) || die "未启用 Hysteria2，不能用 --hy2-ver 更新。请先打开 Hysteria2。"
+    install_hysteria
+    write_hy2_config
+    restart_hy2
+    did=1
+  fi
+  if [[ -n ${OPT_SINGBOX_VER:-} ]]; then
+    sb_needed || die "未启用 TUIC / AnyTLS，不能用 --singbox-ver 更新。请先打开其中一项。"
+    install_singbox
+    write_singbox_config
+    restart_singbox
+    did=1
+  fi
+  (( did )) || die "没有要更新的组件。"
 }
 
 update_script() {
@@ -11354,7 +11822,7 @@ do_uninstall() {
   if have systemctl; then systemctl disable --now 'xray@*' >/dev/null 2>&1 || true; fi
   rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service "$XRAY_RC"
   rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
-  rm -f "$XRAY_BIN"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+  rm -f "$XRAY_BIN" "${XRAY_BIN}.bak" "${XRAY_BIN}.prebak"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
   sd_reload
   ok "Xray 已移除"
   remove_hysteria purge; ok "Hysteria2 已移除"
@@ -12768,6 +13236,9 @@ usage() {
                       会把代理端口写进它们。--no-firewall 同 off
   --no-firewall       不配置 nftables 防火墙（同 --firewall off）
   --no-upgrade        跳过系统软件包升级
+  --xray-ver <版本>   安装指定的 Xray 发布标签（例如 v26.3.27），须在 GitHub 上存在
+  --hy2-ver <版本>    安装指定的 Hysteria2 发布标签（例如 v2.6.1 或 app/v2.6.1）
+  --singbox-ver <版本> 安装指定的 sing-box 发布标签（例如 v1.11.0）
   --no-tune           跳过 sysctl 网络调优
   --tune-preset <名>  安装/调优使用的预设（默认 bbr-fq，见下方「网络调优」）
   -h, --help          显示帮助
@@ -12850,7 +13321,12 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy regen         重新生成全部密钥
   proxy port          修改端口
   proxy user          用户管理
-  proxy update        更新组件
+  proxy update        更新组件。菜单里可以回滚到 .bak
+  proxy update --xray-ver <版本> [--hy2-ver <版本>] [--singbox-ver <版本>]
+                      只把写出的内核换成这个已经发布的版本
+  proxy update --rollback [xray|hy2|singbox|all]
+                      用 <程序>.bak 换回并重启服务，打印 旧版本 -> 新版本
+                      不写目标时回滚这三个。systemd 和 OpenRC 都用同一套重启
   proxy update-script 只更新本脚本
   proxy export [文件]  导出密钥和证书（权限 600）。--password 加密，密码不回显
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
@@ -13113,6 +13589,46 @@ parse_args() {
       regen|rekey) OPT_ACTION=regen ;;
       port|ports) OPT_ACTION=port ;;
       user|users) OPT_ACTION=user ;;
+      --xray-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--xray-ver 需要版本号（例如 v26.3.27）"
+        OPT_XRAY_VER=$2; shift ;;
+      --xray-ver=*)
+        OPT_XRAY_VER=${1#*=}
+        [[ -n $OPT_XRAY_VER && $OPT_XRAY_VER != -* ]] || die "--xray-ver 需要版本号（例如 v26.3.27）" ;;
+      --hy2-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--hy2-ver 需要版本号（例如 v2.6.1）"
+        OPT_HY2_VER=$2; shift ;;
+      --hy2-ver=*)
+        OPT_HY2_VER=${1#*=}
+        [[ -n $OPT_HY2_VER && $OPT_HY2_VER != -* ]] || die "--hy2-ver 需要版本号（例如 v2.6.1）" ;;
+      --singbox-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--singbox-ver 需要版本号（例如 v1.11.0）"
+        OPT_SINGBOX_VER=$2; shift ;;
+      --singbox-ver=*)
+        OPT_SINGBOX_VER=${1#*=}
+        [[ -n $OPT_SINGBOX_VER && $OPT_SINGBOX_VER != -* ]] || die "--singbox-ver 需要版本号（例如 v1.11.0）" ;;
+      --rollback)
+        OPT_ACTION=update
+        if [[ -n ${2-} && ${2} != -* ]]; then OPT_ROLLBACK=${2,,}; shift
+        else OPT_ROLLBACK=all; fi
+        case $OPT_ROLLBACK in
+          xray) ;;
+          hy2|hysteria|hysteria2) OPT_ROLLBACK=hy2 ;;
+          singbox|sing-box|sb) OPT_ROLLBACK=singbox ;;
+          all) ;;
+          *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
+        esac ;;
+      --rollback=*)
+        OPT_ACTION=update
+        OPT_ROLLBACK=${1#*=}
+        OPT_ROLLBACK=${OPT_ROLLBACK,,}
+        case $OPT_ROLLBACK in
+          xray) ;;
+          hy2|hysteria|hysteria2) OPT_ROLLBACK=hy2 ;;
+          singbox|sing-box|sb) OPT_ROLLBACK=singbox ;;
+          all) ;;
+          *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
+        esac ;;
       update|upgrade) OPT_ACTION=update ;;
       export)
         OPT_ACTION="export"
@@ -13167,7 +13683,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || -n $OPT_XRAY_VER || -n $OPT_HY2_VER || -n $OPT_SINGBOX_VER || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert

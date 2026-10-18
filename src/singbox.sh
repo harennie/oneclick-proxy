@@ -337,15 +337,24 @@ RC
   fi
 }
 install_singbox() {
+  BIN_UPDATED_SB=0
+  BIN_BAK_SKIP_SB=0
   step "安装 / 更新 sing-box（TUIC v5 / AnyTLS）"
   mktmp
-  local tag ver asset url sum want cur="" bin dg
-  tag=$(gh_latest_tag SagerNet/sing-box)
-  [[ -n $tag ]] || { github_hint; die "获取 sing-box 最新版本号失败。"; }
+  local tag="" ver asset url sum want cur="" bin dg old="" replaced=0
+  old=$(bin_version singbox "$SB_BIN" || true)
+  if [[ -n $OPT_SINGBOX_VER ]]; then
+    tag=$(bin_norm_tag singbox "$OPT_SINGBOX_VER") || die "sing-box 版本号无效: ${OPT_SINGBOX_VER}（例如 v1.11.0）"
+    gh_release_ok SagerNet/sing-box "$tag" || die "找不到 sing-box 版本 ${tag}（GitHub 上没有这个发布，或网络不可达）。"
+  else
+    tag=$(gh_latest_tag SagerNet/sing-box)
+    [[ -n $tag ]] || { github_hint; die "获取 sing-box 最新版本号失败。"; }
+  fi
   ver=${tag#v}
-  [[ -x $SB_BIN ]] && cur=$("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')
-  if [[ $cur == "$ver" ]]; then
-    ok "sing-box 已是最新版本 ${ver}，跳过下载。"
+  cur=$old
+  if [[ -n $cur && $cur == "$ver" ]]; then
+    if [[ -n $OPT_SINGBOX_VER ]]; then ok "sing-box 已是指定版本 ${ver}，跳过下载。"
+    else ok "sing-box 已是最新版本 ${ver}，跳过下载。"; fi
   else
     asset=$(sb_asset_name "$ver")
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
@@ -367,12 +376,19 @@ install_singbox() {
     bin=$(find "$dg" -type f -name sing-box | head -n1)
     [[ -n $bin ]] || die "压缩包中没有 sing-box 可执行文件。"
     chmod 755 "$bin"
-    "$bin" version >/dev/null 2>&1 || die "下载的 sing-box 无法运行（架构或 musl/glibc 不匹配？当前 ${ARCH} / ${OS_ID:-未知}）。"
+    # 先在临时路径校验，通过后才备份并替换正在使用的程序
+    if ! sb_check_bin "$bin"; then
+      rm -rf "$dg"
+      die "下载的 sing-box 未通过校验，未替换现有程序。"
+    fi
+    if [[ $cur != "$ver" ]]; then bin_backup "$SB_BIN" singbox; fi
     install -m 755 "$bin" "${SB_BIN}.new" && mv -f "${SB_BIN}.new" "$SB_BIN"
+    rm -rf "$dg"
+    replaced=1
   fi
   ensure_sb_user
   write_singbox_service
-  ok "sing-box 已安装: $("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}')"
+  if (( replaced )); then bin_finish_install singbox "$SB_BIN" "sing-box" "$old"; fi
 }
 sb_copy_cert() {
   mkdir -p "$HY_DIR" "$SB_DIR"
@@ -452,13 +468,19 @@ restart_singbox() {
   sleep 1
   if ! svc_active sing-box; then
     svc_logs sing-box 20 >&2 || true
+    local rc=0
+    bin_restart_failed singbox "$SB_BIN" sing-box "sing-box" || rc=$?
+    if (( rc == 0 )); then die "sing-box 更新后没有跑起来，已恢复备份。"
+    elif (( rc == 2 )); then die "sing-box 更新后没有跑起来，恢复备份后仍未运行。"
+    fi
     die "sing-box 启动失败，请查看上方日志。"
   fi
+  BIN_UPDATED_SB=0
   ok "sing-box 运行中 ($( ((TUIC_ENABLED)) && echo -n "TUIC UDP $([[ -n $TUIC_EXT_PORT && $NAT_MODE == 1 ]] && echo "$TUIC_EXT_PORT" || echo "$TUIC_PORT")")$( ((TUIC_ENABLED && ANYTLS_ENABLED)) && echo -n " / ")$( ((ANYTLS_ENABLED)) && echo -n "AnyTLS TCP $([[ -n $ANYTLS_EXT_PORT && $NAT_MODE == 1 ]] && echo "$ANYTLS_EXT_PORT" || echo "$ANYTLS_PORT")"))"
 }
 remove_singbox() {
   svc_disable_stop sing-box
-  rm -f "$SB_UNIT" "$SB_RC" "$SB_BIN"
+  rm -f "$SB_UNIT" "$SB_RC" "$SB_BIN" "${SB_BIN}.bak" "${SB_BIN}.prebak"
   rm -rf "$SB_DIR" /etc/systemd/system/sing-box.service.d /var/log/sing-box
   if id sing-box >/dev/null 2>&1; then userdel sing-box >/dev/null 2>&1 || deluser sing-box >/dev/null 2>&1 || true; fi
   if getent group sing-box >/dev/null 2>&1; then groupdel sing-box >/dev/null 2>&1 || delgroup sing-box >/dev/null 2>&1 || true; fi

@@ -171,9 +171,20 @@ menu_users() {
 }
 
 menu_update() {
+  if [[ -n ${OPT_ROLLBACK:-} ]]; then
+    [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]] && die "回滚和指定版本不能一起用。"
+    do_rollback "$OPT_ROLLBACK"
+    return 0
+  fi
   need_installed
+  if [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]]; then
+    do_pinned_update
+    return 0
+  fi
   preflight
-  echo "  1) 更新 Xray-core   2) 更新 Hysteria2   3) 更新本脚本   4) 全部更新   0) 返回"
+  echo "  1) 更新 Xray-core    2) 更新 Hysteria2    3) 更新本脚本"
+  echo "  4) 全部更新（含 sing-box）    5) 回滚到备份    0) 返回"
+  echo "  指定版本: proxy update --xray-ver <版本>  --hy2-ver <版本>  --singbox-ver <版本>"
   local c; ask c "请选择" "4"
   case $c in
     1) install_xray; if xray_inbound_needed; then write_xray_config; restart_xray; else info "当前没有 Xray 入站，已跳过。"; fi ;;
@@ -184,8 +195,43 @@ menu_update() {
        if (( HY2_ENABLED )); then install_hysteria; write_hy2_config; restart_hy2; fi
        if sb_needed; then install_singbox; write_singbox_config; restart_singbox; fi
        update_script ;;
+    5) echo "  1) Xray    2) Hysteria2    3) sing-box    4) 全部    0) 返回"
+       local w; ask w "回滚哪一个" "0"
+       case $w in
+         1) do_rollback xray ;;
+         2) do_rollback hy2 ;;
+         3) do_rollback singbox ;;
+         4) do_rollback all ;;
+         *) return 0 ;;
+       esac ;;
     *) return 0 ;;
   esac
+}
+do_pinned_update() { # proxy update --xray-ver / --hy2-ver / --singbox-ver，不进菜单
+  need_installed
+  preflight
+  local did=0
+  if [[ -n ${OPT_XRAY_VER:-} ]]; then
+    install_xray
+    if xray_inbound_needed; then write_xray_config; restart_xray
+    else info "当前没有 Xray 入站，已跳过重启。"; fi
+    did=1
+  fi
+  if [[ -n ${OPT_HY2_VER:-} ]]; then
+    (( HY2_ENABLED )) || die "未启用 Hysteria2，不能用 --hy2-ver 更新。请先打开 Hysteria2。"
+    install_hysteria
+    write_hy2_config
+    restart_hy2
+    did=1
+  fi
+  if [[ -n ${OPT_SINGBOX_VER:-} ]]; then
+    sb_needed || die "未启用 TUIC / AnyTLS，不能用 --singbox-ver 更新。请先打开其中一项。"
+    install_singbox
+    write_singbox_config
+    restart_singbox
+    did=1
+  fi
+  (( did )) || die "没有要更新的组件。"
 }
 
 update_script() {
@@ -482,7 +528,7 @@ do_uninstall() {
   if have systemctl; then systemctl disable --now 'xray@*' >/dev/null 2>&1 || true; fi
   rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service "$XRAY_RC"
   rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
-  rm -f "$XRAY_BIN"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
+  rm -f "$XRAY_BIN" "${XRAY_BIN}.bak" "${XRAY_BIN}.prebak"; rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
   sd_reload
   ok "Xray 已移除"
   remove_hysteria purge; ok "Hysteria2 已移除"

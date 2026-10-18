@@ -368,6 +368,9 @@ usage() {
                       会把代理端口写进它们。--no-firewall 同 off
   --no-firewall       不配置 nftables 防火墙（同 --firewall off）
   --no-upgrade        跳过系统软件包升级
+  --xray-ver <版本>   安装指定的 Xray 发布标签（例如 v26.3.27），须在 GitHub 上存在
+  --hy2-ver <版本>    安装指定的 Hysteria2 发布标签（例如 v2.6.1 或 app/v2.6.1）
+  --singbox-ver <版本> 安装指定的 sing-box 发布标签（例如 v1.11.0）
   --no-tune           跳过 sysctl 网络调优
   --tune-preset <名>  安装/调优使用的预设（默认 bbr-fq，见下方「网络调优」）
   -h, --help          显示帮助
@@ -450,7 +453,12 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy regen         重新生成全部密钥
   proxy port          修改端口
   proxy user          用户管理
-  proxy update        更新组件
+  proxy update        更新组件。菜单里可以回滚到 .bak
+  proxy update --xray-ver <版本> [--hy2-ver <版本>] [--singbox-ver <版本>]
+                      只把写出的内核换成这个已经发布的版本
+  proxy update --rollback [xray|hy2|singbox|all]
+                      用 <程序>.bak 换回并重启服务，打印 旧版本 -> 新版本
+                      不写目标时回滚这三个。systemd 和 OpenRC 都用同一套重启
   proxy update-script 只更新本脚本
   proxy export [文件]  导出密钥和证书（权限 600）。--password 加密，密码不回显
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
@@ -713,6 +721,46 @@ parse_args() {
       regen|rekey) OPT_ACTION=regen ;;
       port|ports) OPT_ACTION=port ;;
       user|users) OPT_ACTION=user ;;
+      --xray-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--xray-ver 需要版本号（例如 v26.3.27）"
+        OPT_XRAY_VER=$2; shift ;;
+      --xray-ver=*)
+        OPT_XRAY_VER=${1#*=}
+        [[ -n $OPT_XRAY_VER && $OPT_XRAY_VER != -* ]] || die "--xray-ver 需要版本号（例如 v26.3.27）" ;;
+      --hy2-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--hy2-ver 需要版本号（例如 v2.6.1）"
+        OPT_HY2_VER=$2; shift ;;
+      --hy2-ver=*)
+        OPT_HY2_VER=${1#*=}
+        [[ -n $OPT_HY2_VER && $OPT_HY2_VER != -* ]] || die "--hy2-ver 需要版本号（例如 v2.6.1）" ;;
+      --singbox-ver)
+        [[ -n ${2-} && ${2} != -* ]] || die "--singbox-ver 需要版本号（例如 v1.11.0）"
+        OPT_SINGBOX_VER=$2; shift ;;
+      --singbox-ver=*)
+        OPT_SINGBOX_VER=${1#*=}
+        [[ -n $OPT_SINGBOX_VER && $OPT_SINGBOX_VER != -* ]] || die "--singbox-ver 需要版本号（例如 v1.11.0）" ;;
+      --rollback)
+        OPT_ACTION=update
+        if [[ -n ${2-} && ${2} != -* ]]; then OPT_ROLLBACK=${2,,}; shift
+        else OPT_ROLLBACK=all; fi
+        case $OPT_ROLLBACK in
+          xray) ;;
+          hy2|hysteria|hysteria2) OPT_ROLLBACK=hy2 ;;
+          singbox|sing-box|sb) OPT_ROLLBACK=singbox ;;
+          all) ;;
+          *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
+        esac ;;
+      --rollback=*)
+        OPT_ACTION=update
+        OPT_ROLLBACK=${1#*=}
+        OPT_ROLLBACK=${OPT_ROLLBACK,,}
+        case $OPT_ROLLBACK in
+          xray) ;;
+          hy2|hysteria|hysteria2) OPT_ROLLBACK=hy2 ;;
+          singbox|sing-box|sb) OPT_ROLLBACK=singbox ;;
+          all) ;;
+          *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
+        esac ;;
       update|upgrade) OPT_ACTION=update ;;
       export)
         OPT_ACTION="export"
@@ -767,7 +815,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || -n $OPT_XRAY_VER || -n $OPT_HY2_VER || -n $OPT_SINGBOX_VER || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert

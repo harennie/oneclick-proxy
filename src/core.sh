@@ -25,6 +25,10 @@
 #   bash proxy.sh route           # 回程线路检测（不改配置）
 #   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
 #   bash proxy.sh --help          # 查看全部参数
+#   bash proxy.sh --xray-ver v26.3.27 --hy2-ver v2.6.1 --singbox-ver v1.11.0
+#                                 # 安装指定的已发布版本
+#   proxy update --rollback [xray|hy2|singbox|all]
+#                                 # 用 .bak 换回内核并重启
 # 安装完成后可直接使用命令: proxy
 #
 # 支持: Debian 11/12/13, Ubuntu 20.04+, Rocky/Alma/CentOS Stream 8/9(+), RHEL, Fedora (systemd, amd64/arm64)
@@ -209,6 +213,10 @@ OPT_IMPORT=""       # --import / proxy import 的文件
 OPT_EXPORT_PATH=""  # proxy export 的输出路径，空则用默认
 OPT_EXPORT_ENC=0    # 1 = 导出时用 openssl 加密
 OPT_DOCTOR_FIX=0    # 1 = proxy doctor --fix
+OPT_XRAY_VER=""     # 安装 / proxy update：指定 Xray 发布标签
+OPT_HY2_VER=""      # 安装 / proxy update：指定 Hysteria2 发布标签
+OPT_SINGBOX_VER=""  # 安装 / proxy update：指定 sing-box 发布标签
+OPT_ROLLBACK=""     # proxy update --rollback：xray | hy2 | singbox | all
 IMPORT_MODE=0       # 1 = 本次安装来自导入，要重新检测 IP / NAT / SNI / 防火墙
 OPT_CERT=""         # 空=沿用已有或在交互安装时询问；1=申请；0=--no-cert 关闭
 OPT_CERT_DOMAIN=""  # 申请证书的自有域名（须解析到本机）

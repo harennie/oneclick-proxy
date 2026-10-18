@@ -184,13 +184,14 @@ proxy proto
   - 以 `nobody` 运行，配置文件 `root:nogroup 640`，私钥/种子只保存在 `/root/.proxy-oneclick/state.env`（600），不会在屏幕上显示；
   - 屏蔽访问服务器内网（geoip:private）与 BT。
   - 官方脚本遇到 GitHub API 限流（403）时，会自动改为“指定最新版本号”重试。
+  - 更新前把当前程序备份为 `/usr/local/bin/xray.bak`。该目录剩余空间不足 50 MB 时跳过备份并警告。直接下载时先在临时文件上跑 `version`，并对当前配置跑 `xray run -test`，通过后才替换。官方安装脚本会自己写入程序，脚本在写完后做同样的检查，不通过就恢复备份。可用 `--xray-ver <标签>` 安装指定的已发布版本。
   - **安装后 REALITY 自检**：用已安装的 xray 在 127.0.0.1 随机端口起一个临时客户端，按生成的链接参数连接本机节点并访问外网，打印通过 / 未通过（不影响安装；更换 SNI 后也会自动自检）。临时客户端限制 `GOMEMLIMIT`，128MB 的 NAT 小鸡也能跑。
 - **REALITY 目标网站自动优选**（见下文「为什么 SNI 规则很重要」）。
-- **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。Cloudflare 源站证书不会交给 Hysteria2。
+- **Hysteria2（可选，默认启用，官方 get.hy2.sh 安装）**：自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。Cloudflare 源站证书不会交给 Hysteria2。更新前备份为 `hysteria.bak`（剩余空间不足 50 MB 时跳过并警告）。Hysteria2 没有配置检查命令，只确认新程序能跑 `version`。可用 `--hy2-ver <标签>`（例如 `v2.6.1`）安装指定版本。
 - **防火墙（nftables）**：独立表 `inet proxy_oneclick`，不改 Docker / Podman 自己的表。模式为 `strict`（入站默认拒绝，干净机器的默认）、`allow`（只放行代理端口和端口跳跃，不接管入站策略；检测到 Docker/Podman、WireGuard 或其它 UDP、已有 nftables/iptables/ufw/firewalld，或多个非标准监听端口时，交互安装默认推荐它，非交互且未指定 `--firewall` 时直接用它）或 `off`（`--no-firewall`，不写规则）。严格模式放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有 HTTP-01（Let's Encrypt / ZeroSSL 的单域名或多域名）才额外放行 TCP 80。只有公开证书才放行订阅 HTTPS 端口。通配符 DNS-01 和 Cloudflare 源站证书不放行 80，源站证书也不开订阅。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时，严格模式会询问是否停用（卸载时可恢复）；只放行模式，或选择保留它们时，会把当前代理端口、SSH 和 Hysteria2 跳跃范围写进正在运行的 ufw（注释 `proxy-oneclick`）或 firewalld 默认区域，并记在 `/root/.proxy-oneclick/fw-host.list`，改端口、关协议、切换模式和卸载时按这份记录删掉，不碰用户自己加的规则。本机没有 ufw 也没有 firewalld 时这一步不做。不会关闭 SELinux（写入文件后执行 `restorecon`）。防火墙菜单、运行状态和安装结束时会逐行列出已经放行的端口，以及每一条属于哪个协议（Reality、XHTTP、Hysteria2、Trojan、TUIC、AnyTLS、CDN 的 XHTTP 与 WebSocket、订阅、证书申请的 TCP 80、SSH、端口跳跃，以及额外放行），并写出已经同步到 ufw / firewalld 的条目。严格模式下，没写出来的新连接仍然拒绝；只放行模式不会丢掉其它端口。装好后可用 `proxy firewall strict`、`proxy firewall allow`、`proxy firewall off` 切换。
 - **fail2ban**：sshd 监狱，10 分钟内失败 5 次封禁 1 小时（systemd 日志后端 + nftables 动作）。
 - **XHTTP（默认开启）**：VLESS + XHTTP + REALITY。与 Vision 共用同一把 x25519、ShortId、SNI 和 ML-DSA-65 种子，默认单独监听 TCP 8443，`flow` 必须为空，路径为随机 `/` + 十六进制。服务端和客户端链接的 `mode` 都是 `stream-one`（REALITY 直连；客户端用 `auto` 时有已知握手失败）。不需要自己的域名，也不把自己的证书挂到 XHTTP 上。这条和下面的「XHTTP + TLS（CDN）」是两条入站，互不替换。加上 `--xhttp-on-443`（或 `proxy proto xhttp-443 on`）后，Vision 的入站用 Xray fallbacks 把非 Vision 流量交给本机的 XHTTP 入站（优先 `/dev/shm/xray-xhttp.sock`，没有则用 127.0.0.1），链接端口、SNI、公钥和 ShortId 与 Vision 相同，防火墙不再单独放行 8443。已有安装默认仍是分开的 8443。NAT 只有一个 TCP 映射时，安装会建议或直接启用共用。
-- **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。Cloudflare 源站证书不会交给它们。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。
+- **可选协议（默认关闭，安装时不会询问）**：Trojan + REALITY（Xray，TCP 8444，同一把 Reality 密钥）；TUIC v5（sing-box，UDP 8446，BBR，ALPN h3）和 AnyTLS（sing-box，TCP 8445）。后两个默认复用 Hysteria2 的自签证书（CN = 所选 SNI），客户端需要允许不安全证书。申请公开证书后，这两条改为出示该证书，客户端按正常校验。Cloudflare 源站证书不会交给它们。当前 v2rayNG 不能导入 `tuic://` 和 `anytls://`，请用 v2rayN / sing-box / mihomo。更新 sing-box 时同样先备份为 `sing-box.bak`（空间不足 50 MB 则跳过），临时文件要通过 `version` 和 `sing-box check` 才替换。可用 `--singbox-ver <标签>` 安装指定版本。
 - **CDN 上的两条线路（默认关闭）**：VLESS + XHTTP + TLS（TCP 2083，`mode=packet-up`）和 VLESS + WebSocket + TLS（TCP 2087）。用公开证书，或只用这两条时改用 Cloudflare 源站证书。都不是 REALITY。打开时脚本会打印 DNS、橙色云朵、回源端口、加密模式和客户端链接该怎么填。详见「经过 CDN 的两条线路」。
 - **输出**：每个已开启协议单独一块：名称、地址、端口各一行，链接本身最后单独一行。vless://（含 / 不含 pqv）、xhttp 的 vless://（`mode=stream-one`，无 flow）、hysteria2://（未申请证书时带 `mport`、`sni`、`insecure=1`、`pinSHA256`；申请之后地址和 SNI 为自有域名，不再带 insecure / pin）、可选的 trojan:// / tuic:// / anytls://。打开 CDN 线路后另有两条 vless://（`security=tls`，没有 flow / pbk / sid / pqv / insecure）。终端二维码，mihomo（Clash.Meta）YAML 片段。申请公开证书后另有仅 HTTPS 的订阅地址。源站证书没有订阅。
 - **管理菜单**：顶部字符 Logo 是「哈人」，正下方小标题和菜单框标题是 `oneclick proxy`。主菜单两列编号，第 16 项是「协议开关」，第 17 项是「申请证书」，第 18 项是「回程线路检测」，第 19 项是「导出配置」，第 20 项是「导入配置」，第 21 项是「健康检查」。其余是：安装/重装、查看链接和二维码、更换 SNI、重新生成密钥、修改端口、添加/删除用户（UUID + 备注）、更新 Xray/Hysteria2/脚本、状态与日志、测速与延迟提示、防火墙管理、网络调优、落地转发、安装为落地机、卸载、切换 NAT 模式。
@@ -927,11 +928,22 @@ proxy sni
 proxy user
 ```
 
-**更新 Xray / Hysteria2 / 脚本**
+**更新 Xray / Hysteria2 / sing-box / 脚本**
 
 ```bash
 proxy update
+proxy update --xray-ver v26.3.27
+proxy update --hy2-ver v2.6.1
+proxy update --singbox-ver v1.11.0
+proxy update --rollback
+proxy update --rollback xray
 ```
+
+更新 Xray、Hysteria2 或 sing-box 之前，把正在用的程序复制为同目录的 `.bak`（例如 `/usr/local/bin/xray.bak`）。这个目录剩余空间不足 50 MB 时跳过备份，并给出警告。直接下载的新程序先放在临时路径：Xray 要能跑 `version`，并且对当前配置 `xray run -test` 通过；sing-box 要能跑 `version` 和 `sing-box check`；Hysteria2 没有配置检查，只跑 `version`。通过之后才替换原来的文件。官方安装脚本会自己写入程序，脚本在它写完后立刻做同样的检查，不通过就恢复备份。换成新版本后如果服务没有起来，会自动恢复 `.bak`，并写明版本变化。
+
+`--xray-ver`、`--hy2-ver`、`--singbox-ver` 在安装和 `proxy update` 里都能用。版本号必须是 GitHub 上已经发布的标签。Hysteria2 可以写 `v2.6.1` 或 `app/v2.6.1`。`proxy update` 带了这些参数或 `--rollback` 时不再进入菜单，只处理写出的内核。
+
+`--rollback` 用 `.bak` 换回程序并重启对应服务（systemd 和 OpenRC 都支持），打印 `旧版本 -> 新版本`。目标是 `xray`、`hy2`、`singbox` 或 `all`，不写就是 `all`。没有 `.bak` 时跳过并警告。菜单第 7 项（落地机菜单第 6 项）里选「回滚到备份」是同一件事。
 
 **只更新本脚本**（proxy 命令）
 
