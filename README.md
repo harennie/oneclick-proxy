@@ -796,7 +796,7 @@ proxy firewall allow
 proxy firewall off
 ```
 
-菜单「防火墙管理」里是同样的三项。卸载会删掉本脚本的表和 `proxy-oneclick-fw` 服务。NAT 模式不使用这套入站防火墙。落地机的来源白名单仍是单独的表 `inet proxy_oneclick_land`，只限制落地端口的来源，不是默认拒绝。
+菜单「防火墙管理」里是同样的三项。`proxy firewall off` 会删掉本脚本写进 ufw / firewalld 的放行。这两个防火墙如果还开着，会额外警告：默认拒绝会挡住代理端口，可再执行 `proxy firewall allow`，或自行停用那个防火墙。卸载会删掉本脚本的表和 `proxy-oneclick-fw` 服务。NAT 模式不使用这套入站防火墙。落地机的来源白名单仍是单独的表 `inet proxy_oneclick_land`，只限制落地端口的来源，不是默认拒绝。
 
 </details>
 

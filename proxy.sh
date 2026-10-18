@@ -369,7 +369,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;719:src/os.sh:1;1228:src/tune.sh:1;2028:src/xray.sh:1;4051:src/hy2.sh:1;4190:src/firewall.sh:1;5442:src/cert.sh:1;7474:src/cdn.sh:1;8459:src/link.sh:1;8848:src/singbox.sh:1;9426:src/nat.sh:1;10064:src/selftest.sh:1;10209:src/land.sh:1;11655:src/menu.sh:1;12228:src/route.sh:1;12743:src/export.sh:1;12959:src/doctor.sh:1;13294:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;719:src/os.sh:1;1228:src/tune.sh:1;2028:src/xray.sh:1;4051:src/hy2.sh:1;4190:src/firewall.sh:1;5448:src/cert.sh:1;7480:src/cdn.sh:1;8465:src/link.sh:1;8854:src/singbox.sh:1;9432:src/nat.sh:1;10070:src/selftest.sh:1;10215:src/land.sh:1;11661:src/menu.sh:1;12234:src/route.sh:1;12749:src/export.sh:1;12965:src/doctor.sh:1;13300:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -4494,6 +4494,12 @@ fw_switch_mode() { # strict|allow|off。已安装后从菜单或 proxy firewall 
       FW_ENABLED=0
       save_state
       ok "已关闭本脚本防火墙（没有改系统其它规则，写入 ufw / firewalld 的放行也已去掉）。"
+      if fw_ufw_active; then
+        warn "ufw 仍在运行。写进 ufw 的放行已经去掉，它的默认拒绝会挡住代理端口。要恢复：proxy firewall allow；或自行停用 ufw。"
+      fi
+      if fw_firewalld_active; then
+        warn "firewalld 仍在运行。写进 firewalld 的放行已经去掉，它的默认拒绝会挡住代理端口。要恢复：proxy firewall allow；或自行停用 firewalld。"
+      fi
       ;;
     allow)
       FW_MODE=allow

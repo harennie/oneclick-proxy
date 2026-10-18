@@ -305,6 +305,12 @@ fw_switch_mode() { # strict|allow|off。已安装后从菜单或 proxy firewall 
       FW_ENABLED=0
       save_state
       ok "已关闭本脚本防火墙（没有改系统其它规则，写入 ufw / firewalld 的放行也已去掉）。"
+      if fw_ufw_active; then
+        warn "ufw 仍在运行。写进 ufw 的放行已经去掉，它的默认拒绝会挡住代理端口。要恢复：proxy firewall allow；或自行停用 ufw。"
+      fi
+      if fw_firewalld_active; then
+        warn "firewalld 仍在运行。写进 firewalld 的放行已经去掉，它的默认拒绝会挡住代理端口。要恢复：proxy firewall allow；或自行停用 firewalld。"
+      fi
       ;;
     allow)
       FW_MODE=allow
