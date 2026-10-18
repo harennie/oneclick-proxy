@@ -67,17 +67,32 @@ fw_wireguard_present() {
   if have ip && ip -d link show 2>/dev/null | grep -q wireguard; then return 0; fi
   return 1
 }
+# apt purge 之后，oneshot 服务仍可能显示 active (exited)。命令没了，或单元文件已经不在，就不算在运行。
+fw_unit_missing() { # $1 服务名。0 = 单元已经不在
+  local name=$1 load="" frag=""
+  [[ ${INIT_SYS:-} == systemd ]] || return 1
+  have systemctl || return 1
+  load=$(systemctl show -p LoadState --value "$name" 2>/dev/null || true)
+  case $load in
+    not-found|masked) return 0 ;;
+  esac
+  frag=$(systemctl show -p FragmentPath --value "$name" 2>/dev/null || true)
+  [[ -n $frag && ! -e $frag ]]
+}
 fw_ufw_active() {
   local st=""
-  svc_active ufw && return 0
   have ufw || return 1
+  fw_unit_missing ufw && return 1
+  svc_active ufw && return 0
   # 不用 grep -q 接管道：pipefail 下 ufw 写到一半会被 SIGPIPE，活动状态会误判。
   st=$(ufw status 2>/dev/null || true)
   [[ $st == *'Status: active'* ]]
 }
 fw_firewalld_active() {
+  have firewall-cmd || return 1
+  fw_unit_missing firewalld && return 1
   svc_active firewalld && return 0
-  have firewall-cmd && firewall-cmd --state >/dev/null 2>&1
+  firewall-cmd --state >/dev/null 2>&1
 }
 # 除本脚本的表以外，规则集里还有实际规则（空表、只有 chain 类型声明的不算）
 fw_foreign_nft() {
