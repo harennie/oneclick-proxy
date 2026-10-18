@@ -906,7 +906,7 @@ bash proxy.sh --import /root/node.tar.gz --auto
 
 `--password` 会询问密码（不回显），用 `openssl enc -aes-256-cbc -pbkdf2` 加密。也可以把密码放在环境变量 `PROXY_EXPORT_PASS`。不会把密钥打成一行 base64 放在命令行里。NAT 机器导入后要重新填映射，例如再加上 `--nat-ports`。
 
-**健康检查**（第 21 项，落地机菜单第 18 项，或 `proxy doctor`）：只读。依次看时间偏差（Cloudflare `cdn-cgi/trace` 的 `ts=`，超过 15 秒提醒）、服务是否在跑、端口是否在听、最近有没有内存不足或崩溃、nftables 表和已放行端口、ufw/firewalld 同步、Hysteria2 端口跳跃的 DNAT 和计数器、SNI 是否还合格、REALITY / XHTTP 回环自检、外部检查命令，以及公开证书是否快到期（不足 7 天提醒）。有失败项时退出码非 0。`proxy doctor --fix` 只做安全修复：拉起已停止的服务、`chronyc makestep` 或重启 timesyncd / OpenRC chronyd、按清单重写 ufw/firewalld、把 `state.env` 改成 600。不加 `--fix` 时不改任何配置。
+**健康检查**（第 21 项，落地机菜单第 18 项，或 `proxy doctor`）：只读。依次看时间偏差（Cloudflare `cdn-cgi/trace` 的 `ts=`，超过 15 秒提醒）、服务是否在跑、端口是否在听、最近有没有内存不足或崩溃、nftables 表和已放行端口、ufw/firewalld 同步、Hysteria2 端口跳跃的 DNAT 和计数器、SNI 是否还合格、REALITY / XHTTP 回环自检、外部检查命令，以及公开证书是否快到期（不足 7 天提醒）。有失败项时退出码非 0。`proxy doctor --fix` 只做安全修复：拉起已停止的服务、`chronyc makestep` 或重启 timesyncd / OpenRC chronyd、按清单重写 ufw/firewalld、把 `state.env` 改成 600。修好之后会再查一遍，并列出这次修好的项目；原先失败的都已通过时退出码为 0。仍有失败则退出码非 0。不加 `--fix` 时不改任何配置。
 
 **切换 NAT 模式**（第 15 项，落地机菜单为第 11 项）：`自动`（默认：Alpine 强制 NAT、LXC/OpenVZ 容器安装时询问、已安装的沿用原模式）/ `开`（强制 NAT 映射端口流程，等同 `--nat`）/ `关`（强制普通模式，等同 `--no-nat`；Alpine 不可用）。在第 1 或 13 项安装前选择即可；设置保存在 `state.env`（`NAT_PREF`），之后的修改端口等操作都按它执行。已安装时切换到不同模式会提示立即重新安装（保留密钥 / UUID）；命令行 `--nat` / `--no-nat` 优先并同步该设置。
 

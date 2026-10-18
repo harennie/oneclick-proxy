@@ -369,7 +369,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5275:src/cert.sh:1;7307:src/cdn.sh:1;8292:src/link.sh:1;8681:src/singbox.sh:1;9259:src/nat.sh:1;9897:src/selftest.sh:1;10042:src/land.sh:1;11488:src/menu.sh:1;12057:src/route.sh:1;12572:src/export.sh:1;12773:src/doctor.sh:1;13068:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5275:src/cert.sh:1;7307:src/cdn.sh:1;8292:src/link.sh:1;8681:src/singbox.sh:1;9259:src/nat.sh:1;9897:src/selftest.sh:1;10042:src/land.sh:1;11488:src/menu.sh:1;12057:src/route.sh:1;12572:src/export.sh:1;12773:src/doctor.sh:1;13108:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -12777,20 +12777,32 @@ menu_import() {
 # 按清单重写 ufw/firewalld、把 state.env 改为 600。
 DOCTOR_FIX=0
 DOCTOR_FAIL=0
+DOCTOR_FIXED=""
 doc_line() { printf '  %-6s %s\n' "$1" "$2"; }
 doc_ok() { doc_line OK "$*"; }
 doc_warn() { doc_line WARN "$*"; }
 doc_fail() { doc_line FAIL "$*"; DOCTOR_FAIL=1; }
+doc_info() { doc_line INFO "$*"; }
+doc_fixed() { DOCTOR_FIXED+="${DOCTOR_FIXED:+$'\n'}$*"; }
 doctor_fix_time() {
   if have chronyc && chronyc makestep >/dev/null 2>&1; then
     doc_ok "已执行 chronyc makestep。"
+    doc_fixed "已步进对时（chronyc makestep）"
     return 0
   fi
   if [[ $INIT_SYS == systemd ]] && systemctl cat systemd-timesyncd >/dev/null 2>&1; then
-    systemctl restart systemd-timesyncd >/dev/null 2>&1 && { doc_ok "已重启 systemd-timesyncd。"; return 0; }
+    if systemctl restart systemd-timesyncd >/dev/null 2>&1; then
+      doc_ok "已重启 systemd-timesyncd。"
+      doc_fixed "已重启 systemd-timesyncd"
+      return 0
+    fi
   fi
   if is_openrc && [[ -x /etc/init.d/chronyd ]]; then
-    rc-service chronyd restart >/dev/null 2>&1 9>&- && { doc_ok "已重启 OpenRC chronyd。"; return 0; }
+    if rc-service chronyd restart >/dev/null 2>&1 9>&-; then
+      doc_ok "已重启 OpenRC chronyd。"
+      doc_fixed "已重启 OpenRC chronyd"
+      return 0
+    fi
   fi
   doc_warn "没有可用的对时命令（chronyc / timesyncd / chronyd）。"
 }
@@ -12839,7 +12851,9 @@ doctor_one_svc() { # $1 服务名 $2 是否必须（1/0）
   else
     doc_fail "${svc} 没有在运行（$(svc_state "$svc")）。"
     if (( DOCTOR_FIX )); then
-      if svc_restart "$svc" && sleep 1 && svc_active "$svc"; then doc_ok "已重新拉起 ${svc}。"
+      if svc_restart "$svc" && sleep 1 && svc_active "$svc"; then
+        doc_ok "已重新拉起 ${svc}。"
+        doc_fixed "已重新拉起 ${svc}"
       else doc_fail "重新拉起 ${svc} 失败。可查看: proxy status"; fi
     else
       echo "        可执行: proxy doctor --fix"
@@ -12875,7 +12889,12 @@ doctor_services() {
     if [[ $mode == 600 ]]; then doc_ok "state.env 权限是 600。"
     elif [[ -n $mode ]]; then
       doc_warn "state.env 权限是 ${mode}，应为 600。"
-      if (( DOCTOR_FIX )); then chmod 600 "$STATE_FILE" && doc_ok "已把 state.env 改为 600。"; fi
+      if (( DOCTOR_FIX )); then
+        if chmod 600 "$STATE_FILE"; then
+          doc_ok "已把 state.env 改为 600。"
+          doc_fixed "已把 state.env 改为 600"
+        fi
+      fi
     fi
   fi
 }
@@ -12922,6 +12941,7 @@ doctor_host_sync() {
   if (( miss && DOCTOR_FIX )); then
     fw_host_sync || true
     doc_ok "已按清单重新同步 ufw/firewalld。"
+    doc_fixed "已重新同步 ufw/firewalld"
   elif (( miss )); then
     echo "        可执行: proxy doctor --fix"
   fi
@@ -13031,16 +13051,7 @@ doctor_cert() {
   fi
   doc_ok "公开证书未过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。"
 }
-do_doctor() {
-  load_state
-  (( INSTALLED )) || die "还没有安装。"
-  [[ -n $INIT_SYS ]] || detect_init
-  [[ -n $OS_ID ]] || detect_os
-  DOCTOR_FAIL=0
-  [[ ${OPT_DOCTOR_FIX:-0} == 1 ]] && DOCTOR_FIX=1 || DOCTOR_FIX=0
-  echo
-  if (( DOCTOR_FIX )); then hr; _green "  健康检查（会做安全修复）"; hr
-  else hr; _green "  健康检查（只读）"; hr; fi
+doctor_run_checks() {
   doctor_clock
   doctor_services
   doctor_firewall
@@ -13048,12 +13059,41 @@ do_doctor() {
   doctor_selftests
   doctor_reach
   doctor_cert
+}
+do_doctor() {
+  load_state
+  (( INSTALLED )) || die "还没有安装。"
+  [[ -n $INIT_SYS ]] || detect_init
+  [[ -n $OS_ID ]] || detect_os
+  DOCTOR_FAIL=0
+  DOCTOR_FIXED=""
+  [[ ${OPT_DOCTOR_FIX:-0} == 1 ]] && DOCTOR_FIX=1 || DOCTOR_FIX=0
   echo
+  if (( DOCTOR_FIX )); then hr; _green "  健康检查（会做安全修复）"; hr
+  else hr; _green "  健康检查（只读）"; hr; fi
+  doctor_run_checks
+  # 修复时第一次检查仍记着修复前的失败。复查时不再改系统，只看现在是否通过。
+  if (( DOCTOR_FIX && DOCTOR_FAIL )); then
+    echo
+    info "正在复查刚才的修复 ..."
+    DOCTOR_FAIL=0
+    DOCTOR_FIX=0
+    doctor_run_checks
+  fi
+  echo
+  if [[ -n $DOCTOR_FIXED ]]; then
+    info "这次修好了："
+    local line
+    while IFS= read -r line; do
+      [[ -n $line ]] && printf '  - %s\n' "$line"
+    done <<<"$DOCTOR_FIXED"
+  fi
   if (( DOCTOR_FAIL )); then
     warn "有检查未通过。"
     exit 1
   fi
-  ok "检查完成，没有失败项。"
+  if [[ -n $DOCTOR_FIXED ]]; then ok "检查完成。列出的项目已经修好。"
+  else ok "检查完成，没有失败项。"; fi
 }
 menu_doctor() {
   need_installed
