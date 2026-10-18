@@ -341,8 +341,20 @@ fw_rules_cover_ssh() { # $1 nft 文件
   return 0
 }
 
+# Debian 上 fail2ban.service 有 PartOf=firewalld.service，停 firewalld 会把 fail2ban 一起停掉。
+fw_revive_fail2ban() { # $1 = 停用前 fail2ban 是否在运行
+  [[ ${1:-0} == 1 ]] || return 0
+  svc_active fail2ban && return 0
+  if svc_restart fail2ban; then
+    ok "已重新拉起 fail2ban（停用其它防火墙时它被一起停掉了）。"
+  else
+    warn "fail2ban 在停用其它防火墙时被一起停掉，重新拉起失败。可手动执行: systemctl restart fail2ban"
+  fi
+  return 0
+}
 handle_other_firewalls() {
-  local fw
+  local fw f2b_was=0
+  svc_active fail2ban && f2b_was=1
   FW_HOST_SYNC=0
   for fw in firewalld ufw; do
     if { [[ $fw == ufw ]] && fw_ufw_active; } || { [[ $fw == firewalld ]] && fw_firewalld_active; }; then
@@ -359,10 +371,13 @@ handle_other_firewalls() {
         FW_ENABLED=0
         FW_MODE=off
         FW_HOST_SYNC=1
+        fw_revive_fail2ban "$f2b_was"
         return 0
       fi
     fi
   done
+  fw_revive_fail2ban "$f2b_was"
+  return 0
 }
 
 backup_firewall() {

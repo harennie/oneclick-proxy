@@ -369,7 +369,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5260:src/cert.sh:1;7292:src/cdn.sh:1;8277:src/link.sh:1;8666:src/singbox.sh:1;9244:src/nat.sh:1;9882:src/selftest.sh:1;10027:src/land.sh:1;11473:src/menu.sh:1;12042:src/route.sh:1;12557:src/export.sh:1;12758:src/doctor.sh:1;13053:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;714:src/os.sh:1;1223:src/tune.sh:1;2023:src/xray.sh:1;3899:src/hy2.sh:1;4038:src/firewall.sh:1;5275:src/cert.sh:1;7307:src/cdn.sh:1;8292:src/link.sh:1;8681:src/singbox.sh:1;9259:src/nat.sh:1;9897:src/selftest.sh:1;10042:src/land.sh:1;11488:src/menu.sh:1;12057:src/route.sh:1;12572:src/export.sh:1;12773:src/doctor.sh:1;13068:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -4378,8 +4378,20 @@ fw_rules_cover_ssh() { # $1 nft 文件
   return 0
 }
 
+# Debian 上 fail2ban.service 有 PartOf=firewalld.service，停 firewalld 会把 fail2ban 一起停掉。
+fw_revive_fail2ban() { # $1 = 停用前 fail2ban 是否在运行
+  [[ ${1:-0} == 1 ]] || return 0
+  svc_active fail2ban && return 0
+  if svc_restart fail2ban; then
+    ok "已重新拉起 fail2ban（停用其它防火墙时它被一起停掉了）。"
+  else
+    warn "fail2ban 在停用其它防火墙时被一起停掉，重新拉起失败。可手动执行: systemctl restart fail2ban"
+  fi
+  return 0
+}
 handle_other_firewalls() {
-  local fw
+  local fw f2b_was=0
+  svc_active fail2ban && f2b_was=1
   FW_HOST_SYNC=0
   for fw in firewalld ufw; do
     if { [[ $fw == ufw ]] && fw_ufw_active; } || { [[ $fw == firewalld ]] && fw_firewalld_active; }; then
@@ -4396,10 +4408,13 @@ handle_other_firewalls() {
         FW_ENABLED=0
         FW_MODE=off
         FW_HOST_SYNC=1
+        fw_revive_fail2ban "$f2b_was"
         return 0
       fi
     fi
   done
+  fw_revive_fail2ban "$f2b_was"
+  return 0
 }
 
 backup_firewall() {
