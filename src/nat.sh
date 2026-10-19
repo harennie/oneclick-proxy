@@ -473,16 +473,21 @@ resolve_mode() {
 
 do_install() {
   load_state
-  if cert_cli_requested && { [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; }; then
-    die "落地机只运行 Shadowsocks 2022，不能申请证书，也不提供订阅。"
+  # 纯 --land（以及已是落地机且没写 --no-land / --with-land）仍只装落地机。
+  # --with-land，或 --land 再加某个节点协议的开启开关，走下面的节点安装并带上落地入站。
+  if installing_land_only; then
+    if cert_cli_requested; then
+      die "落地机只运行 Shadowsocks 2022，不能申请证书，也不提供订阅。"
+    fi
+    if cdn_cli_requested; then
+      cdn_explain land
+      die "落地机不能打开 CDN 线路。"
+    fi
+    do_install_land
+    return
   fi
-  if cdn_cli_requested && { [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; }; then
-    cdn_explain land
-    die "落地机不能打开 CDN 线路。"
-  fi
-  # 落地机：--land，或已安装为落地机且未指定 --no-land
-  if [[ $OPT_LAND == 1 ]] || { [[ $LAND_MODE == 1 && $OPT_LAND != 0 ]]; }; then do_install_land; return; fi
-  local was_land=$LAND_MODE
+  local was_land=$LAND_MODE want_in=0
+  install_wants_land_in && want_in=1
   LAND_MODE=0
   preflight      # decide_nat_mode：命令行 / 菜单设置 / Alpine / 已安装 / 自动检测，端口设置前确定 NAT_MODE
   resolve_mode
@@ -494,19 +499,35 @@ do_install() {
     die "NAT 模式不能申请证书（含通配符、ZeroSSL 和 Cloudflare 源站证书）：公网访问不到这台机器，CDN 也无法回源。请去掉证书参数。不带这些参数时，安装方式与现在相同。"
   fi
   take_lock
-    if (( was_land )); then
+  if (( was_land )); then
     info "由落地机改装为 Reality / XHTTP / Hysteria2 节点：移除落地机白名单规则，停止 Shadowsocks，重新生成节点配置。"
     land_fw_remove
-    land_fwd_remove
-    # 落地机的下一跳 / 原样转发不是节点菜单 12 的中转。改装后不要自动沿用。
-    FWD_ON=0 FWD_LINK=""
-    RELAY_ON=0 RELAY_LINK="" RELAY_SOCKS=""
+    if (( want_in )); then
+      info "保留落地密钥、白名单和原样转发。原来启用中的加密下一跳改记到落地入站自己的出口（land-next），不再当作节点的 land-add。"
+      if [[ ${RELAY_ON:-0} == 1 && -n ${RELAY_LINK:-} ]]; then
+        LAND_NEXT=$RELAY_LINK
+        LAND_NEXT_ON=1
+      fi
+      RELAY_ON=0 RELAY_LINK="" RELAY_SOCKS=""
+      if [[ -z ${OPT_LAND_PORT:-} ]]; then
+        LAND_PORT=$XRAY_PORT
+        if (( NAT_MODE )) && [[ -n ${XRAY_EXT_PORT:-} ]]; then LAND_EXT_PORT=$XRAY_EXT_PORT; fi
+      fi
+      LAND_IN=1
+    else
+      land_fwd_remove
+      FWD_ON=0 FWD_LINK=""
+      RELAY_ON=0 RELAY_LINK="" RELAY_SOCKS=""
+      LAND_IN=0 LAND_NEXT="" LAND_NEXT_ON=0 LAND_PORT="" LAND_EXT_PORT=""
+    fi
     if is_openrc; then rc-service xray stop >/dev/null 2>&1 9>&- || true   # 避免旧的 SS 端口被当作「其它已监听端口」放行
     else systemctl stop xray >/dev/null 2>&1 || true; fi
     HY2_ENABLED=1
     REALITY_ENABLED=1
     [[ -n $OPT_XHTTP ]] || XHTTP_ENABLED=1
     if (( ! NAT_MODE )); then XRAY_PORT=443 HY2_PORT=443 HOP_RANGE="20000-50000"; fi
+  else
+    LAND_IN=$want_in
   fi
   resolve_install_protos
   if (( INSTALLED )) && (( ! OPT_AUTO )); then
@@ -544,6 +565,11 @@ do_install() {
   [[ -n $OPT_NAME ]] && NODE_NAME=$OPT_NAME
   [[ -n $NODE_NAME ]] || NODE_NAME=$(default_node_name)
   fw_decide_install
+  if land_in_on; then
+    step "落地入站"
+    land_choose_method
+    land_choose_allow
+  fi
 
   install_xray
   if [[ -z $UUID || -z $PRIV_KEY || -z $PUB_KEY || -z $SHORT_ID ]]; then
@@ -584,6 +610,10 @@ do_install() {
 
   ensure_proto_secrets
   save_state
+  if land_in_on && [[ ${FWD_ON:-0} == 1 && -n ${FWD_LINK:-} ]]; then
+    land_raw_active || die "原样转发链接无法解析，拒绝按直连安装。"
+    land_fwd_check
+  fi
   if xray_inbound_needed; then
     local rc=0
     write_xray_config || rc=$?
@@ -618,13 +648,14 @@ do_install() {
   fi
 
   apply_firewall
+  land_sync_fwd_rules
   if tls_present_real; then cert_start_sub; fi
   cdn_after_cert
   (( NAT_MODE )) || setup_fail2ban
   INSTALLED=1
   save_state
   self_install
-  ( trap - ERR; set +e; reality_selftest; xhttp_selftest ) || true
+  ( trap - ERR; set +e; reality_selftest; xhttp_selftest; if land_in_on && ! land_raw_active; then land_selftest; fi ) || true
   show_info
   cloud_fw_reminder
   echo

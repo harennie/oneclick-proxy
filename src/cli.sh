@@ -176,6 +176,7 @@ show_menu() {
   ui_stat_row "状态" "$st_word" "模式" "$mode_lbl"
   [[ -n $SNI ]] && ui_stat_row "SNI" "$SNI"
   (( NAT_MODE && INSTALLED )) && ui_stat_row "地址" "${SERVER_ADDR:-未设置}" "映射" "${NAT_PORTS:-未设置}"
+  if land_in_on; then ui_stat_row "落地入站" "TCP+UDP $(pub_land_port)" "出口" "$(land_in_egress_label)"; fi
   ui_columns "oneclick proxy" "退出" \
     "安装 / 重新安装" \
     "查看链接 / 二维码 / Clash 配置" \
@@ -197,7 +198,8 @@ show_menu() {
     "回程线路检测" \
     "导出配置（迁到另一台机器）" \
     "导入配置" \
-    "健康检查"
+    "健康检查" \
+    "落地入站（与本机节点同时开启）"
   local c act=""; ask c "请选择" ""
   (( TTY_EOF )) && { echo; exit 0; }
   case $c in
@@ -222,6 +224,7 @@ show_menu() {
     19) act=menu_export ;;
     20) act=menu_import ;;
     21) act=menu_doctor ;;
+    22) act=menu_land_in ;;
     0|q|Q) exit 0 ;;
     *) warn "请输入正确的数字。"; return 0 ;;
   esac
@@ -381,7 +384,7 @@ usage() {
 
 双栈（同时有 IPv4 和 IPv6）写入节点配置时询问出站策略：IPv4优先 / IPv6优先 / 仅IPv4 / 仅IPv6（记在 state.env，之后沿用；--auto 默认 IPv4优先；只有一种地址时不询问）。
 本机 IPv6 只有内网 ULA（fc00::/7，例如 fd42::）时，会用 curl -6 探测。若回显是公网 IPv6（NAT66），按双栈处理，可以选 IPv6优先。回显仍是 ULA 或探测失败，则当作没有 IPv6。
-落地机（--land）使用同一套出站策略，写进 Xray freedom 的 domainStrategy。
+落地机（--land）和节点上的落地入站使用同一套出站策略，写进 Xray freedom 的 domainStrategy。加密下一跳另外带 sockopt.domainStrategy。
   --outbound 46|64|4|6|auto    直接指定。auto 清掉已记住的选择，再按本次检测决定。可与 --land 一起用。
   proxy outbound                  查看检测结果
   proxy outbound 64               设为 IPv6优先；节点或落地机已安装时重写配置并重启
@@ -419,32 +422,49 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
       proxy tune apply --tune-cc bbr --tune-qdisc cake --tune-bw 1000 --tune-rtt 180
 
 落地机 / 落地转发（中转机 → 落地机，出口 IP 为落地机）:
-  --land              安装为落地机：只运行 Xray Shadowsocks 2022（TCP+UDP），无 Reality/Hy2，内存占用最低
+  --land              安装为纯落地机：只运行 Xray Shadowsocks 2022（TCP+UDP），无 Reality/Hy2，内存占用最低
                       可与 --nat（NAT 映射端口 / Alpine）、--port、--name、--auto、--outbound 组合
+                      若同时写上 --reality / --hy2 / --xhttp / --trojan / --tuic / --anytls / --xhttp-tls / --ws，
+                      则是普通节点再加一条落地入站（与 --with-land 相同）。--no-hy2 这种关闭不算
+  --with-land         普通节点同时开落地入站（自己的端口、密钥、白名单）。不关掉 Reality / Hy2
+  --no-with-land      重装时关掉落地入站（密钥保留）。--no-land 且不带 --with-land 也会关掉
+  --land-port <端口>  落地入站端口（随机或指定；NAT 可写 外部:内部）。纯 --land 且没写 --port 时当作落地端口
   --land-method <m>   aes-128（默认 2022-blake3-aes-128-gcm）| aes-256 | chacha20
   --land-allow <列表> 来源 IP 白名单（只允许中转机；IPv4/IPv6/CIDR，逗号分隔；none = 不限制）
-  --no-land           落地机改装回 Reality / Hysteria2 节点
-  例: bash proxy.sh --land --auto --land-allow 203.0.113.10          # 落地机，只允许中转机 203.0.113.10
+  --no-land           纯落地机改装回 Reality / Hysteria2 节点。不带 --with-land 时不保留落地入站
+  例: bash proxy.sh --land --auto --land-allow 203.0.113.10          # 纯落地机，只允许中转机 203.0.113.10
       bash proxy.sh --land --nat --auto --port 52430:8388            # NAT 落地机：公网 52430 → 内部 8388
-      bash proxy.sh --land --nat --outbound 64 --port 12446:80       # NAT 落地机，出站 IPv6优先
-  proxy allow [--land-allow 列表]   （落地机）修改来源白名单
-  proxy land-add 'ss://...'         中转机：添加 / 替换落地，测试后设为默认出站（--force 测试失败也启用）
-                                    落地机：加密转发。本机 SS2022 入站，再 SS2022 到下一跳。不装 hy2-relay
-                                    上一跳用本机自己的 ss://；下一跳链接单独打印
-  proxy land-on                     中转机：重新启用已保存的落地。落地机：重新启用已保存的下一跳（并去掉 DNAT）
-  proxy land-off                    中转机：停用落地转发，保留链接。落地机：停用当前的加密转发或原样转发，保留链接
-  proxy land-del                    中转机：删除落地链接。落地机：只删除加密转发的下一跳
-  proxy land-direct | land-clear    （落地机）本机直连。清除下一跳、原样转发目标和 DNAT
-  proxy land-forward 'ss://...'     （落地机）原样转发，同 land-raw。不解密，DNAT 到链接里的主机和端口
+      bash proxy.sh --with-land --auto --land-port 8388              # 节点 + 落地入站
+      bash proxy.sh --land --reality --hy2 --auto --land-port 8388   # 同上，--land 与节点协议一起写
+  proxy land-enable [--land-port 端口] [--land-method m] [--land-allow 列表]
+                                    已安装的节点上补开落地入站。不重装，不改 Reality / Hy2 的密钥和链接
+  proxy land-disable                关掉落地入站（密钥、白名单、下一跳留着）。节点和 land-add 不动
+  proxy allow [--land-allow 列表]   修改落地来源白名单（纯落地机，或已开启落地入站的节点）
+  proxy land-add 'ss://...'         节点：添加 / 替换本机出站的落地，测试后设为默认出站（--force 测试失败也启用）
+                                    纯落地机：加密转发。本机 SS2022 入站，再 SS2022 到下一跳。不装 hy2-relay
+                                    节点上另有落地入站时，land-add 不改变那条入站的出口
+  proxy land-next 'ss://...'        节点上落地入站自己的加密下一跳（出站 tag ss-out）。不改本机 land-add
+                                    纯落地机上与 land-add 相同
+  proxy land-next-on | land-next-off | land-next-del
+                                    重新启用 / 停用 / 删除落地入站的下一跳。纯落地机上分别等于 land-on / land-off / land-del
+  proxy land-on                     节点：重新启用已保存的 land-add。纯落地机：重新启用已保存的下一跳（并去掉 DNAT）
+  proxy land-off                    节点：停用 land-add，保留链接。纯落地机：停用当前的加密转发或原样转发，保留链接
+                                    节点上的落地入站不受影响；停它的出口用 land-next-off 或 land-direct
+  proxy land-del                    节点：删除 land-add 链接。纯落地机：只删除加密转发的下一跳
+  proxy land-direct | land-clear    纯落地机：本机直连。清除下一跳、原样转发目标和 DNAT
+                                    节点上的落地入站：只清这条入站自己的下一跳和原样转发，不改 land-add
+  proxy land-forward 'ss://...'     原样转发，同 land-raw。不解密，DNAT 到链接里的主机和端口
   proxy land-raw 'ss://...'         上一跳链接 = 本机地址/对外端口 + 最终落地的加密方式与密钥
                                     最终落地原地址单独标出。白名单里没有目标地址族时拒绝，不装开放 DNAT
+                                    节点同时开着时，DNAT 只占落地端口，不停 Xray
   proxy land-forward-off | land-raw-off   只停用原样转发（去掉 DNAT，保留目标）
   proxy land-forward-del | land-raw-del   只删除原样转发目标
-  proxy land-test                   中转机：测试落地。落地机：测试下一跳或最终落地的 TCP
-  proxy land                        菜单（落地机上显示链接；中转机进入落地转发菜单）
+  proxy land-test                   节点：测试 land-add。纯落地机：测试下一跳或最终落地的 TCP
+                                    节点上没有 land-add、但落地入站有自己的出口时，测试那条出口
+  proxy land                        菜单（纯落地机上显示链接；节点进入 land-add 菜单。落地入站是菜单第 22 项）
 
 管理命令:
-  proxy               打开交互菜单
+  proxy               打开交互菜单（节点菜单第 22 项是落地入站，不改 1–21）
   proxy info          查看链接 / 二维码 / mihomo 配置
   proxy cert          选择证书种类 / 续期 / 关闭（默认 Let's Encrypt 单域名）
   proxy cdn           查看 CDN 线路教程并复查（XHTTP+TLS / WebSocket+TLS）
@@ -685,6 +705,15 @@ parse_args() {
       --dns64) OPT_DNS64=1 ;;
       --land) OPT_LAND=1 ;;
       --no-land) OPT_LAND=0 ;;
+      --with-land) OPT_WITH_LAND=1 ;;
+      --no-with-land) OPT_WITH_LAND=0 ;;
+      --land-port)
+        [[ -n ${2-} ]] || die "--land-port 需要端口"
+        is_port_opt "$2" || die "--land-port 参数无效: $2"
+        OPT_LAND_PORT=$2; shift ;;
+      --land-port=*)
+        is_port_opt "${1#*=}" || die "--land-port 参数无效: ${1#*=}"
+        OPT_LAND_PORT=${1#*=} ;;
       --land-method) land_norm_method "${2-}" >/dev/null || die "--land-method 参数无效（aes-128 | aes-256 | chacha20）"; OPT_LAND_METHOD=$2; shift ;;
       --land-allow)
         [[ -n ${2-} ]] || die "--land-allow 需要参数（例如 1.2.3.4,2001:db8::/64，或 none）"
@@ -698,6 +727,14 @@ parse_args() {
         OPT_ACTION=import ;;
       --password) OPT_EXPORT_ENC=1 ;;
       --force) OPT_FORCE=1 ;;
+      land-enable) OPT_ACTION=land-enable ;;
+      land-disable) OPT_ACTION=land-disable ;;
+      land-next)
+        OPT_ACTION=land; OPT_LAND_ACT=next
+        if [[ ${2-} == ss://* ]]; then OPT_LAND_LINK=$2; shift; fi ;;
+      land-next-on) OPT_ACTION=land; OPT_LAND_ACT=next-on ;;
+      land-next-off) OPT_ACTION=land; OPT_LAND_ACT=next-off ;;
+      land-next-del|land-next-rm|land-next-remove) OPT_ACTION=land; OPT_LAND_ACT=next-del ;;
       land-add|relay-add)
         OPT_ACTION=land; OPT_LAND_ACT=add
         if [[ ${2-} == ss://* ]]; then OPT_LAND_LINK=$2; shift; fi ;;
@@ -829,7 +866,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
-  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || -n $OPT_XRAY_VER || -n $OPT_HY2_VER || -n $OPT_SINGBOX_VER || $OPT_CERT == 1 ]]; }; then
+  if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_WITH_LAND || -n $OPT_LAND_PORT || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || -n $OPT_XRAY_VER || -n $OPT_HY2_VER || -n $OPT_SINGBOX_VER || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
   [[ -z $OPT_ACTION && $OPT_CERT == 0 ]] && OPT_ACTION=cert
@@ -846,7 +883,7 @@ parse_args() {
   if [[ $OPT_NAT != 1 ]]; then
     [[ -z $OPT_PORT || $OPT_PORT != *:* || -f $STATE_FILE ]] || die "--port 的 外部:内部 写法仅用于 NAT 模式（--nat）。"
     local _po
-    for _po in "$OPT_HY2_PORT" "$OPT_XHTTP_PORT" "$OPT_TROJAN_PORT" "$OPT_TUIC_PORT" "$OPT_ANYTLS_PORT" "$OPT_XHTTP_TLS_PORT" "$OPT_WS_PORT"; do
+    for _po in "$OPT_HY2_PORT" "$OPT_XHTTP_PORT" "$OPT_TROJAN_PORT" "$OPT_TUIC_PORT" "$OPT_ANYTLS_PORT" "$OPT_XHTTP_TLS_PORT" "$OPT_WS_PORT" "$OPT_LAND_PORT"; do
       [[ -z $_po || $_po != *:* || -f $STATE_FILE ]] || die "外部:内部 端口写法仅用于 NAT 模式（--nat）。"
     done
   fi
@@ -897,6 +934,8 @@ main() {
     route) do_route ;;
     outbound) do_outbound ;;
     land) do_land_cli ;;
+    land-enable) land_enable ;;
+    land-disable) land_disable ;;
     allow) land_menu_allow ;;
     uninstall) do_uninstall ;;
     export) do_export ;;

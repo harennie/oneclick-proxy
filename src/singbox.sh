@@ -32,10 +32,12 @@ default_node_name() {
 # 单独 TCP 端口，不需要自己的域名。mode 固定 stream-one（REALITY 直连；避免客户端 auto 握手失败）。
 # TUIC v5 / AnyTLS 由 sing-box 提供。默认自签证书（CN = 所选 SNI），不要求自有域名。
 # 申请了公开证书时，这两个协议和 Hysteria2 改用那张证书，链接里的地址和 SNI 换成自有域名。
-# Trojan 走 Xray + REALITY。Shadowsocks 2022 只存在于落地机，这里不加直连入站。
+# Trojan 走 Xray + REALITY。Shadowsocks 2022 在纯落地机里，或在节点上作为额外入站（LAND_IN）。
 xray_inbound_needed() {
   (( ${REALITY_ENABLED:-0} || ${XHTTP_ENABLED:-0} || ${TROJAN_ENABLED:-0} || ${XHTTP_TLS_ENABLED:-0} || ${WS_ENABLED:-0} )) && return 0
   relay_active && (( ${HY2_ENABLED:-0} )) && return 0
+  # 原样转发时落地端口不由 Xray 听；节点上还有别的入站时上面已经返回了。
+  land_in_on && ! land_raw_active && return 0
   return 1
 }
 proto_xray_brief() {
@@ -45,6 +47,7 @@ proto_xray_brief() {
   (( XHTTP_TLS_ENABLED )) && s+="${s:+ / }XHTTP+TLS TCP ${XHTTP_TLS_PORT}"
   (( WS_ENABLED )) && s+="${s:+ / }WS+TLS TCP ${WS_PORT}"
   (( TROJAN_ENABLED )) && s+="${s:+ / }Trojan TCP ${TROJAN_PORT}"
+  if land_in_on && ! land_raw_active; then s+="${s:+ / }SS2022 TCP+UDP $(land_listen_port)"; fi
   [[ -n $s ]] || s="无入站"
   printf '%s' "$s"
 }
@@ -195,7 +198,8 @@ choose_extra_local() {
   if (( WS_ENABLED )); then
     cdn_choose_port WS_PORT "$OPT_WS_PORT" "VLESS + WebSocket + TLS（CDN）" "${WS_PORT:-2087}" || die "WebSocket+TLS 的端口不可用，见上方说明。REALITY 没有改动。"
   fi
-  proto_any_enabled || die "至少需要启用一个协议（Reality / XHTTP / Hysteria2 / Trojan / TUIC / AnyTLS）。"
+  if land_in_on; then land_choose_node_port; fi
+  proto_any_enabled || land_in_on || die "至少需要启用一个协议（Reality / XHTTP / Hysteria2 / Trojan / TUIC / AnyTLS，或 --with-land 只开落地入站）。"
 }
 nat_usable_count() {
   local n=0 p
@@ -240,7 +244,8 @@ choose_extra_nat() {
       HOP_RANGE="" HOP_EXT_RANGE="" HOP_BACKEND=""
     fi
   fi
-  proto_any_enabled || die "至少需要启用一个协议。NAT 只有一个映射端口、又不共用 443 时放不下 XHTTP，请再加一条映射，或加 --xhttp-on-443。"
+  if land_in_on; then land_choose_node_port; fi
+  proto_any_enabled || land_in_on || die "至少需要启用一个协议。NAT 只有一个映射端口、又不共用 443 时放不下 XHTTP，请再加一条映射，或加 --xhttp-on-443。也可以用 --with-land 只开落地入站。"
 }
 
 ensure_sb_user() {
@@ -524,6 +529,7 @@ apply_proto_services() { # 按开关写配置并启停。不删除已有密钥�
   fi
   cdn_sync_flag
   apply_firewall
+  land_sync_fwd_rules
   save_state
   save_info
 }

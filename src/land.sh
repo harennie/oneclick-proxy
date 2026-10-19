@@ -1,12 +1,19 @@
 # ============================================================
 #       落地机（Shadowsocks 2022 出口）/ 中转机的落地转发
 # ============================================================
-# 落地机：本机只运行 Xray 的 Shadowsocks 2022 入站（TCP+UDP），不装 Reality / Hysteria2 / fail2ban，
-#         可选来源 IP 白名单（Xray 路由 + nftables 双重限制），仅允许中转机连接。
-#         出口三选一：本机直连、加密转发（再拨一跳 SS2022）、原样转发（DNAT，不解密）。
-# 中转机：普通 / NAT 模式安装的节点，把 Xray 的默认出站改为落地机（ss:// 链接），
-#         内网 / BT 屏蔽规则仍在最前；Hysteria2 经本机 127.0.0.1 的 socks 入站同样走落地机。
-#         节点上的 land-add / land-on / land-off / land-del 不改成落地机的下一跳。
+# 纯落地机（LAND_MODE=1，--land）：只运行 Xray 的 Shadowsocks 2022 入站（TCP+UDP），
+#         不装 Reality / Hysteria2 / fail2ban。端口仍是 XRAY_PORT。state.env 与 v1.6 相同。
+# 节点 + 落地入站（LAND_MODE=0 且 LAND_IN=1，--with-land / land-enable）：
+#         同一份 Xray 配置里同时有 Reality/XHTTP/… 和 tag=ss-in 的 SS2022。
+#         落地入站用自己的 LAND_PORT（NAT 时还有 LAND_EXT_PORT），不占用节点端口，也不改节点密钥。
+# 出口：
+#   纯落地机三选一：本机直连、加密转发（RELAY_*）、原样转发（FWD_*，DNAT，此时停掉 Xray）。
+#   节点上的落地入站也是这三选一，但加密下一跳记在 LAND_NEXT / LAND_NEXT_ON，不占用 RELAY_*。
+#   RELAY_* 在节点上始终是「本机客户端 → 另一台落地」（land-add）。
+#   进入 ss-in 的流量按 inboundTag 先匹配：直连 freedom，或 ss-out，或 DNAT。
+#   不会掉进 land-add 的兜底规则，除非用户把落地入站的下一跳单独设成同一条链接。
+# 中转机：land-add 把节点默认出站改到落地机。内网 / BT 屏蔽仍在最前。
+#         Hysteria2 经 127.0.0.1 socks 同样走这条落地。节点的 land-add 不改落地入站的出口。
 land_norm_method() {
   case ${1,,} in
     1|aes-128|aes128|aes-128-gcm|2022-blake3-aes-128-gcm) echo 2022-blake3-aes-128-gcm ;;
@@ -32,6 +39,42 @@ land_key_ok() { # $1 方法 $2 密钥（多用户 iPSK 写法 k1:k2 逐段检查
   done
 }
 urldecode() { local s=${1//\\/\\\\}; printf '%b' "${s//%/\\x}"; }
+
+# 纯落地机与「节点上的落地入站」分开判断。旧状态没有 LAND_IN 时为 0，纯落地机只看 LAND_MODE。
+land_only() { (( ${LAND_MODE:-0} == 1 )); }
+land_in_on() { (( ${LAND_IN:-0} == 1 )) && ! land_only; }
+land_ss_on() { land_only || land_in_on; }
+land_listen_port() {
+  if land_only; then printf '%s' "${XRAY_PORT:-}"; else printf '%s' "${LAND_PORT:-}"; fi
+}
+pub_land_port() {
+  if land_only; then pub_xray_port; return; fi
+  if (( ${NAT_MODE:-0} )) && [[ -n ${LAND_EXT_PORT:-} ]]; then printf '%s' "$LAND_EXT_PORT"
+  else printf '%s' "${LAND_PORT:-}"; fi
+}
+# --land 再写上某个节点协议的开启开关，表示同一台机器两者都装。--no-hy2 这种关闭不算。
+land_combo_flags() {
+  [[ ${OPT_REALITY:-} == 1 || ${OPT_HY2:-} == 1 || ${OPT_XHTTP:-} == 1 || ${OPT_TROJAN:-} == 1 || ${OPT_TUIC:-} == 1 || ${OPT_ANYTLS:-} == 1 || ${OPT_XHTTP_TLS:-} == 1 || ${OPT_WS:-} == 1 ]]
+}
+land_install_wants_inbound() {
+  [[ ${OPT_WITH_LAND:-} == 1 ]] && return 0
+  [[ ${OPT_LAND:-} == 1 ]] && land_combo_flags && return 0
+  return 1
+}
+installing_land_only() {
+  land_install_wants_inbound && return 1
+  [[ ${OPT_LAND:-} == 1 ]] && return 0
+  [[ ${LAND_MODE:-0} == 1 && ${OPT_LAND:-} != 0 ]] && return 0
+  return 1
+}
+# 本次节点安装要不要带落地入站。--no-with-land，以及不带 --with-land 的 --no-land，都关掉。
+install_wants_land_in() {
+  [[ ${OPT_WITH_LAND:-} == 0 ]] && return 1
+  [[ ${OPT_LAND:-} == 0 && ${OPT_WITH_LAND:-} != 1 ]] && return 1
+  land_install_wants_inbound && return 0
+  [[ ${LAND_IN:-0} == 1 ]] && return 0
+  return 1
+}
 
 # ---------- 来源 IP 白名单 ----------
 valid_cidr() {
@@ -84,7 +127,7 @@ land_xray_json() {
 land_xray_json_base() {
   local ds
   ds=$(xray_domain_strategy)
-  jq -n --argjson port "$XRAY_PORT" --arg method "$LAND_METHOD" --arg key "$LAND_KEY" \
+  jq -n --argjson port "$(land_listen_port)" --arg method "$LAND_METHOD" --arg key "$LAND_KEY" \
     --arg ds "$ds" \
     --argjson privnets "$PRIV_NETS_JSON" --argjson allow "$(land_allow_json)" --argjson wl "$([[ -n $LAND_ALLOW ]] && echo 1 || echo 0)" '
   {
@@ -117,7 +160,7 @@ land_xray_json_base() {
 ss_link_build() { # $1 方法 $2 密钥 $3 地址 $4 端口 $5 名称（SIP002；2022 方法使用 百分号编码的 method:password）
   printf 'ss://%s:%s@%s:%s#%s' "$(urlencode "$1")" "$(urlencode "$2")" "$(host_fmt "$3")" "$4" "$(urlencode "$5")"
 }
-land_link() { ss_link_build "$LAND_METHOD" "$LAND_KEY" "$(server_addr)" "$(pub_xray_port)" "${NODE_NAME}"; }
+land_link() { ss_link_build "$LAND_METHOD" "$LAND_KEY" "$(server_addr)" "$(pub_land_port)" "${NODE_NAME}"; }
 land_tag_of() { # $1 名称 $2 地址
   local t; t=$(printf '%s' "${1:-$2}" | tr -cd 'A-Za-z0-9_.-' | cut -c1-32)
   [[ -n $t ]] || t=$(printf '%s' "$2" | tr -cd 'A-Za-z0-9_.-' | cut -c1-32)
@@ -137,10 +180,13 @@ land_print_links() { # $1=1 屏幕着色
   local paint=${1:-0} link
   if land_raw_active; then land_print_links_raw "$paint"; return; fi
   link=$(land_link)
-  node_link_head "$paint" "Shadowsocks 2022" "$NODE_NAME" "$(server_addr)" "$(pub_xray_port)  TCP+UDP"
+  node_link_head "$paint" "Shadowsocks 2022" "$NODE_NAME" "$(server_addr)" "$(pub_land_port)  TCP+UDP"
   node_link_note "$paint" "$LAND_METHOD"
   if [[ -n $LAND_ALLOW ]]; then node_link_note "$paint" "来源白名单  ${LAND_ALLOW}"
   else node_link_note "$paint" "来源白名单未设置，建议 proxy allow 只允许中转机"; fi
+  if land_in_on; then
+    node_link_note "$paint" "出口 $(land_in_egress_label)。这条入站不走本机的 land-add。"
+  fi
   node_link_uri "$link"
   echo
   ui_bar '─' 62 "$paint"
@@ -149,7 +195,7 @@ land_print_links() { # $1=1 屏幕着色
   echo
   ui_bar '─' 62 "$paint"
   if (( paint )); then printf '%sXray 出站%s\n' "$C_TITLE" "$C_NONE"; else echo "Xray 出站"; fi
-  land_outbound_json "$LAND_METHOD" "$LAND_KEY" "$(server_addr)" "$(pub_xray_port)" "$(land_tag_of "$NODE_NAME" "$(server_addr)")"
+  land_outbound_json "$LAND_METHOD" "$LAND_KEY" "$(server_addr)" "$(pub_land_port)" "$(land_tag_of "$NODE_NAME" "$(server_addr)")"
   echo
   ui_bar '─' 62 "$paint"
   if (( paint )); then printf '%smihomo / Clash.Meta%s\n' "$C_TITLE" "$C_NONE"; else echo "mihomo / Clash.Meta"; fi
@@ -158,7 +204,7 @@ proxies:
   - name: "${NODE_NAME}"
     type: ss
     server: $(server_addr)
-    port: $(pub_xray_port)
+    port: $(pub_land_port)
     cipher: ${LAND_METHOD}
     password: "${LAND_KEY}"
     udp: true
@@ -169,6 +215,13 @@ Y
     if (( paint )); then printf '%s下一跳（不要交给上一台）%s\n' "$C_TITLE" "$C_NONE"; else echo "下一跳（不要交给上一台）"; fi
     echo "上一台请用上面的本机 ss://。下面这串只保存在本机："
     printf '%s\n' "$RELAY_LINK"
+  elif land_in_on && [[ ${LAND_NEXT_ON:-0} == 1 && -n ${LAND_NEXT:-} ]]; then
+    echo
+    ui_bar '─' 62 "$paint"
+    if (( paint )); then printf '%s落地入站的下一跳（不要交给上一台，也不改本机 land-add）%s\n' "$C_TITLE" "$C_NONE"
+    else echo "落地入站的下一跳（不要交给上一台，也不改本机 land-add）"; fi
+    echo "上一台请用上面的本机 ss://。下面这串只决定进入落地入站之后的出口："
+    printf '%s\n' "$LAND_NEXT"
   fi
 }
 land_build_info() {
@@ -214,15 +267,15 @@ land_fw_render() {
     echo "  chain input {"
     echo "    type filter hook input priority -10; policy accept;"
     echo "    iif \"lo\" accept"
-    [[ -n $v4 ]] && echo "    meta l4proto { tcp, udp } th dport ${XRAY_PORT} ip saddr @allow4 accept"
-    [[ -n $v6 ]] && echo "    meta l4proto { tcp, udp } th dport ${XRAY_PORT} ip6 saddr @allow6 accept"
-    echo "    meta l4proto { tcp, udp } th dport ${XRAY_PORT} counter drop comment \"not in whitelist\""
+    [[ -n $v4 ]] && echo "    meta l4proto { tcp, udp } th dport $(land_listen_port) ip saddr @allow4 accept"
+    [[ -n $v6 ]] && echo "    meta l4proto { tcp, udp } th dport $(land_listen_port) ip6 saddr @allow6 accept"
+    echo "    meta l4proto { tcp, udp } th dport $(land_listen_port) counter drop comment \"not in whitelist\""
     echo "  }"
     echo "}"
   } >"${LAND_FW_FILE}.tmp"
 }
 land_fw_apply() {
-  if [[ -z $LAND_ALLOW ]] || (( ! LAND_MODE )); then land_fw_remove; return 0; fi
+  if [[ -z $LAND_ALLOW ]] || ! land_ss_on; then land_fw_remove; return 0; fi
   [[ -n $VIRT ]] || detect_virt
   if (( NAT_MODE )) && is_container; then
     land_fw_remove
@@ -287,7 +340,7 @@ UNIT
   fi
   svc_enable proxy-oneclick-land-fw
   svc_restart proxy-oneclick-land-fw >/dev/null 2>&1 || true
-  if land_fw_active; then ok "nftables 白名单已加载：端口 ${XRAY_PORT} (TCP+UDP) 只允许 ${LAND_ALLOW}"
+  if land_fw_active; then ok "nftables 白名单已加载：端口 $(land_listen_port) (TCP+UDP) 只允许 ${LAND_ALLOW}"
   else land_fw_remove; warn "nftables 白名单加载失败，来源白名单仅由 Xray 路由实现。"; fi
 }
 
@@ -307,7 +360,7 @@ ss_probe() { # $1 地址 $2 端口 $3 方法 $4 密钥 [$5=1 优先查 IPv6 出�
   dir=$(mktemp -d "${TMP_DIR}/ssprobe.XXXXXX") || return 1
   for i in 1 2 3 4 5 6 7 8 9 10; do
     port=$(( 20000 + RANDOM % 40000 ))
-    [[ $port == "$XRAY_PORT" || $port == "${HY2_PORT:-}" || $port == "${RELAY_SOCKS:-}" ]] && continue
+    [[ $port == "$XRAY_PORT" || $port == "${LAND_PORT:-}" || $port == "${HY2_PORT:-}" || $port == "${RELAY_SOCKS:-}" ]] && continue
     port_in_use tcp "$port" || break
   done
   jq -n --argjson sport "$port" --argjson ob "$(land_outbound_json "$3" "$4" "$1" "$2" probe)" \
@@ -341,14 +394,25 @@ tcp_probe() { # $1 地址 $2 端口
 }
 
 land_selftest() {
-  local prefer6=0 fam="IPv4"
+  LAND_SELFTEST=skip
+  local prefer6=0 fam="IPv4" port
+  land_ss_on || return 0
+  if land_raw_active; then
+    LAND_SELFTEST=skip
+    info "原样转发不经过本机 Shadowsocks，跳过落地自检。"
+    return 0
+  fi
+  port=$(land_listen_port)
+  [[ -n $port && -n $LAND_METHOD && -n $LAND_KEY ]] || { warn "跳过落地自检（缺少端口或密钥）。"; return 0; }
   [[ ${OUTBOUND_EFFECTIVE:-} == 64 || ${OUTBOUND_EFFECTIVE:-} == 6 ]] && prefer6=1
-  info "落地机自检：临时客户端 → 本机 127.0.0.1:${XRAY_PORT}（SS2022）→ 外网 ..."
-  if ss_probe 127.0.0.1 "$XRAY_PORT" "$LAND_METHOD" "$LAND_KEY" "$prefer6"; then
+  info "落地自检：临时客户端 → 本机 127.0.0.1:${port}（SS2022）→ 外网 ..."
+  if ss_probe 127.0.0.1 "$port" "$LAND_METHOD" "$LAND_KEY" "$prefer6"; then
     [[ $LAND_EXIT_IP == *:* ]] && fam="IPv6"
-    ok "落地机自检通过：出口 ${fam} ${LAND_EXIT_IP}（$(outbound_label "${OUTBOUND_EFFECTIVE:-}")）"
+    LAND_SELFTEST=ok
+    ok "落地自检通过：出口 ${fam} ${LAND_EXIT_IP}（$(outbound_label "${OUTBOUND_EFFECTIVE:-}")）"
   else
-    warn "落地机自检未通过（经本机 SS2022 访问外网失败）。可查看: proxy status"
+    LAND_SELFTEST=fail
+    warn "落地自检未通过（经本机 SS2022 访问外网失败）。可查看: proxy status"
   fi
   return 0
 }
@@ -406,6 +470,8 @@ do_install_land() {
   load_state
   local was_land=$LAND_MODE was_inst=$INSTALLED
   LAND_MODE=1
+  # 纯落地机不使用节点上的落地入站开关。旧机器没有这项，写上 0 也不改变端口和密钥。
+  LAND_IN=0
   preflight      # 同上：Alpine 落地机也强制 NAT 模式（v1.2.0 在这里漏掉了，导致走了普通端口流程并自动调优）
   resolve_mode
   take_lock
@@ -435,6 +501,10 @@ do_install_land() {
 
   step "端口设置"
   HY2_ENABLED=0
+  if [[ -n $OPT_LAND_PORT && -z $OPT_PORT ]]; then OPT_PORT=$OPT_LAND_PORT
+  elif [[ -n $OPT_LAND_PORT && -n $OPT_PORT && $(opt_ext "$OPT_LAND_PORT") != $(opt_ext "$OPT_PORT") ]]; then
+    die "纯落地安装时 --port 与 --land-port 都是这一条 Shadowsocks 端口，请只写一个，或写成相同的值。"
+  fi
   if (( ! was_land )) && [[ -z $OPT_PORT ]]; then XRAY_PORT=$(land_pick_default_port); XRAY_EXT_PORT=""; fi
   XRAY_LABEL="Shadowsocks 2022"
   if (( NAT_MODE )); then
@@ -493,10 +563,11 @@ do_install_land() {
 }
 
 # ---------- 落地机管理 ----------
-need_land() { need_installed; (( LAND_MODE )) || die "本机不是落地机（此功能仅用于 --land 安装的落地机）。"; }
-need_node() { need_installed; (( ! LAND_MODE )) || die "本机是落地机（Shadowsocks 2022），没有 Reality / Hysteria2 节点功能。菜单中可管理白名单、端口与密钥。"; }
+need_land() { need_installed; land_ss_on || die "本机没有落地入站。纯落地机用 --land 安装；已有节点用 proxy land-enable（不重装、不改节点链接）。"; }
+need_node() { need_installed; land_only && die "本机是落地机（Shadowsocks 2022），没有 Reality / Hysteria2 节点功能。菜单中可管理白名单、端口与密钥。要同时做节点和落地，请用 --with-land 安装，或改装为节点后再 proxy land-enable。"; }
 
 land_apply() {
+  if land_in_on; then land_node_apply; return; fi
   [[ -n $INIT_SYS ]] || detect_init
   [[ -n $PKG ]] || detect_os
   # 原样转发先校验（白名单地址族、出站策略、nat 能力）。失败时还没写状态、也没停 Xray。
@@ -529,6 +600,15 @@ land_menu_allow() {
 }
 land_menu_port() {
   need_land
+  if land_in_on; then
+    land_seed_used_ports
+    local old; old=$(pub_land_port)
+    land_choose_node_port
+    land_apply
+    ok "落地端口已更新：${old} -> $(pub_land_port)。上一跳需要重新执行 land-add（新链接见下方）。"
+    land_print_links 1
+    return 0
+  fi
   nat_pref_guard || return 0
   detect_os; detect_virt
   local old; old=$(pub_xray_port)
@@ -558,7 +638,7 @@ land_menu_key() {
   fi
   land_apply
   ok "已更换为 ${LAND_METHOD} 新密钥。中转机需要重新执行 land-add（新链接见下方）。"
-  land_show_info
+  if land_in_on; then land_print_links 1; else land_show_info; fi
 }
 
 # ---------- 落地机出口：直连 / 加密转发 / 原样转发（三者互斥） ----------
@@ -576,7 +656,7 @@ fwd_load() { # $1 ss:// ；成功时写入 FWD_*，并还原 RELAY_*（ss_parse 
   return $rc
 }
 land_raw_active() {
-  (( ${LAND_MODE:-0} )) || return 1
+  land_ss_on || return 1
   [[ ${FWD_ON:-0} == 1 && -n ${FWD_LINK:-} ]] || return 1
   fwd_load "$FWD_LINK"
 }
@@ -593,6 +673,17 @@ land_egress_label() {
   fi
   if (( ${LAND_MODE:-0} )) && [[ ${RELAY_ON:-0} == 1 && -n ${RELAY_LINK:-} ]]; then
     if land_relay_active; then printf '%s' "加密转发"; else printf '%s' "加密转发（链接无效）"; fi
+    return
+  fi
+  printf '%s' "本机直连"
+}
+land_in_egress_label() { # 节点上落地入站的出口。不看 RELAY_*（那是本机 land-add）。
+  if [[ ${FWD_ON:-0} == 1 && -n ${FWD_LINK:-} ]]; then
+    if land_raw_active; then printf '%s' "原样转发"; else printf '%s' "原样转发（链接无效）"; fi
+    return
+  fi
+  if [[ ${LAND_NEXT_ON:-0} == 1 && -n ${LAND_NEXT:-} ]]; then
+    if land_in_next_active; then printf '%s' "加密转发"; else printf '%s' "加密转发（链接无效）"; fi
     return
   fi
   printf '%s' "本机直连"
@@ -792,11 +883,12 @@ land_fwd_check() { # 不改防火墙。失败则 die，调用方尚未把新模�
     rm -f "$chk"
   fi
   if (( NAT_MODE )); then
-    info "NAT 模式：DNAT 做在本机端口 ${XRAY_PORT}，上一跳链接里的端口仍是外部端口 $(pub_xray_port)。"
+    info "NAT 模式：DNAT 做在本机端口 $(land_listen_port)，上一跳链接里的端口仍是外部端口 $(pub_land_port)。"
   fi
 }
 land_fwd_nft_text() {
-  local list fam=$FWD_FAM
+  local list fam=$FWD_FAM dport
+  dport=$(land_listen_port)
   list=$(land_allow_fam_csv "$fam")
   [[ -n $list ]] || die "内部错误：DNAT 白名单为空，已中止。"
   {
@@ -810,7 +902,7 @@ land_fwd_nft_text() {
         printf '  set allow4 {\n    type ipv4_addr; flags interval; auto-merge\n    elements = { %s }\n  }\n' "$list"
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
-        echo "    ip saddr @allow4 meta l4proto { tcp, udp } th dport ${XRAY_PORT} dnat ip to ${FWD_IP}:${FWD_P}"
+        echo "    ip saddr @allow4 meta l4proto { tcp, udp } th dport ${dport} dnat ip to ${FWD_IP}:${FWD_P}"
         echo "  }"
         echo "  chain postrouting {"
         echo "    type nat hook postrouting priority srcnat; policy accept;"
@@ -820,7 +912,7 @@ land_fwd_nft_text() {
         printf '  set allow6 {\n    type ipv6_addr; flags interval; auto-merge\n    elements = { %s }\n  }\n' "$list"
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
-        echo "    ip6 saddr @allow6 meta l4proto { tcp, udp } th dport ${XRAY_PORT} dnat ip6 to [${FWD_IP}]:${FWD_P}"
+        echo "    ip6 saddr @allow6 meta l4proto { tcp, udp } th dport ${dport} dnat ip6 to [${FWD_IP}]:${FWD_P}"
         echo "  }"
         echo "  chain postrouting {"
         echo "    type nat hook postrouting priority srcnat; policy accept;"
@@ -838,7 +930,7 @@ land_fwd_nft_text() {
         printf '  set allow4 {\n    type ipv4_addr; flags interval; auto-merge\n    elements = { %s }\n  }\n' "$list"
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
-        echo "    ip saddr @allow4 meta l4proto { tcp, udp } th dport ${XRAY_PORT} dnat to ${FWD_IP}:${FWD_P}"
+        echo "    ip saddr @allow4 meta l4proto { tcp, udp } th dport ${dport} dnat to ${FWD_IP}:${FWD_P}"
         echo "  }"
         echo "  chain postrouting {"
         echo "    type nat hook postrouting priority srcnat; policy accept;"
@@ -848,7 +940,7 @@ land_fwd_nft_text() {
         printf '  set allow6 {\n    type ipv6_addr; flags interval; auto-merge\n    elements = { %s }\n  }\n' "$list"
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
-        echo "    ip6 saddr @allow6 meta l4proto { tcp, udp } th dport ${XRAY_PORT} dnat to [${FWD_IP}]:${FWD_P}"
+        echo "    ip6 saddr @allow6 meta l4proto { tcp, udp } th dport ${dport} dnat to [${FWD_IP}]:${FWD_P}"
         echo "  }"
         echo "  chain postrouting {"
         echo "    type nat hook postrouting priority srcnat; policy accept;"
@@ -894,11 +986,12 @@ land_fwd_forwarding_restore() {
 }
 # shellcheck disable=SC2016  # 生成的脚本里 $1/$0 保持字面量
 land_fwd_write_script() {
-  local bin src
+  local bin src dport
+  dport=$(land_listen_port)
   mkdir -p "$STATE_DIR"
   {
     echo '#!/bin/sh'
-    echo "# 由 proxy-oneclick 生成：落地机原样转发 ${XRAY_PORT} → ${FWD_IP}:${FWD_P}（${FWD_BACKEND}）"
+    echo "# 由 proxy-oneclick 生成：落地机原样转发 ${dport} → ${FWD_IP}:${FWD_P}（${FWD_BACKEND}）"
     echo 'case "$1" in'
     echo '  start)'
     case $FWD_BACKEND in
@@ -916,11 +1009,11 @@ land_fwd_write_script() {
         for src in $LAND_ALLOW; do
           local ip=${src%%/*}
           if [[ $FWD_FAM == 4 ]] && is_ipv4 "$ip"; then
-            echo "    ${bin} -t nat -A PROXY_OC_FWD -p tcp -s ${src} --dport ${XRAY_PORT} -j DNAT --to-destination ${FWD_IP}:${FWD_P}"
-            echo "    ${bin} -t nat -A PROXY_OC_FWD -p udp -s ${src} --dport ${XRAY_PORT} -j DNAT --to-destination ${FWD_IP}:${FWD_P}"
+            echo "    ${bin} -t nat -A PROXY_OC_FWD -p tcp -s ${src} --dport ${dport} -j DNAT --to-destination ${FWD_IP}:${FWD_P}"
+            echo "    ${bin} -t nat -A PROXY_OC_FWD -p udp -s ${src} --dport ${dport} -j DNAT --to-destination ${FWD_IP}:${FWD_P}"
           elif [[ $FWD_FAM == 6 ]] && [[ $ip == *:* ]]; then
-            echo "    ${bin} -t nat -A PROXY_OC_FWD -p tcp -s ${src} --dport ${XRAY_PORT} -j DNAT --to-destination [${FWD_IP}]:${FWD_P}"
-            echo "    ${bin} -t nat -A PROXY_OC_FWD -p udp -s ${src} --dport ${XRAY_PORT} -j DNAT --to-destination [${FWD_IP}]:${FWD_P}"
+            echo "    ${bin} -t nat -A PROXY_OC_FWD -p tcp -s ${src} --dport ${dport} -j DNAT --to-destination [${FWD_IP}]:${FWD_P}"
+            echo "    ${bin} -t nat -A PROXY_OC_FWD -p udp -s ${src} --dport ${dport} -j DNAT --to-destination [${FWD_IP}]:${FWD_P}"
           fi
         done
         echo "    ${bin} -t nat -C PREROUTING -j PROXY_OC_FWD >/dev/null 2>&1 || ${bin} -t nat -A PREROUTING -j PROXY_OC_FWD"
@@ -1029,7 +1122,7 @@ land_fwd_install() {
   fi
   land_fwd_write_service
   svc_restart proxy-oneclick-fwd >/dev/null 2>&1 || true
-  ok "原样转发已加载：本机 TCP/UDP ${XRAY_PORT} → ${FWD_IP}:${FWD_P}（仅白名单来源，回程 masquerade）。"
+  ok "原样转发已加载：本机 TCP/UDP $(land_listen_port) → ${FWD_IP}:${FWD_P}（仅白名单来源，回程 masquerade）。"
 }
 land_fwd_remove() {
   if [[ -f $LAND_FWD_UNIT || -f $LAND_FWD_RC ]]; then svc_disable_stop proxy-oneclick-fwd || true; fi
@@ -1060,6 +1153,16 @@ ss_parse_or_die() { # $1 链接。失败信息与中转 land-add 相同。
 }
 land_direct() {
   need_land
+  if land_in_on; then
+    echo "  落地入站改回本机直连。会清掉这条入站自己的下一跳和原样转发。"
+    echo "  本机作为中转的 land-add（RELAY_*）不动。"
+    (( OPT_AUTO )) || confirm "确认落地入站改为本机直连？" y || return 0
+    LAND_NEXT="" LAND_NEXT_ON=0
+    FWD_LINK="" FWD_ON=0
+    land_apply
+    ok "落地入站已改回本机直连。节点的 land-add 未改。"
+    return 0
+  fi
   echo "  将清除已保存的下一跳、原样转发目标和 DNAT 规则，恢复本机 Shadowsocks 直连。"
   (( OPT_AUTO )) || confirm "确认改为本机直连？" y || return 0
   RELAY_LINK="" RELAY_ON=0 RELAY_SOCKS=""
@@ -1155,10 +1258,10 @@ land_forward_add() {
   fi
   FWD_LINK=$normalized
   FWD_ON=1
-  RELAY_ON=0
+  if land_in_on; then LAND_NEXT_ON=0; else RELAY_ON=0; fi
   land_apply
-  ok "原样转发已启用：上一跳连本机 $(server_addr):$(pub_xray_port)，DNAT 到 ${FWD_IP}:${FWD_P}。两条链接已分开打印。"
-  land_show_info
+  ok "原样转发已启用：上一跳连本机 $(server_addr):$(pub_land_port)，DNAT 到 ${FWD_IP}:${FWD_P}。两条链接已分开打印。"
+  if land_in_on; then land_print_links 1; else land_show_info; fi
 }
 land_forward_off() {
   need_land
@@ -1178,8 +1281,8 @@ land_forward_del() {
 land_print_links_raw() {
   local paint=${1:-0} link
   fwd_load "$FWD_LINK" || die "保存的原样转发链接无法解析。"
-  link=$(ss_link_build "$FWD_M" "$FWD_K" "$(server_addr)" "$(pub_xray_port)" "${NODE_NAME}")
-  node_link_head "$paint" "上一跳使用（本机地址 + 最终密钥）" "$NODE_NAME" "$(server_addr)" "$(pub_xray_port)  TCP+UDP"
+  link=$(ss_link_build "$FWD_M" "$FWD_K" "$(server_addr)" "$(pub_land_port)" "${NODE_NAME}")
+  node_link_head "$paint" "上一跳使用（本机地址 + 最终密钥）" "$NODE_NAME" "$(server_addr)" "$(pub_land_port)  TCP+UDP"
   node_link_note "$paint" "本机不解密。加密方式与密钥来自最终落地：${FWD_M}"
   node_link_note "$paint" "最终落地原地址  $(host_fmt "$FWD_H"):${FWD_P}（不要把这个地址交给上一台当入口）"
   if [[ -n $LAND_ALLOW ]]; then node_link_note "$paint" "来源白名单  ${LAND_ALLOW}"
@@ -1197,7 +1300,7 @@ land_print_links_raw() {
   echo
   ui_bar '─' 62 "$paint"
   if (( paint )); then printf '%sXray 出站（上一跳指向本机）%s\n' "$C_TITLE" "$C_NONE"; else echo "Xray 出站（上一跳指向本机）"; fi
-  land_outbound_json "$FWD_M" "$FWD_K" "$(server_addr)" "$(pub_xray_port)" "$(land_tag_of "$NODE_NAME" "$(server_addr)")"
+  land_outbound_json "$FWD_M" "$FWD_K" "$(server_addr)" "$(pub_land_port)" "$(land_tag_of "$NODE_NAME" "$(server_addr)")"
   echo
   ui_bar '─' 62 "$paint"
   if (( paint )); then printf '%smihomo / Clash.Meta（上一跳看到的本机）%s\n' "$C_TITLE" "$C_NONE"; else echo "mihomo / Clash.Meta（上一跳看到的本机）"; fi
@@ -1206,7 +1309,7 @@ proxies:
   - name: "${NODE_NAME}"
     type: ss
     server: $(server_addr)
-    port: $(pub_xray_port)
+    port: $(pub_land_port)
     cipher: ${FWD_M}
     password: "${FWD_K}"
     udp: true
@@ -1256,6 +1359,353 @@ menu_land_raw() {
   esac
 }
 
+# ---------- 节点上的落地入站（与 Reality / Hy2 共存） ----------
+# 路由：write_xray_config 先调用 land_in_attach，再 relay_inject。
+# ss-in 的规则写在私网 / BT 之后、land-add 兜底之前，所以落地流量不会进本机中转出站。
+# 出站地址族与纯落地机相同：freedom 的 domainStrategy 由 xray_apply_ip_strategy 写入（含 NAT66 检测），
+# 加密下一跳的 sockopt.domainStrategy 与 land_xray_attach_relay 相同。
+NEXT_M="" NEXT_K="" NEXT_H="" NEXT_P="" NEXT_N=""
+land_next_load() { # $1 ss:// ；成功时写入 NEXT_*，并还原 RELAY_*（ss_parse 会改它们）
+  local om=$RELAY_M ok=$RELAY_K oh=$RELAY_H op=$RELAY_P on=$RELAY_N rc=0
+  ss_parse "$1" || rc=$?
+  if (( rc == 0 )); then
+    NEXT_M=$RELAY_M NEXT_K=$RELAY_K NEXT_H=$RELAY_H NEXT_P=$RELAY_P NEXT_N=$RELAY_N
+  fi
+  RELAY_M=$om RELAY_K=$ok RELAY_H=$oh RELAY_P=$op RELAY_N=$on
+  return $rc
+}
+land_in_next_active() {
+  land_in_on || return 1
+  [[ ${FWD_ON:-0} == 1 ]] && return 1
+  [[ ${LAND_NEXT_ON:-0} == 1 && -n ${LAND_NEXT:-} ]] || return 1
+  land_next_load "$LAND_NEXT"
+}
+land_in_attach() { # $1 节点 Xray 配置。纯落地机不走这里。
+  local f=$1 exit_tag="direct" ob='null' ds
+  land_in_on || return 0
+  # 原样转发占着落地端口。链接坏了就停，不要改成直连入站把流量从本机放出去。
+  if [[ ${FWD_ON:-0} == 1 && -n ${FWD_LINK:-} ]]; then
+    land_raw_active || die "原样转发链接无法解析，拒绝生成落地入站。"
+    return 0
+  fi
+  [[ -n ${LAND_PORT:-} && -n ${LAND_METHOD:-} && -n ${LAND_KEY:-} ]] || die "落地入站缺少端口或密钥，请先 proxy land-enable。"
+  ds=$(xray_domain_strategy)
+  if [[ ${LAND_NEXT_ON:-0} == 1 && -n ${LAND_NEXT:-} ]]; then
+    land_in_next_active || die "落地入站的下一跳无法解析，拒绝按直连生成配置。"
+    exit_tag="ss-out"
+    ob=$(land_outbound_json "$NEXT_M" "$NEXT_K" "$NEXT_H" "$NEXT_P" "$exit_tag" "$ds")
+  fi
+  jq --argjson port "$LAND_PORT" --arg method "$LAND_METHOD" --arg key "$LAND_KEY" \
+    --argjson allow "$(land_allow_json)" --argjson wl "$([[ -n $LAND_ALLOW ]] && echo 1 || echo 0)" \
+    --arg exit "$exit_tag" --argjson ob "$ob" '
+    .inbounds += [{
+      tag: "ss-in",
+      port: $port,
+      protocol: "shadowsocks",
+      settings: {method: $method, password: $key, network: "tcp,udp"},
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+    }]
+    | (if $ob == null then . else .outbounds += [$ob] end)
+    | .routing.rules += (
+        if $wl == 1 then [
+          {type: "field", inboundTag: ["ss-in"], source: $allow, outboundTag: $exit},
+          {type: "field", inboundTag: ["ss-in"], outboundTag: "block"}
+        ] else [
+          {type: "field", inboundTag: ["ss-in"], outboundTag: $exit}
+        ] end)
+  ' "$f" >"${f}.land" && mv -f "${f}.land" "$f"
+}
+land_reserved_port() { # $1 内部端口。与已开启的节点协议或 hy2-relay 冲突则返回 0
+  local p=$1
+  (( ${REALITY_ENABLED:-0} )) && [[ $p == "$XRAY_PORT" ]] && return 0
+  (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && [[ $p == "$XHTTP_PORT" ]] && return 0
+  (( ${TROJAN_ENABLED:-0} )) && [[ $p == "$TROJAN_PORT" ]] && return 0
+  (( ${ANYTLS_ENABLED:-0} )) && [[ $p == "$ANYTLS_PORT" ]] && return 0
+  (( ${XHTTP_TLS_ENABLED:-0} )) && [[ $p == "$XHTTP_TLS_PORT" ]] && return 0
+  (( ${WS_ENABLED:-0} )) && [[ $p == "$WS_PORT" ]] && return 0
+  (( ${HY2_ENABLED:-0} )) && [[ $p == "$HY2_PORT" ]] && return 0
+  (( ${TUIC_ENABLED:-0} )) && [[ $p == "$TUIC_PORT" ]] && return 0
+  cert_is_public && [[ -n ${SUB_PORT:-} && $p == "$SUB_PORT" ]] && return 0
+  [[ -n ${RELAY_SOCKS:-} && $p == "$RELAY_SOCKS" ]] && return 0
+  local_used_hit tcp "$p" && return 0
+  local_used_hit udp "$p" && return 0
+  return 1
+}
+land_pick_free_port() {
+  local p i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    p=$(land_pick_default_port)
+    land_reserved_port "$p" && continue
+    port_in_use tcp "$p" && continue
+    port_in_use udp "$p" && continue
+    printf '%s' "$p"; return 0
+  done
+  printf '%s' 34567
+}
+land_nat_first_both() { # 额外跳过的外部端口。TCP 和 UDP 都还没被别的协议占用。
+  local p x skip
+  while read -r p; do
+    nat_used_hit tcp "$p" && continue
+    nat_used_hit udp "$p" && continue
+    skip=0
+    for x in "$@"; do [[ -n $x && $p == "$x" ]] && skip=1; done
+    (( skip )) && continue
+    printf '%s\n' "$p"; return 0
+  done < <(nat_all_ext)
+  return 1
+}
+land_seed_used_ports() {
+  if (( NAT_MODE )); then
+    nat_seed_used
+    (( XHTTP_ENABLED )) && ! xhttp_shared && [[ -n ${XHTTP_EXT_PORT:-} ]] && nat_mark_used tcp "$XHTTP_EXT_PORT"
+    (( TROJAN_ENABLED )) && [[ -n ${TROJAN_EXT_PORT:-} ]] && nat_mark_used tcp "$TROJAN_EXT_PORT"
+    (( ANYTLS_ENABLED )) && [[ -n ${ANYTLS_EXT_PORT:-} ]] && nat_mark_used tcp "$ANYTLS_EXT_PORT"
+    (( TUIC_ENABLED )) && [[ -n ${TUIC_EXT_PORT:-} ]] && nat_mark_used udp "$TUIC_EXT_PORT"
+  else
+    local_seed_used
+    (( XHTTP_ENABLED )) && ! xhttp_shared && local_mark_used tcp "$XHTTP_PORT"
+    (( TROJAN_ENABLED )) && local_mark_used tcp "$TROJAN_PORT"
+    (( ANYTLS_ENABLED )) && local_mark_used tcp "$ANYTLS_PORT"
+    (( XHTTP_TLS_ENABLED )) && local_mark_used tcp "$XHTTP_TLS_PORT"
+    (( WS_ENABLED )) && local_mark_used tcp "$WS_PORT"
+    (( TUIC_ENABLED )) && local_mark_used udp "$TUIC_PORT"
+    cert_is_public && local_mark_used tcp "$SUB_PORT"
+  fi
+}
+land_choose_node_port_nat() {
+  local p def="" saved=${LAND_EXT_PORT:-}
+  if [[ -n ${OPT_LAND_PORT:-} ]]; then def=$(opt_ext "$OPT_LAND_PORT")
+  elif [[ -n $saved ]] && nat_usable "$saved" && ! nat_used_hit tcp "$saved" && ! nat_used_hit udp "$saved"; then def=$saved
+  else def=$(land_nat_first_both) || def=""; fi
+  [[ -n $def ]] || die "没有同时空闲的 TCP 和 UDP 映射端口给落地入站。请再映射一个 TCP+UDP 端口，或用 --land-port 指定。"
+  while :; do
+    if [[ -n $OPT_LAND_PORT ]] || (( OPT_AUTO )); then p=$def
+    else
+      ask p "落地入站使用的外部端口（TCP+UDP，须在映射中）" "$def"
+      p=$(sanitize_port_input "$p"); p=${p// /}
+    fi
+    if nat_usable "$p" && ! nat_used_hit tcp "$p" && ! nat_used_hit udp "$p"; then
+      local ip; ip=$(ext2int "$p")
+      if ! land_reserved_port "$ip" && check_port_free tcp "$ip" "xray" && check_port_free udp "$ip" "xray"; then
+        LAND_EXT_PORT=$p
+        LAND_PORT=$ip
+        nat_mark_used tcp "$p"
+        nat_mark_used udp "$p"
+        info "落地入站：外部 ${LAND_EXT_PORT} → 本机 ${LAND_PORT}（TCP+UDP）。该映射需同时包含 TCP 和 UDP。"
+        return 0
+      fi
+    else
+      warn "端口 ${p:-空} 不可用（不在映射中、已排除，或 TCP/UDP 已被其它协议占用）。"
+    fi
+    { [[ -n $OPT_LAND_PORT ]] || (( OPT_AUTO )); } && die "无法使用外部端口 ${p:-空} 作为落地入站。"
+    def=$(land_nat_first_both "$p") || die "没有其它可用的 TCP+UDP 映射端口。"
+  done
+}
+land_choose_node_port() {
+  land_in_on || return 0
+  if (( NAT_MODE )); then land_choose_node_port_nat; return; fi
+  local p def
+  if [[ -n ${OPT_LAND_PORT:-} ]]; then def=$(opt_ext "$OPT_LAND_PORT")
+  elif [[ -n ${LAND_PORT:-} ]] && is_port "$LAND_PORT" && ! land_reserved_port "$LAND_PORT"; then def=$LAND_PORT
+  else def=$(land_pick_free_port); fi
+  while :; do
+    if [[ -z ${OPT_LAND_PORT:-} ]] && (( ! OPT_AUTO )); then
+      ask p "落地入站 Shadowsocks 2022 端口 (TCP+UDP)" "$def"
+      p=$(sanitize_port_input "$p"); p=${p// /}
+    else p=$def; fi
+    if ! is_port "$p"; then
+      { [[ -n $OPT_LAND_PORT ]] || (( OPT_AUTO )); } && die "落地端口无效: ${p:-空}"
+      warn "端口无效。"; def=$(land_pick_free_port); continue
+    fi
+    if land_reserved_port "$p"; then
+      { [[ -n $OPT_LAND_PORT ]] || (( OPT_AUTO )); } && die "落地端口 ${p} 与其它协议冲突。"
+      warn "端口 ${p} 已被其它协议占用。"; def=$(land_pick_free_port); continue
+    fi
+    if check_port_free tcp "$p" "xray" && check_port_free udp "$p" "xray"; then
+      LAND_PORT=$p
+      LAND_EXT_PORT=""
+      local_mark_used tcp "$p"
+      local_mark_used udp "$p"
+      return 0
+    fi
+    { [[ -n $OPT_LAND_PORT ]] || (( OPT_AUTO )); } && die "落地端口 ${p} 已被占用。"
+    def=$(land_pick_free_port)
+  done
+}
+land_sync_fwd_rules() { # 只处理节点上的原样转发。纯落地机仍由 land_apply 自己装 DNAT 并停 Xray。
+  land_only && return 0
+  if land_in_on && land_raw_active; then
+    land_fwd_check
+    land_fwd_install
+  elif [[ -f $LAND_FWD_UNIT || -f $LAND_FWD_RC || -f $LAND_FWD_SCRIPT ]]; then
+    land_fwd_remove
+  fi
+}
+land_node_apply() { # 重写节点 Xray（含或不含 ss-in）、防火墙和原样转发。不重装 Hy2。
+  land_only && die "内部错误：纯落地机不能走节点落地入站的应用流程。"
+  [[ -n $INIT_SYS ]] || detect_init
+  [[ -n $PKG ]] || detect_os
+  if land_in_on && land_raw_active; then land_fwd_check; fi
+  save_state
+  local rc=0
+  if land_in_on && land_raw_active; then
+    write_xray_config || rc=$?
+    if (( rc == 2 )); then
+      svc_disable_stop xray
+      info "Xray 没有需要监听的入站，已停止（密钥保留）。落地端口留给原样转发。"
+    elif (( rc != 0 )); then die "重写 Xray 配置失败。"
+    else restart_xray
+    fi
+    land_fwd_install
+  else
+    land_fwd_remove
+    rc=0
+    write_xray_config || rc=$?
+    if (( rc == 2 )); then
+      svc_disable_stop xray
+      info "Xray 没有需要监听的入站，已停止（密钥保留）。"
+    elif (( rc != 0 )); then die "重写 Xray 配置失败。"
+    else restart_xray
+    fi
+  fi
+  apply_firewall
+  save_state
+  save_info
+}
+land_enable() {
+  load_state
+  land_only && die "本机已是纯落地机（--land）。要同时跑节点，请用 bash proxy.sh --with-land 安装；那会保留落地密钥，并把原来的下一跳记到落地入站自己的出口上。"
+  need_node
+  [[ -n $PKG ]] || detect_os
+  [[ -n $VIRT ]] || detect_virt
+  local was=${LAND_IN:-0}
+  LAND_IN=1
+  land_choose_method
+  land_choose_allow
+  land_seed_used_ports
+  land_choose_node_port
+  ensure_outbound_ip
+  land_node_apply
+  if (( was == 1 )); then ok "落地入站已更新。节点链接没有改。"
+  else ok "已在本机节点上启用落地入站。Reality / Hysteria2 的密钥和链接没有改。"; fi
+  echo
+  land_print_links 1
+  if ! land_raw_active; then ( trap - ERR; set +e; land_selftest ) || true; fi
+}
+land_disable() {
+  load_state
+  land_only && die "纯落地机没有单独的落地入站开关。改装为节点用菜单第 9 项或 bash proxy.sh --no-land。"
+  need_node
+  (( ${LAND_IN:-0} == 1 )) || { info "落地入站未启用。"; return 0; }
+  echo "  关闭落地入站后，本机不再监听 Shadowsocks 2022。节点链接和 land-add 都保留。"
+  echo "  密钥、白名单和下一跳会留在状态里，之后 land-enable 可以沿用。"
+  (( OPT_AUTO )) || confirm "确认关闭落地入站？" y || return 0
+  LAND_IN=0
+  [[ -n $PKG ]] || detect_os
+  land_node_apply
+  ok "已关闭落地入站。节点仍在运行。"
+}
+land_next_add() {
+  need_land
+  if land_only; then land_relay_add; return; fi
+  local link=${OPT_LAND_LINK:-}
+  if [[ -z $link ]]; then
+    (( OPT_AUTO )) && die "请提供链接：proxy land-next 'ss://...'"
+    echo "  这是落地入站自己的下一跳，不会改本机 land-add，也不会让 Reality / Hy2 走这条链接。"
+    ask link "粘贴下一跳 ss:// 链接" "${LAND_NEXT}"
+  fi
+  ss_parse_or_die "$link"
+  step "测试下一跳 ${RELAY_H}:${RELAY_P}（${RELAY_M}）"
+  if ! relay_test; then
+    if (( OPT_FORCE )); then warn "测试未通过，--force 强制启用。"
+    elif (( OPT_AUTO )) || ! confirm "测试未通过，仍然保存并启用落地入站的加密转发吗？" n; then
+      die "未启用加密转发（配置未改变）。确认无误可加 --force 强制启用。"
+    fi
+  fi
+  ensure_outbound_ip
+  LAND_NEXT=$(ss_link_build "$RELAY_M" "$RELAY_K" "$RELAY_H" "$RELAY_P" "${RELAY_N:-land}")
+  LAND_NEXT_ON=1
+  FWD_ON=0
+  land_apply
+  ok "落地入站的加密转发已启用 → ${RELAY_H}:${RELAY_P}。本机 land-add 未改。上一跳仍用本机自己的 ss://。"
+  land_print_links 1
+}
+land_next_on() {
+  need_land
+  if land_only; then land_relay_on; return; fi
+  [[ -n $LAND_NEXT ]] || die "没有保存的落地入站下一跳，请先 proxy land-next 'ss://...'"
+  land_next_load "$LAND_NEXT" || die "保存的下一跳无法解析，请重新 land-next。"
+  RELAY_M=$NEXT_M RELAY_K=$NEXT_K RELAY_H=$NEXT_H RELAY_P=$NEXT_P RELAY_N=$NEXT_N
+  step "测试下一跳 ${RELAY_H}:${RELAY_P}"
+  if ! relay_test && (( ! OPT_FORCE )); then
+    { (( OPT_AUTO )) || ! confirm "测试未通过，仍然启用吗？" n; } && die "未启用加密转发。"
+  fi
+  LAND_NEXT_ON=1
+  FWD_ON=0
+  land_apply
+  ok "已启用落地入站的加密转发。DNAT 已移除。本机 land-add 未改。"
+}
+land_next_off() {
+  need_land
+  if land_only; then
+    [[ $RELAY_ON == 1 && -n $RELAY_LINK ]] || { info "加密转发未启用。"; return 0; }
+    RELAY_ON=0
+    land_apply
+    ok "已停用加密转发（下一跳已保留）。"
+    return 0
+  fi
+  [[ ${LAND_NEXT_ON:-0} == 1 ]] || { info "落地入站的加密转发未启用。"; return 0; }
+  LAND_NEXT_ON=0
+  land_apply
+  ok "已停用落地入站的加密转发（恢复本机直连；下一跳已保留）。本机 land-add 未改。"
+}
+land_next_del() {
+  need_land
+  if land_only; then land_relay_del; return; fi
+  [[ -n $LAND_NEXT || ${LAND_NEXT_ON:-0} == 1 ]] || { info "没有设置落地入站的加密转发。"; return 0; }
+  (( OPT_AUTO )) || confirm "删除落地入站保存的下一跳？原样转发（若有）和本机 land-add 保持不动。" y || return 0
+  LAND_NEXT="" LAND_NEXT_ON=0
+  land_apply
+  ok "已删除落地入站的下一跳。本机 land-add 未改。"
+}
+menu_land_in() {
+  need_node
+  echo; hr; _green "  落地入站（与本机节点同时开启）"; hr
+  if land_in_on; then
+    echo "  状态: ${C_GREEN}已启用${C_NONE}    端口: $(pub_land_port) (TCP+UDP)    出口: $(land_in_egress_label)"
+    echo "  加密: ${LAND_METHOD#2022-blake3-}    白名单: ${LAND_ALLOW:-未设置}"
+    echo "  进入这条入站的流量按上面的出口离开，不走菜单 12 的 land-add。"
+  else
+    echo "  状态: 未启用。开启后本机仍是 Reality / Hy2 节点，并多听一个 Shadowsocks 2022 端口。"
+    echo "  不会重装，也不会更换已有节点的密钥和链接。"
+  fi
+  hr
+  echo "  1) 开启 / 更新落地入站    2) 关闭（保留密钥）    3) 来源白名单"
+  echo "  4) 修改端口              5) 更换密钥 / 加密方式  6) 出口：本机直连"
+  echo "  7) 出口：加密转发        8) 出口：原样转发       9) 查看 ss:// / land-add 命令"
+  echo "  0) 返回"
+  local c; ask c "请选择" "0"
+  case $c in
+    1) OPT_LAND_METHOD=""; OPT_LAND_ALLOW=""; OPT_LAND_PORT=""; land_enable ;;
+    2) land_disable ;;
+    3) land_in_on || { warn "请先开启落地入站。"; return 0; }
+       OPT_LAND_ALLOW=""; land_menu_allow ;;
+    4) land_in_on || { warn "请先开启落地入站。"; return 0; }
+       OPT_LAND_PORT=""; land_menu_port ;;
+    5) land_in_on || { warn "请先开启落地入站。"; return 0; }
+       land_menu_key ;;
+    6) land_in_on || { warn "请先开启落地入站。"; return 0; }
+       land_direct ;;
+    7) land_in_on || { warn "请先开启落地入站。"; return 0; }
+       OPT_LAND_LINK=""; land_next_add ;;
+    8) land_in_on || { warn "请先开启落地入站。"; return 0; }
+       OPT_LAND_LINK=""; land_forward_add ;;
+    9) land_in_on || { warn "请先开启落地入站。"; return 0; }
+       land_print_links 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # ---------- 中转机：落地转发 ----------
 RELAY_M="" RELAY_K="" RELAY_H="" RELAY_P="" RELAY_N=""
 ss_parse() { # $1 ss:// 链接；成功时设置 RELAY_M/K/H/P/N。返回 1 格式错误 2 非 SS2022 3 密钥长度不对
@@ -1285,6 +1735,8 @@ ss_parse() { # $1 ss:// 链接；成功时设置 RELAY_M/K/H/P/N。返回 1 格�
 relay_active() { [[ $RELAY_ON == 1 && -n $RELAY_LINK ]] && (( ! LAND_MODE )) && ss_parse "$RELAY_LINK"; }
 relay_tag() { land_tag_of "$RELAY_N" "$RELAY_H"; }
 relay_inject() { # $1 Xray 配置文件（节点模式）：落地出站放在最前 + 路由最后一条兜底到落地
+  # 兜底不带 inboundTag，会匹配所有还没被前面规则接走的 TCP/UDP。
+  # 落地入站的 ss-in 规则由 land_in_attach 先写好，所以不会进这条出站。
   relay_active || { [[ $RELAY_ON == 1 && -n $RELAY_LINK ]] && warn "保存的落地链接无法解析，已按直连生成配置。"; return 0; }
   local ob tag; tag=$(relay_tag)
   ob=$(land_outbound_json "$RELAY_M" "$RELAY_K" "$RELAY_H" "$RELAY_P" "$tag")
@@ -1426,6 +1878,10 @@ do_land_cli() {
     forward) land_forward_add ;;
     forward-off) land_forward_off ;;
     forward-del) land_forward_del ;;
+    next) land_next_add ;;
+    next-on) land_next_on ;;
+    next-off) land_next_off ;;
+    next-del) land_next_del ;;
     test)
       load_state
       if (( LAND_MODE )); then
@@ -1434,6 +1890,14 @@ do_land_cli() {
           if tcp_probe "$FWD_H" "$FWD_P"; then ok "TCP 连接成功。"; else die "无法建立 TCP 到 ${FWD_H}:${FWD_P}。"; fi
         elif [[ -n $RELAY_LINK ]] && ss_parse "$RELAY_LINK"; then relay_test
         else die "尚未设置下一跳或原样转发。"; fi
+      elif land_in_on && [[ -z ${RELAY_LINK:-} ]] && [[ ${LAND_NEXT_ON:-0} == 1 || ${FWD_ON:-0} == 1 ]]; then
+        if [[ ${FWD_ON:-0} == 1 ]] && fwd_load "$FWD_LINK"; then
+          info "测试 TCP 连接 ${FWD_H}:${FWD_P} ..."
+          if tcp_probe "$FWD_H" "$FWD_P"; then ok "TCP 连接成功。"; else die "无法建立 TCP 到 ${FWD_H}:${FWD_P}。"; fi
+        elif land_next_load "$LAND_NEXT"; then
+          RELAY_M=$NEXT_M RELAY_K=$NEXT_K RELAY_H=$NEXT_H RELAY_P=$NEXT_P RELAY_N=$NEXT_N
+          relay_test
+        else die "尚未设置落地入站的下一跳或原样转发。"; fi
       else
         need_node
         if [[ -z $RELAY_LINK ]] || ! ss_parse "$RELAY_LINK"; then die "尚未设置落地。"; fi

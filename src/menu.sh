@@ -249,8 +249,11 @@ update_script() {
       if (( NAT_MODE )) && ! grep -q 'NAT_MODE' "${TMP_DIR}/proxy.sh"; then
         warn "在线版本不支持 NAT 模式，更新后将无法管理当前安装，已取消。"; return 0
       fi
-      if { (( LAND_MODE )) || [[ -n $RELAY_LINK ]]; } && ! grep -q 'LAND_MODE' "${TMP_DIR}/proxy.sh"; then
+      if { (( LAND_MODE )) || [[ -n $RELAY_LINK ]] || (( ${LAND_IN:-0} )); } && ! grep -q 'LAND_MODE' "${TMP_DIR}/proxy.sh"; then
         warn "在线版本不支持落地机 / 落地转发，更新后将无法管理当前配置，已取消。"; return 0
+      fi
+      if (( ${LAND_IN:-0} )) && ! grep -q 'LAND_IN' "${TMP_DIR}/proxy.sh"; then
+        warn "在线版本不能同时管理节点和落地入站，更新后将无法管理当前配置，已取消。"; return 0
       fi
       (( OPT_AUTO )) && { warn "自动模式下不降级，已取消。"; return 0; }
       confirm "仍要降级吗？" n || return 0
@@ -268,7 +271,9 @@ menu_status() {
   echo; hr; _green "  服务状态$( ((LAND_MODE)) && echo '（落地机）')$( ((NAT_MODE)) && echo '（NAT 模式）')"; hr
   local s svcs="xray hysteria-server sing-box proxy-oneclick-fw fail2ban"
   if (( NAT_MODE )); then svcs="xray hysteria-server sing-box"; [[ -n $HOP_RANGE ]] && svcs+=" proxy-oneclick-hop"; fi
-  if (( LAND_MODE )); then svcs="xray"; [[ -f $LAND_FW_UNIT || -f $LAND_FW_RC ]] && svcs+=" proxy-oneclick-land-fw"; fi
+  if (( LAND_MODE )); then svcs="xray"; fi
+  if land_ss_on && [[ -f $LAND_FW_UNIT || -f $LAND_FW_RC ]]; then svcs+=" proxy-oneclick-land-fw"; fi
+  if land_ss_on && [[ -f $LAND_FWD_UNIT || -f $LAND_FWD_RC ]]; then svcs+=" proxy-oneclick-fwd"; fi
   cert_is_public && svcs+=" proxy-oneclick-sub"
   for s in $svcs; do
     local st; st=$(svc_state "$s")
@@ -306,6 +311,13 @@ menu_status() {
     printf '  来源白名单:     %s\n' "${LAND_ALLOW:-未设置（不限制）}$([[ -n $LAND_ALLOW ]] && { land_fw_active && echo '（Xray 路由 + nftables）' || echo '（Xray 路由）'; })"
   else
     printf '  落地转发:       %s\n' "$(relay_status_line)"
+    if land_in_on; then
+      printf '  落地入站:       Shadowsocks 2022 %s，端口 %s (TCP+UDP)%s\n' "$LAND_METHOD" "$(pub_land_port)" "$( ((NAT_MODE)) && echo " → 本机 ${LAND_PORT}")"
+      printf '  落地入站出口:   %s（不走上面的 land-add）\n' "$(land_in_egress_label)"
+      printf '  来源白名单:     %s\n' "${LAND_ALLOW:-未设置（不限制）}$([[ -n $LAND_ALLOW ]] && { land_fw_active && echo '（Xray 路由 + nftables）' || echo '（Xray 路由）'; })"
+    elif [[ ${LAND_IN:-0} != 1 ]]; then
+      printf '  落地入站:       未启用（proxy land-enable，不改节点链接）\n'
+    fi
     (( NAT_MODE )) && nat_status_lines
   fi
   printf '  拥塞控制:       %s / %s\n' "$(sysval net.ipv4.tcp_congestion_control)" "$(sysval net.core.default_qdisc)"
@@ -330,6 +342,10 @@ menu_status() {
   if (( LAND_MODE )); then
     lh=$(ss -Hulnp 2>/dev/null | awk '/xray/{print "   UDP "$4"  xray"}') || true
     [[ -n $lh ]] || { lh=$(ss -Huln "sport = :${XRAY_PORT}" 2>/dev/null | awk '{print "   UDP "$4"  (xray)"}') || true; }
+  elif land_in_on && ! land_raw_active; then
+    local lu
+    lu=$(ss -Huln "sport = :${LAND_PORT}" 2>/dev/null | awk '{print "   UDP "$4"  (落地 SS2022)"}') || true
+    [[ -n $lu ]] && lh+=$'\n'"$lu"
   fi
   # 看不到进程名时（容器权限受限）按配置端口显示
   if [[ -z $lx ]]; then lx=$(ss -Htln "sport = :${XRAY_PORT}" 2>/dev/null | awk '{print "   TCP "$4"  (xray)"}') || true; fi
@@ -362,6 +378,11 @@ menu_status() {
          echo "下面是 nftables 原文。哪一端口属于哪个协议，看上面的中文列表。"
          nft list table inet "$NFT_TABLE" 2>/dev/null || warn "未找到本脚本的防火墙表。"
          nft list table ip "${NFT_TABLE}_nat" 2>/dev/null || true
+         if land_in_on && [[ -n ${LAND_ALLOW:-} ]]; then
+           echo
+           nft list table inet "$LAND_NFT_TABLE" 2>/dev/null || warn "未启用落地入站的 nftables 白名单。"
+         fi
+         if land_in_on && [[ ${FWD_ON:-0} == 1 ]]; then echo; land_fwd_show; fi
        fi ;;
     4) svc_follow xray ;;
     *) return 0 ;;
@@ -381,6 +402,7 @@ nat_status_lines() {
     else printf '  端口跳跃:       关闭\n'; fi
   fi
   (( TUIC_ENABLED )) && printf '  TUIC:           外部 UDP %s → 本机 %s\n' "${TUIC_EXT_PORT:-?}" "$TUIC_PORT"
+  if land_in_on; then printf '  落地 SS2022:    外部 TCP+UDP %s → 本机 %s\n' "${LAND_EXT_PORT:-?}" "$LAND_PORT"; fi
   printf '  虚拟化 / init:  %s / %s\n' "${VIRT:-未知}" "${INIT_SYS:-未知}"
   local envs; envs=$(go_mem_env); envs=${envs//$'\n'/ }
   printf '  内存:           %s MB%s\n' "$(mem_limit_mb)" "${envs:+（${envs}）}"
@@ -521,6 +543,8 @@ do_uninstall() {
   [[ -n $INIT_SYS ]] || detect_init
   if (( LAND_MODE )); then
     warn "将卸载落地机：Xray（Shadowsocks 2022）、来源白名单规则、网络调优（如有）、服务脚本及管理命令。"
+  elif land_in_on; then
+    warn "将卸载 Xray（含落地入站）、Hysteria2、本脚本防火墙与落地白名单、调优配置、fail2ban 规则及管理命令。"
   elif (( NAT_MODE )); then
     warn "将卸载 Xray、Hysteria2、端口跳跃规则、网络调优（如有）、服务脚本及管理命令（NAT 模式）。"
   else

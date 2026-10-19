@@ -95,12 +95,39 @@ doctor_port() { # $1 tcp|udp $2 port $3 名称
   if port_in_use "$proto" "$port"; then doc_ok "${name} 正在监听 ${proto^^}/${port}。"
   else doc_fail "${name} 没有监听 ${proto^^}/${port}。可查看: proxy status"; fi
 }
+doctor_land_listen() {
+  local port=$1
+  if land_raw_active; then
+    if port_in_use tcp "$port" || port_in_use udp "$port"; then
+      doc_fail "原样转发时 ${port} 仍被占用，DNAT 可能进不来。"
+    else
+      doc_ok "原样转发：${port} 留给 DNAT，Xray 不监听该端口。"
+    fi
+    return 0
+  fi
+  doctor_port tcp "$port" "落地 Shadowsocks"
+  doctor_port udp "$port" "落地 Shadowsocks"
+}
 doctor_services() {
   local need_x=0
-  if declare -F xray_inbound_needed >/dev/null && xray_inbound_needed; then need_x=1; fi
-  (( LAND_MODE )) && need_x=1
-  doctor_one_svc xray "$need_x"
-  if (( need_x )); then doctor_port tcp "$XRAY_PORT" "Xray"; fi
+  if land_only && land_raw_active; then need_x=0
+  elif declare -F xray_inbound_needed >/dev/null && xray_inbound_needed; then need_x=1
+  elif land_only; then need_x=1
+  fi
+  if land_only && land_raw_active; then
+    if svc_exists xray && svc_active xray; then
+      doc_fail "原样转发时 Xray 仍在运行，会占住落地端口。"
+    else
+      doc_ok "原样转发：Xray 已停止，端口留给 DNAT。"
+    fi
+  else
+    doctor_one_svc xray "$need_x"
+  fi
+  if land_only; then doctor_land_listen "$XRAY_PORT"
+  elif (( need_x && REALITY_ENABLED )); then doctor_port tcp "$XRAY_PORT" "Xray"
+  elif (( need_x )) && ! land_in_on; then doctor_port tcp "$XRAY_PORT" "Xray"
+  fi
+  if land_in_on; then doctor_land_listen "$LAND_PORT"; fi
   if (( HY2_ENABLED )); then
     doctor_one_svc hysteria-server 1
     doctor_port udp "$HY2_PORT" "Hysteria2"
@@ -136,6 +163,9 @@ doctor_fw_ports_present() {
   fi
   if (( HY2_ENABLED )); then
     grep -Eq "dport .*${HY2_PORT}([^0-9]|$)" <<<"$text" || miss=1
+  fi
+  if land_in_on && [[ -n ${LAND_PORT:-} ]]; then
+    grep -Eq "dport .*${LAND_PORT}([^0-9]|$)" <<<"$text" || miss=1
   fi
   (( miss )) && return 1
   return 0
@@ -196,10 +226,12 @@ doctor_firewall() {
   if (( NAT_MODE )); then
     doc_ok "NAT 模式不写本机入站默认拒绝。外部是否通，看服务商的端口映射。"
     doctor_hop
+    land_ss_on && doctor_land_whitelist
     return 0
   fi
   if (( LAND_MODE )); then
     doc_ok "落地机使用单独的来源白名单，不走节点这套默认拒绝。"
+    doctor_land_whitelist
     return 0
   fi
   if [[ ${FW_MODE:-off} == off || ${FW_ENABLED:-0} == 0 ]]; then
@@ -216,6 +248,26 @@ doctor_firewall() {
   fi
   doctor_host_sync
   doctor_hop
+  land_in_on && doctor_land_whitelist
+}
+doctor_land_whitelist() {
+  land_ss_on || return 0
+  [[ -n ${LAND_ALLOW:-} ]] || { doc_ok "落地来源白名单未设置。"; return 0; }
+  if (( NAT_MODE )) && is_container; then
+    doc_ok "NAT 容器的落地白名单不写 nft 表。"
+    return 0
+  fi
+  if have nft && nft list table inet "$LAND_NFT_TABLE" >/dev/null 2>&1; then
+    local text
+    text=$(nft list table inet "$LAND_NFT_TABLE" 2>/dev/null || true)
+    if grep -Eq "dport $(land_listen_port)([^0-9]|$)" <<<"$text"; then
+      doc_ok "落地白名单表 inet ${LAND_NFT_TABLE} 已加载，端口 $(land_listen_port)。"
+    else
+      doc_warn "落地白名单表已加载，但没有看到端口 $(land_listen_port)。"
+    fi
+  else
+    doc_warn "设置了落地白名单，但表 inet ${LAND_NFT_TABLE} 没有加载（可能只靠 Xray 路由，或原样转发的 DNAT）。"
+  fi
 }
 doctor_sni() {
   (( REALITY_ENABLED || XHTTP_ENABLED )) || return 0
@@ -249,6 +301,14 @@ doctor_selftests() {
   if (( HY2_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )); then
     doc_ok "Hysteria2 / TUIC / AnyTLS 只核对了本机是否在监听，没有单独的回环握手。"
   fi
+  if land_ss_on && ! land_raw_active; then
+    land_selftest || true
+    case ${LAND_SELFTEST:-skip} in
+      ok) doc_ok "落地 Shadowsocks 回环自检通过。" ;;
+      fail) doc_fail "落地 Shadowsocks 回环自检未通过。" ;;
+      *) doc_warn "跳过了落地 Shadowsocks 回环自检。" ;;
+    esac
+  fi
 }
 doctor_reach() {
   local addr
@@ -264,6 +324,10 @@ doctor_reach() {
   fi
   if (( HY2_ENABLED )); then
     echo "        nc -uvz ${addr} $(pub_hy2_port)"
+  fi
+  if land_ss_on && ! land_raw_active; then
+    echo "        nc -vz ${addr} $(pub_land_port)"
+    echo "        nc -uvz ${addr} $(pub_land_port)"
   fi
 }
 doctor_cert() {

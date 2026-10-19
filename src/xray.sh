@@ -504,6 +504,8 @@ check_port_free() { # $1 proto $2 port $3 允许的进程名(正则)
     [[ $1 == udp && $2 == "$HY2_PORT" && hysteria =~ ^($3)$ ]] && svc_active hysteria-server && return 0
     [[ $1 == udp && $2 == "$TUIC_PORT" && ${TUIC_ENABLED:-0} == 1 && sing-box =~ ^($3)$ ]] && svc_active sing-box && return 0
     [[ $1 == udp && $2 == "$XRAY_PORT" && ${LAND_MODE:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
+    [[ $1 == tcp && $2 == "${LAND_PORT:-}" && ${LAND_IN:-0} == 1 && ${LAND_MODE:-0} != 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
+    [[ $1 == udp && $2 == "${LAND_PORT:-}" && ${LAND_IN:-0} == 1 && ${LAND_MODE:-0} != 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
     [[ $1 == tcp && $2 == "$SUB_PORT" ]] && cert_is_public && [[ $3 =~ python ]] && svc_active proxy-oneclick-sub && return 0
     [[ $1 == tcp && $2 == "$XHTTP_TLS_PORT" && ${XHTTP_TLS_ENABLED:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
     [[ $1 == tcp && $2 == "$WS_PORT" && ${WS_ENABLED:-0} == 1 && xray =~ ^($3)$ ]] && svc_active xray && return 0
@@ -1238,6 +1240,7 @@ xhttp_fallback_prepare() {
 }
 xray_need_cap() {
   if (( ${LAND_MODE:-0} )); then need_bind_cap "$XRAY_PORT"; return; fi
+  land_in_on && need_bind_cap "${LAND_PORT:-0}" && return 0
   (( ${REALITY_ENABLED:-1} )) && need_bind_cap "$XRAY_PORT" && return 0
   (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && need_bind_cap "$XHTTP_PORT" && return 0
   (( ${TROJAN_ENABLED:-0} )) && need_bind_cap "$TROJAN_PORT" && return 0
@@ -1710,13 +1713,14 @@ outbound_print_status() {
 outbound_apply_installed() { # 已安装时按当前策略重写配置。未安装的调用方不要进来。
   (( INSTALLED )) || return 0
   local did=0
-  # 原样转发不经过 Xray。换出站策略时按同一策略重选 DNAT 目标，不要把 Xray 拉起来听落地端口。
-  if (( LAND_MODE )) && land_raw_active; then
+  # 原样转发不经过 Xray。换出站策略时按同一策略重选 DNAT 目标。
+  # 纯落地机会停掉 Xray。节点上的落地入站只让出 LAND_PORT，其它入站继续跑。
+  if land_raw_active; then
     land_fwd_check
     land_fwd_install
     did=1
     info "原样转发已按 $(outbound_label "${OUTBOUND_EFFECTIVE:-}") 重选目标。"
-    return 0
+    if land_only; then return 0; fi
   fi
   # 落地机也走这里。不要调用 need_node：落地机没有 Reality / Hysteria2，need_node 会直接拒绝。
   if [[ -x $XRAY_BIN ]] && { [[ -f $XRAY_CONF ]] || (( LAND_MODE )); }; then
@@ -1878,6 +1882,7 @@ write_xray_config() {
     ensure_outbound_ip
     land_xray_json >"$tmp" || die "生成落地机 Xray 配置失败。"
   else
+  ensure_outbound_ip
   local share=0
   if xhttp_shared; then share=1; xhttp_fallback_prepare; fi
   jq -n \
@@ -1956,6 +1961,8 @@ write_xray_config() {
       rm -f "$tmp" "${tmp}.cdn"
       return 1
     fi
+    # 落地入站的规则必须写在 land-add 兜底之前，ss-in 才不会被送进本机中转。
+    land_in_attach "$tmp"
     relay_inject "$tmp"   # 中转机：落地出站（保存在状态文件中，每次重新生成配置都会重新加入）
     if [[ $(jq '.inbounds | length' "$tmp") == 0 ]]; then
       rm -f "$tmp"
@@ -1987,8 +1994,9 @@ write_xray_config() {
 }
 
 restart_xray() {
-  # 原样转发时本机不终止 SS。停掉并取消开机自启，避免 Xray 占住落地端口。
-  if land_raw_active; then
+  # 纯落地机的原样转发：停掉 Xray，把端口留给 DNAT。
+  # 节点同时开着落地入站时不能停 Xray，只是配置里不监听 LAND_PORT。
+  if land_only && land_raw_active; then
     BIN_UPDATED_XRAY=0
     svc_disable_stop xray
     ok "原样转发中：Xray 已停止，不监听 ${XRAY_PORT}（对外端口 $(pub_xray_port)）。"
@@ -2010,6 +2018,8 @@ restart_xray() {
   BIN_UPDATED_XRAY=0
   if (( LAND_MODE )); then
     ok "Xray 运行中 (Shadowsocks 2022 TCP+UDP ${XRAY_PORT}$( ((NAT_MODE)) && [[ $XRAY_EXT_PORT != "$XRAY_PORT" ]] && echo "，外部端口 ${XRAY_EXT_PORT}"))"
+  elif land_in_on && ! land_raw_active; then
+    ok "Xray 运行中 ($(proto_xray_brief)；落地 SS2022 TCP+UDP $(land_listen_port))"
   else
     ok "Xray 运行中 ($(proto_xray_brief))"
   fi
