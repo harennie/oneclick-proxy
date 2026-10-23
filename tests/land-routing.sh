@@ -230,5 +230,17 @@ LAND_NEXT='ss://not-a-link'
 if ( trap - ERR; land_in_attach "$cfg" ) >/dev/null 2>&1; then fail "坏掉的下一跳不应按直连生成"; fi
 printf 'ok bad land-next is rejected\n'
 
+# 回归：守卫函数在节点上不能返回非零。脚本开着 set -e，它作为独立命令调用时
+# 返回 1 会直接终止整个流程（land-enable / land-disable 都被它带崩过）。
+need_installed() { :; }
+LAND_MODE=0 LAND_IN=0
+need_node || fail "need_node 在节点上不应返回非零"
+printf 'ok need_node returns 0 on a node\n'
+
+# 回归：端口种子函数在没有证书时必须返回 0，否则 land-enable 会在选端口前退出。
+LAND_MODE=0 LAND_IN=0 NAT_MODE=0 CERT_ON=0
+land_seed_used_ports || fail "land_seed_used_ports 在无证书时应返回 0"
+printf 'ok land_seed_used_ports returns 0 without cert\n'
+
 rm -rf "$dir"
 printf 'ok land routing\n'

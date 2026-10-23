@@ -382,7 +382,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;738:src/os.sh:1;1247:src/tune.sh:1;2047:src/xray.sh:1;4080:src/hy2.sh:1;4219:src/firewall.sh:1;5504:src/cert.sh:1;7536:src/cdn.sh:1;8521:src/link.sh:1;8914:src/singbox.sh:1;9498:src/nat.sh:1;10167:src/selftest.sh:1;10312:src/land.sh:1;12222:src/menu.sh:1;12819:src/route.sh:1;13334:src/export.sh:1;13550:src/doctor.sh:1;13949:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;738:src/os.sh:1;1247:src/tune.sh:1;2047:src/xray.sh:1;4080:src/hy2.sh:1;4219:src/firewall.sh:1;5504:src/cert.sh:1;7536:src/cdn.sh:1;8521:src/link.sh:1;8914:src/singbox.sh:1;9498:src/nat.sh:1;10167:src/selftest.sh:1;10312:src/land.sh:1;12223:src/menu.sh:1;12820:src/route.sh:1;13335:src/export.sh:1;13551:src/doctor.sh:1;13950:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -10875,7 +10875,7 @@ do_install_land() {
 
 # ---------- 落地机管理 ----------
 need_land() { need_installed; land_ss_on || die "本机没有落地入站。纯落地机用 --land 安装；已有节点用 proxy land-enable（不重装、不改节点链接）。"; }
-need_node() { need_installed; land_only && die "本机是落地机（Shadowsocks 2022），没有 Reality / Hysteria2 节点功能。菜单中可管理白名单、端口与密钥。要同时做节点和落地，请用 --with-land 安装，或改装为节点后再 proxy land-enable。"; }
+need_node() { need_installed; if land_only; then die "本机是落地机（Shadowsocks 2022），没有 Reality / Hysteria2 节点功能。菜单中可管理白名单、端口与密钥。要同时做节点和落地，请用 --with-land 安装，或改装为节点后再 proxy land-enable。"; fi; }
 
 land_apply() {
   if land_in_on; then land_node_apply; return; fi
@@ -11782,6 +11782,7 @@ land_seed_used_ports() {
     (( TUIC_ENABLED )) && local_mark_used udp "$TUIC_PORT"
     cert_is_public && local_mark_used tcp "$SUB_PORT"
   fi
+  return 0
 }
 land_choose_node_port_nat() {
   local p def="" saved=${LAND_EXT_PORT:-}
@@ -13797,7 +13798,7 @@ doctor_firewall() {
   fi
   doctor_host_sync
   doctor_hop
-  land_in_on && doctor_land_whitelist
+  if land_in_on; then doctor_land_whitelist; fi
 }
 doctor_land_whitelist() {
   land_ss_on || return 0

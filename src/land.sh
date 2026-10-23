@@ -564,7 +564,7 @@ do_install_land() {
 
 # ---------- 落地机管理 ----------
 need_land() { need_installed; land_ss_on || die "本机没有落地入站。纯落地机用 --land 安装；已有节点用 proxy land-enable（不重装、不改节点链接）。"; }
-need_node() { need_installed; land_only && die "本机是落地机（Shadowsocks 2022），没有 Reality / Hysteria2 节点功能。菜单中可管理白名单、端口与密钥。要同时做节点和落地，请用 --with-land 安装，或改装为节点后再 proxy land-enable。"; }
+need_node() { need_installed; if land_only; then die "本机是落地机（Shadowsocks 2022），没有 Reality / Hysteria2 节点功能。菜单中可管理白名单、端口与密钥。要同时做节点和落地，请用 --with-land 安装，或改装为节点后再 proxy land-enable。"; fi; }
 
 land_apply() {
   if land_in_on; then land_node_apply; return; fi
@@ -1471,6 +1471,7 @@ land_seed_used_ports() {
     (( TUIC_ENABLED )) && local_mark_used udp "$TUIC_PORT"
     cert_is_public && local_mark_used tcp "$SUB_PORT"
   fi
+  return 0
 }
 land_choose_node_port_nat() {
   local p def="" saved=${LAND_EXT_PORT:-}

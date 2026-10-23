@@ -248,7 +248,7 @@ doctor_firewall() {
   fi
   doctor_host_sync
   doctor_hop
-  land_in_on && doctor_land_whitelist
+  if land_in_on; then doctor_land_whitelist; fi
 }
 doctor_land_whitelist() {
   land_ss_on || return 0
