@@ -3,7 +3,8 @@
 #
 # proxy.sh —— VLESS + REALITY + Vision、VLESS + XHTTP + REALITY、Hysteria2 一键安装 / 管理脚本
 # 可选（默认不装）：Trojan + REALITY、TUIC v5、AnyTLS，以及需要自有域名和公开证书的
-# VLESS + XHTTP + TLS、VLESS + WebSocket + TLS（放在 CDN 后面，不是 REALITY）。Shadowsocks 2022 仅用于落地机。
+# VLESS + XHTTP + TLS、VLESS + WebSocket + TLS（放在 CDN 后面，不是 REALITY）。
+# Shadowsocks 2022 用于纯落地机（--land），也可在普通节点上额外开一条落地入站（--with-land / land-enable）。
 #
 # 用法:
 #   bash proxy.sh                 # 交互式菜单
@@ -12,7 +13,10 @@
 #   bash proxy.sh --nat           # NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine）
 #   bash proxy.sh tune            # 网络调优（BBR / 队列算法 / 缓冲区；可单独使用，NAT/容器也可用）
 #   bash proxy.sh --land          # 落地机：只运行 Shadowsocks 2022（给中转机做出口，可设来源 IP 白名单）
+#   bash proxy.sh --with-land     # 普通节点同时开一条落地入站（不关掉 Reality / Hy2）
+#   proxy land-enable             # 已安装的节点上补开落地入站，不重装、不改节点密钥
 #   proxy land-add 'ss://...'     # 中转机：出口改到落地机；落地机：加密转发到下一跳
+#                                 # 节点+落地入站：land-add 仍是节点出站；落地入站自己的下一跳是 land-next
 #   proxy land-direct | land-clear    # 落地机：本机直连，清除下一跳、原样转发和 DNAT
 #   proxy land-forward 'ss://...' | land-raw 'ss://...'
 #                                 # 落地机：原样转发（不解密，DNAT 到最终落地）
@@ -49,7 +53,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.6.0"
+readonly SCRIPT_VERSION="1.7.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -211,10 +215,12 @@ OPT_NAT_EXCLUDE=""  # 端口段内需要排除的外部端口（例如 SSH 映�
 OPT_NAT_SHARE=""    # 1 = Reality(TCP) 与 Hy2(UDP) 共用一个外部端口；0 = 分开
 OPT_DNS64=0
 OPT_LAND=""         # 1 = 安装为落地机（Shadowsocks 2022）；0 = 改回节点模式；空 = 沿用
+OPT_WITH_LAND=""    # 1 = 节点同时开落地入站；0 = 关掉；空 = 安装时沿用已保存的 LAND_IN
+OPT_LAND_PORT=""    # 落地入站端口。纯 --land 且未写 --port 时当作落地端口
 OPT_LAND_METHOD=""  # 落地机加密方式 aes-128 | aes-256 | chacha20
 OPT_LAND_ALLOW=""   # 落地机来源 IP 白名单（逗号分隔，none 清空）
 OPT_LAND_LINK=""    # 中转机 land-add 的 ss:// 链接
-OPT_LAND_ACT=""     # 中转机落地转发子命令: add | on | off | del | test
+OPT_LAND_ACT=""     # 中转机落地转发子命令: add | on | off | del | test | next | forward
 OPT_FORCE=0         # land-add 测试不通过也强制启用
 OPT_IMPORT=""       # --import / proxy import 的文件
 OPT_EXPORT_PATH=""  # proxy export 的输出路径，空则用默认
@@ -639,6 +645,7 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
             HOP_BACKEND VIRT DNS64_SET
             LAND_MODE LAND_METHOD LAND_KEY LAND_ALLOW RELAY_LINK RELAY_ON RELAY_SOCKS FWD_LINK FWD_ON NAT_PREF
+            LAND_IN LAND_PORT LAND_EXT_PORT LAND_NEXT LAND_NEXT_ON
             REALITY_ENABLED XHTTP_ENABLED XHTTP_PORT XHTTP_PATH XHTTP_EXT_PORT XHTTP_ON_443
             TROJAN_ENABLED TROJAN_PORT TROJAN_PASS TROJAN_EXT_PORT
             TUIC_ENABLED TUIC_PORT TUIC_PASS TUIC_EXT_PORT
@@ -670,9 +677,14 @@ EXTRA_TCP="" EXTRA_UDP="" DISABLED_FW="" SWAP_CREATED=0 SERVER_ADDR=""
 NAT_MODE=0 NAT_PORTS="" NAT_EXCLUDE="" XRAY_EXT_PORT="" HY2_EXT_PORT="" HOP_EXT_RANGE=""
 HOP_BACKEND="" VIRT="" DNS64_SET=0
 LAND_MODE=0 LAND_METHOD="2022-blake3-aes-128-gcm" LAND_KEY="" LAND_ALLOW="" RELAY_LINK="" RELAY_ON=0 RELAY_SOCKS=""
-# 落地机出口。FWD_* 只在落地机上使用：FWD_ON=1 为原样转发（DNAT）。节点不读这两项。
+# 落地机出口。FWD_*：原样转发（DNAT）。纯落地机（LAND_MODE=1）和节点上的落地入站都会读。
 # 旧状态文件没有这两项时保持关闭，落地机仍是直连。
 FWD_LINK="" FWD_ON=0
+# 节点上的落地入站。LAND_MODE=1 的纯落地机不看这几项（端口仍是 XRAY_PORT）。
+# 旧状态没有 LAND_IN 时默认为 0，proxy update 后纯落地机行为不变。
+# LAND_NEXT 只给「节点 + 落地入站」的加密下一跳。纯落地机的下一跳仍是 RELAY_*。
+# 节点自己的 land-add 也仍是 RELAY_*，两者不共用，避免落地入站被送进本机中转。
+LAND_IN=0 LAND_PORT="" LAND_EXT_PORT="" LAND_NEXT="" LAND_NEXT_ON=0
 NAT_PREF=auto       # 菜单「切换 NAT 模式」：auto = 自动检测；on = 强制 NAT（同 --nat）；off = 强制普通模式（同 --no-nat）
 NAT_SRC=""          # 本次安装 NAT_MODE 的来源：cli | manual | alpine | state | auto | detect
 # 已记住的出站策略：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6。空 = 还没问过。

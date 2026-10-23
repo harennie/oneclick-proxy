@@ -132,14 +132,14 @@ fw_collect_foreign() {
   FW_FOREIGN_TCP=""
   FW_FOREIGN_UDP=""
   for p in $t; do
-    if [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || $p == "$XHTTP_TLS_PORT" || $p == "$WS_PORT" || $p == "${SUB_PORT:-}" ]]; then
+    if [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || $p == "$XHTTP_TLS_PORT" || $p == "$WS_PORT" || $p == "${SUB_PORT:-}" || $p == "${LAND_PORT:-}" ]]; then
       continue
     fi
     cert_port_owned "$p" && continue
     FW_FOREIGN_TCP+="$p "
   done
   for p in $u; do
-    [[ $p == "$HY2_PORT" || $p == "$TUIC_PORT" || $p == "$XRAY_PORT" ]] && continue
+    [[ $p == "$HY2_PORT" || $p == "$TUIC_PORT" || $p == "$XRAY_PORT" || $p == "${LAND_PORT:-}" ]] && continue
     FW_FOREIGN_UDP+="$p "
   done
   FW_FOREIGN_TCP=${FW_FOREIGN_TCP% }
@@ -421,6 +421,7 @@ render_firewall() {
     [[ $1 == tcp_ports && ",$ssh_set," == *",$p,"* ]] && return 0
     printf -v "$1" '%s' "${cur:+$cur,}$p"
   }
+  if land_in_on; then fw_add_port tcp_ports "$(land_listen_port)"; fi
   (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && fw_add_port tcp_ports "$XHTTP_PORT"
   (( ${TROJAN_ENABLED:-0} )) && fw_add_port tcp_ports "$TROJAN_PORT"
   (( ${ANYTLS_ENABLED:-0} )) && fw_add_port tcp_ports "$ANYTLS_PORT"
@@ -431,6 +432,7 @@ render_firewall() {
   for p in $EXTRA_TCP; do fw_add_port tcp_ports "$p"; done
   udp_ports=""
   (( HY2_ENABLED )) && udp_ports="$HY2_PORT"
+  if land_in_on; then fw_add_port udp_ports "$(land_listen_port)"; fi
   (( ${TUIC_ENABLED:-0} )) && fw_add_port udp_ports "$TUIC_PORT"
   for p in $EXTRA_UDP; do fw_add_port udp_ports "$p"; done
   local hop="" mode=${FW_MODE:-strict}
@@ -499,9 +501,16 @@ render_firewall_compat() {
   nft -c -f "$f" >/dev/null 2>&1
 }
 
+fw_finish_land_in() {
+  if land_in_on; then land_fw_apply; return 0; fi
+  # 没开过落地入站就别 daemon-reload。关掉之后要把白名单表卸掉。
+  if [[ -f $LAND_FW_UNIT || -f $LAND_FW_RC || -f $LAND_FW_FILE ]] || land_fw_active; then
+    land_fw_remove
+  fi
+}
 apply_firewall() {
   if (( LAND_MODE )); then land_fw_apply; return; fi
-  if (( NAT_MODE )); then apply_nat_hop; return; fi
+  if (( NAT_MODE )); then apply_nat_hop; fw_finish_land_in; return; fi
   case ${FW_MODE:-} in
     off) FW_ENABLED=0 ;;
     allow|strict) FW_ENABLED=1 ;;
@@ -510,10 +519,12 @@ apply_firewall() {
     if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then
       fw_host_sync
       fw_print_allows
+      fw_finish_land_in
       return 0
     fi
     fw_host_clear
     warn "已跳过防火墙配置（--no-firewall、--firewall off，或保留了其它防火墙）。"
+    fw_finish_land_in
     return 0
   fi
   [[ ${FW_MODE:-strict} == allow ]] || FW_MODE=strict
@@ -577,6 +588,7 @@ UNIT
     ok "nftables 规则已加载（入站默认拒绝）。"
   fi
   if [[ ${FW_HOST_SYNC:-0} == 1 ]]; then fw_host_sync; else fw_host_clear; fi
+  fw_finish_land_in
   fw_print_allows
 }
 
@@ -767,12 +779,12 @@ ask_extra_ports() {
   t=$(other_listen_ports tcp); u=$(other_listen_ports udp)
   # 排除自身端口
   t=$(for p in $t; do
-    if [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || $p == "$XHTTP_TLS_PORT" || $p == "$WS_PORT" ]] || cert_port_owned "$p"; then
+    if [[ $p == "$XRAY_PORT" || $p == "$XHTTP_PORT" || $p == "$TROJAN_PORT" || $p == "$ANYTLS_PORT" || $p == "$XHTTP_TLS_PORT" || $p == "$WS_PORT" || $p == "${LAND_PORT:-}" ]] || cert_port_owned "$p"; then
       continue
     fi
     echo "$p"
   done | tr '\n' ' ')
-  u=$(for p in $u; do [[ $p == "$HY2_PORT" || $p == "$TUIC_PORT" ]] || echo "$p"; done | tr '\n' ' ')
+  u=$(for p in $u; do [[ $p == "$HY2_PORT" || $p == "$TUIC_PORT" || $p == "$XRAY_PORT" || $p == "${LAND_PORT:-}" ]] || echo "$p"; done | tr '\n' ' ')
   t=${t% } u=${u% }
   if [[ -n $t || -n $u ]]; then
     warn "检测到本机还有其它服务在对外监听：${t:+TCP [$t] }${u:+UDP [$u]}"
@@ -806,6 +818,7 @@ fw_collect_want() {
   local p seg
   FW_WANT=""
   (( ${REALITY_ENABLED:-0} == 1 )) && fw_want_add tcp "$XRAY_PORT"
+  if land_in_on; then fw_want_add tcp "$(land_listen_port)"; fw_want_add udp "$(land_listen_port)"; fi
   (( ${XHTTP_ENABLED:-0} == 1 )) && ! xhttp_shared && fw_want_add tcp "$XHTTP_PORT"
   (( ${HY2_ENABLED:-0} == 1 )) && fw_want_add udp "$HY2_PORT"
   (( ${TROJAN_ENABLED:-0} == 1 )) && fw_want_add tcp "$TROJAN_PORT"
@@ -1150,6 +1163,10 @@ fw_print_allows() {
   echo
   printf '  %s  %s  %s\n' "$(ui_pad "协议" 22)" "$(ui_pad "类型" 4)" "端口"
   (( ${REALITY_ENABLED:-0} == 1 )) && fw_allow_row "Reality" tcp "$XRAY_PORT"
+  if land_in_on; then
+    fw_allow_row "落地 SS2022" tcp "$(land_listen_port)"
+    fw_allow_row "落地 SS2022" udp "$(land_listen_port)"
+  fi
   if (( ${XHTTP_ENABLED:-0} == 1 )); then
     if xhttp_shared; then fw_allow_row "XHTTP（共用）" tcp "$XRAY_PORT"
     else fw_allow_row "XHTTP" tcp "$XHTTP_PORT"; fi
@@ -1180,6 +1197,13 @@ fw_print_allows() {
   if cert_http_open; then echo "证书申请的 TCP 80 只给 HTTP-01 续期，不提供订阅，也不跑代理。"; fi
   if cert_is_public; then echo "订阅是客户端拉取节点的 HTTPS，不是 Reality。"; fi
   (( ${XHTTP_TLS_ENABLED:-0} == 1 || ${WS_ENABLED:-0} == 1 )) && echo "CDN 这两行给 Cloudflare 回源，不是 Reality。"
+  if land_in_on; then
+    if [[ -n ${LAND_ALLOW:-} ]]; then
+      echo "落地 SS2022 的 TCP/UDP $(land_listen_port) 已放行；来源白名单另由表 inet ${LAND_NFT_TABLE} 限制（非白名单来源在进主防火墙之前丢掉）。"
+    else
+      echo "落地 SS2022 的 TCP/UDP $(land_listen_port) 已放行。未设置来源白名单。"
+    fi
+  fi
   if (( ${HY2_ENABLED:-0} == 1 )) && [[ -n ${HOP_RANGE:-} ]]; then
     echo "端口跳跃的 UDP ${HOP_RANGE} 会转到 Hysteria2 的 UDP ${HY2_PORT}。"
   fi
@@ -1214,6 +1238,9 @@ cloud_fw_reminder() {
       [[ -n $HOP_RANGE ]] && printf 'UDP   %-7s → 本机 %-7s  端口跳跃\n' "$HOP_EXT_RANGE" "$HOP_RANGE"
     fi
     (( TUIC_ENABLED )) && printf 'UDP   %-7s → 本机 %-7s  TUIC v5\n' "$TUIC_EXT_PORT" "$TUIC_PORT"
+    if land_in_on; then
+      printf 'TCP+UDP %-5s → 本机 %-7s  落地 Shadowsocks 2022\n' "${LAND_EXT_PORT:-?}" "$LAND_PORT"
+    fi
     if (( HY2_ENABLED )) && [[ $HY2_EXT_PORT == "$XRAY_EXT_PORT" ]]; then
       echo "Reality 与 Hysteria2 共用外部端口 ${XRAY_EXT_PORT}，该映射必须同时包含 TCP 和 UDP。"
     else

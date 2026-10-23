@@ -13,7 +13,7 @@ reality_selftest() {
   dir=$(mktemp -d "${TMP_DIR}/selftest.XXXXXX") || { warn "跳过 REALITY 自检（无法创建临时目录）。"; return 0; }
   for i in 1 2 3 4 5 6 7 8 9 10; do
     port=$(( 20000 + RANDOM % 40000 ))
-    [[ $port == "$XRAY_PORT" || $port == "${HY2_PORT:-}" ]] && continue
+    [[ $port == "$XRAY_PORT" || $port == "${HY2_PORT:-}" || $port == "${LAND_PORT:-}" ]] && continue
     port_in_use tcp "$port" || break
   done
   if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$XRAY_PORT" --arg sni "$SNI" \
@@ -88,7 +88,7 @@ xhttp_selftest() {
   dir=$(mktemp -d "${TMP_DIR}/xhttp-self.XXXXXX") || { warn "跳过 XHTTP 自检（无法创建临时目录）。"; return 0; }
   for i in 1 2 3 4 5 6 7 8 9 10; do
     port=$(( 20000 + RANDOM % 40000 ))
-    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "$dest" || $port == "${HY2_PORT:-}" ]] && continue
+    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "$dest" || $port == "${HY2_PORT:-}" || $port == "${LAND_PORT:-}" ]] && continue
     port_in_use tcp "$port" || break
   done
   if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$dest" --arg sni "$SNI" \

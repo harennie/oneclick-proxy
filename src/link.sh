@@ -342,6 +342,10 @@ print_node_links() { # $1=1 屏幕着色并附二维码；$1=0 纯文本
   fi
   cdn_print_links "$paint"
   print_sub_block "$paint"
+  if land_in_on; then
+    echo
+    land_print_links "$paint"
+  fi
 }
 
 build_info() { # 输出完整信息（无颜色），用于保存文件
