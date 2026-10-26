@@ -18,12 +18,24 @@ menu_change_sni() {
   need_node; mktmp
   detect_ip; detect_geo
   (( NAT_MODE )) || SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
-  local old=$SNI
-  select_sni
-  [[ $SNI == "$old" ]] && { info "SNI 未变化。"; return 0; }
-  SNI_TARGET="${SNI}:443"
-  mldsa_decide
+  local old=$SNI old_self=${SELF_SNI:-0}
+  select_install_sni
+  if [[ $SNI == "$old" && ${SELF_SNI:-0} == "$old_self" ]]; then
+    info "SNI 未变化。"
+    return 0
+  fi
+  if (( SELF_SNI )); then
+    setup_cert
+    SNI_TARGET=$(sni_own_pick_target)
+    reality_site_install
+    MLDSA_ON=0
+  else
+    SNI_TARGET="${SNI}:443"
+    (( old_self )) && reality_site_remove
+    mldsa_decide
+  fi
   apply_all
+  if tls_present_real; then cert_start_sub; fi
   ( trap - ERR; set +e; reality_selftest ) || true
   if tls_present_real; then
     ok "SNI 已由 ${old} 更换为 ${SNI}。REALITY / XHTTP / Trojan 需要更新链接。Hysteria2 / TUIC / AnyTLS 仍使用 ${CERT_DOMAIN} 的证书。"

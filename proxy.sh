@@ -131,6 +131,9 @@ readonly CERT_BASE="/etc/proxy-oneclick"
 readonly CERT_DIR="${CERT_BASE}/certs"
 readonly CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
 readonly CERT_PRIVKEY="${CERT_DIR}/privkey.pem"
+readonly REALITY_SITE_DEFAULT_PORT=9443
+readonly REALITY_SITE_UNIT="/etc/systemd/system/proxy-oneclick-reality-site.service"
+readonly REALITY_SITE_CONF="${CERT_DIR}/reality-site.json"
 readonly CERT_LIB="/usr/local/lib/proxy-oneclick"
 readonly SUB_PY="${CERT_LIB}/sub_https.py"
 readonly CERT_HOOK="${CERT_LIB}/cert-deploy.sh"
@@ -173,6 +176,7 @@ readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 # ----------------------------- 默认值 / 运行参数 -----------------------------
 OPT_AUTO=0
 OPT_SNI=""
+OPT_OWN_SNI=""
 OPT_FORCE_SNI=0
 OPT_PORT=""
 OPT_HY2=""          # 空=询问(交互)/默认启用(auto); 1/0
@@ -382,7 +386,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;738:src/os.sh:1;1247:src/tune.sh:1;2047:src/xray.sh:1;4080:src/hy2.sh:1;4219:src/firewall.sh:1;5504:src/cert.sh:1;7536:src/cdn.sh:1;8521:src/link.sh:1;8914:src/singbox.sh:1;9498:src/nat.sh:1;10167:src/selftest.sh:1;10312:src/land.sh:1;12223:src/menu.sh:1;12820:src/route.sh:1;13335:src/export.sh:1;13551:src/doctor.sh:1;13950:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;742:src/os.sh:1;1251:src/tune.sh:1;2051:src/xray.sh:1;4156:src/hy2.sh:1;4295:src/firewall.sh:1;5580:src/cert.sh:1;7719:src/cdn.sh:1;8704:src/link.sh:1;9097:src/singbox.sh:1;9681:src/nat.sh:1;10369:src/selftest.sh:1;10514:src/land.sh:1;12425:src/menu.sh:1;13034:src/route.sh:1;13549:src/export.sh:1;13765:src/doctor.sh:1;14164:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -640,7 +644,7 @@ take_lock() {
 
 # ----------------------------- 状态持久化 -----------------------------
 # 持久化的键
-STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY MLDSA_ON SNI SNI_TARGET
+STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY MLDSA_ON SNI SNI_TARGET SELF_SNI
             HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED FW_MODE FW_HOST_SYNC SSH_PORTS
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
@@ -657,7 +661,7 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             OUTBOUND_IP
             CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
             CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
-INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
+INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET="" SELF_SNI=0
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" FW_HOST_SYNC=0 SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
 # 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。
@@ -2410,6 +2414,7 @@ scanner_collect() { # $1 输出候选列表文件
 
 # 主流程：自动优选 SNI。结果写入全局 SNI
 select_sni() {
+  SELF_SNI=0
   mktmp
   local keys main near cands="" k res="${TMP_DIR}/sni.res" sorted="${TMP_DIR}/sni.sorted"
   # 1) 命令行指定
@@ -2501,6 +2506,75 @@ select_sni() {
     fi
   done
   ok "已选择 SNI: ${SNI}"
+}
+
+sni_own_port_busy() {
+  local candidate=$1 v
+  for v in "$XRAY_PORT" "$XHTTP_PORT" "$TROJAN_PORT" "$ANYTLS_PORT" "$XHTTP_TLS_PORT" "$WS_PORT" "$SUB_PORT" "$OPT_SUB_PORT" "$LAND_PORT" "$OPT_LAND_PORT"; do
+    [[ -n $v && $v == "$candidate" ]] && return 0
+  done
+  port_in_use tcp "$candidate"
+}
+sni_own_port_planned() {
+  local candidate=$1 v
+  for v in "$XRAY_PORT" "$XHTTP_PORT" "$TROJAN_PORT" "$ANYTLS_PORT" "$XHTTP_TLS_PORT" "$WS_PORT" "$SUB_PORT" "$OPT_SUB_PORT" "$LAND_PORT" "$OPT_LAND_PORT"; do
+    [[ -n $v && $v == "$candidate" ]] && return 0
+  done
+  return 1
+}
+sni_own_pick_target() {
+  local old=${SNI_TARGET##*:} p
+  if [[ ${SELF_SNI:-0} == 1 && $old =~ ^[0-9]+$ ]] && ! sni_own_port_planned "$old" \
+      && svc_active proxy-oneclick-reality-site; then
+    printf '127.0.0.1:%s' "$old"
+    return 0
+  fi
+  for ((p=REALITY_SITE_DEFAULT_PORT; p<REALITY_SITE_DEFAULT_PORT+20; p++)); do
+    sni_own_port_busy "$p" || { printf '127.0.0.1:%s' "$p"; return 0; }
+  done
+  die "没有可用于自有域名 HTTPS 回落服务的本机端口（${REALITY_SITE_DEFAULT_PORT}–$((REALITY_SITE_DEFAULT_PORT + 19))）。"
+}
+select_self_sni() { # $1 自有域名；REALITY TLS 回落到本机 HTTPS 服务
+  local d=${1#https://} kind
+  d=${d%%/*}; d=${d,,}; d=${d%.}; d=${d// /}
+  cert_domain_syntax "$d" || die "自有 SNI 必须是有效域名，例如 node.example.com。"
+  (( NAT_MODE )) && die "自有域名 SNI 需要公网证书和本机 HTTPS 回落服务，NAT 模式不支持。"
+  (( REALITY_ENABLED )) || die "自有域名 SNI 只适用于 VLESS-REALITY；请启用 REALITY。"
+  [[ ${INIT_SYS:-} == systemd ]] || die "自有域名 SNI 的本机 HTTPS 回落服务目前需要 systemd。"
+  [[ -z $OPT_SNI ]] || die "--own-sni 不能和 --sni 同时使用。"
+  [[ ${OPT_CERT:-1} != 0 ]] || die "自有域名 SNI 需要公开证书，不能同时使用 --no-cert。"
+  [[ -z ${OPT_CERT_DOMAIN:-} || ${OPT_CERT_DOMAIN} == "$d" ]] || die "--cert-domain 必须与 --own-sni 相同。"
+  [[ -z ${OPT_CERT_NAMES:-} || ${OPT_CERT_NAMES} == "$d" ]] || die "--cert-names 必须与 --own-sni 相同。"
+  [[ -z ${OPT_CERT_NAMES:-}${OPT_CF_ORIGIN_KEY:-}${OPT_ZEROSSL_KID:-}${OPT_ZEROSSL_HMAC:-} ]] || die "自有域名 SNI 使用 Let's Encrypt 单域名证书，不能同时指定其它证书类型或凭据。"
+  if [[ -n ${OPT_CERT_KIND:-} ]]; then
+    kind=$(cert_normalize_kind "$OPT_CERT_KIND") || die "自有域名 SNI 只支持 Let's Encrypt 单域名证书。"
+    [[ $kind == le ]] || die "自有域名 SNI 只支持 Let's Encrypt 单域名证书。"
+  fi
+  [[ -n ${PUBLIC_IP4:-}${PUBLIC_IP6:-} ]] || detect_ip
+  cert_domain_points_here "$d" || die "域名 ${d} 没有全部解析到本机；请先修改 A/AAAA 记录并关闭 CDN 代理。"
+  SELF_SNI=1
+  SNI=$d
+  OPT_CERT=1
+  OPT_CERT_KIND=le
+  OPT_CERT_DOMAIN=$d
+  SNI_TARGET=$(sni_own_pick_target)
+  # 自有域名的回落证书链长度不保证满足 Xray 的 ML-DSA pqv 门槛；保留 REALITY，关闭可选的 pqv。
+  MLDSA_ON=0
+  info "SNI ${SNI} 将回落到本机 HTTPS 服务 ${SNI_TARGET}。请将域名 A/AAAA 指向本机、关闭 CDN 代理，并确保公网 TCP 80 可用于签发证书。"
+  warn "自有域名模式不输出 ML-DSA pqv（可选增强）；REALITY 仍正常工作。"
+}
+
+select_install_sni() {
+  local d
+  if [[ -n $OPT_OWN_SNI ]]; then select_self_sni "$OPT_OWN_SNI"; return; fi
+  if [[ -z $OPT_SNI && ! $OPT_AUTO ]] && confirm "是否使用自己的域名作为 REALITY SNI？域名需解析到本机，并通过 TCP 80 申请公开证书。" y; then
+    ask d "请输入指向本机的域名（例如 node.example.com，留空继续普通 SNI）" ""
+    if [[ -n $d ]]; then select_self_sni "$d"; return; fi
+    warn "没有输入自有域名，继续原有 SNI 优选流程。"
+  fi
+  SELF_SNI=0
+  select_sni
+  SNI_TARGET="${SNI}:443"
 }
 
 manual_sni() {
@@ -3118,6 +3192,8 @@ install_xray() {
   if (( ! same )); then bin_backup "$XRAY_BIN" xray; backed=$BIN_BAK_MADE; fi
   fetch -o "${TMP_DIR}/xray-install.sh" "$XRAY_INSTALL_URL" || { bin_backup_drop "$XRAY_BIN"; die "下载 Xray 安装脚本失败，请检查网络（GitHub 可达性）。"; }
   if (( same )); then force=(--force); fi
+  # 官方安装器会在返回前尝试启动服务；先固定用户，避免它用 xray 用户读取 nobody 组的 640 配置而失败。
+  ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
   xray_geo_snapshot
   if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install --version "$tag" "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1; then
     tail -n 20 "${TMP_DIR}/xray-install.log" >&2 || true
@@ -5615,6 +5691,7 @@ cert_normalize_domain() {
 sub_port_blocked() {
   local p=$1
   [[ $p == 80 ]] && return 0
+  (( ${SELF_SNI:-0} == 1 )) && [[ ${SNI_TARGET##*:} == "$p" ]] && return 0
   (( ${REALITY_ENABLED:-0} == 1 )) && [[ $p == "$XRAY_PORT" ]] && return 0
   (( ${XHTTP_ENABLED:-0} == 1 )) && [[ $p == "$XHTTP_PORT" ]] && return 0
   (( ${TROJAN_ENABLED:-0} == 1 )) && [[ $p == "$TROJAN_PORT" ]] && return 0
@@ -5820,13 +5897,21 @@ except ImportError:  # Python 3.6
 def load_conf(path):
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
-    for key in ("port", "cert", "key", "token", "body", "clash"):
+    for key in ("port", "cert", "key"):
         if key not in data:
             raise SystemExit("missing config field")
-    token = str(data["token"])
-    if not token or "/" in token or ".." in token:
-        raise SystemExit("invalid token")
-    data["token"] = token
+    mode = data.get("mode", "sub")
+    if mode == "sub":
+        for key in ("token", "body", "clash"):
+            if key not in data:
+                raise SystemExit("missing config field")
+        token = str(data["token"])
+        if not token or "/" in token or ".." in token:
+            raise SystemExit("invalid token")
+        data["token"] = token
+    elif mode != "site":
+        raise SystemExit("invalid mode")
+    data["mode"] = mode
     return data
 
 
@@ -5843,6 +5928,20 @@ class Handler(BaseHTTPRequestHandler):
         self._empty(404)
 
     def _reply(self, send_body):
+        if self.server.conf["mode"] == "site":
+            data = (b"<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
+                    b"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                    b"<title>Welcome</title><body><h1>Welcome</h1></body></html>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if send_body:
+                self.wfile.write(data)
+            return
         path = self.path.split("?", 1)[0]
         if path.endswith("/") and path != "/":
             path = path[:-1]
@@ -5894,7 +5993,11 @@ class TLSServer(_HTTPServer):
         self.socket = context.wrap_socket(self.socket, server_side=True)
 
 
-def make_server(port, context):
+def make_server(port, context, site=False):
+    if site:
+        class LocalV4(TLSServer):
+            address_family = socket.AF_INET
+        return LocalV4(("127.0.0.1", port), Handler, context)
     last_err = None
     try:
         class V6(TLSServer):
@@ -5927,7 +6030,7 @@ def main():
     else:
         ctx.options |= getattr(ssl, "OP_NO_TLSv1", 0) | getattr(ssl, "OP_NO_TLSv1_1", 0)
     ctx.load_cert_chain(conf["cert"], conf["key"])
-    httpd = make_server(int(conf["port"]), ctx)
+    httpd = make_server(int(conf["port"]), ctx, conf["mode"] == "site")
     httpd.conf = conf
     httpd.serve_forever()
 
@@ -5939,6 +6042,8 @@ PY
 }
 write_cert_hook() {
   mkdir -p "$CERT_LIB"
+  local restart_site=0
+  (( ${SELF_SNI:-0} == 1 )) && restart_site=1
   cat >"$CERT_HOOK" <<EOF
 #!/bin/sh
 # 由 proxy-oneclick 生成。certbot 续期成功后调用。
@@ -5947,6 +6052,7 @@ write_cert_hook() {
 src="/etc/letsencrypt/live/${CERT_NAME}"
 dst="${CERT_DIR}"
 grp="${CERT_GROUP}"
+restart_site="${restart_site}"
 case \${RENEWED_LINEAGE:-} in
   "") ;;
   */${CERT_NAME}|*/${CERT_NAME}/) ;;
@@ -5972,8 +6078,9 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
   systemctl try-restart hysteria-server.service >/dev/null 2>&1 || true
   systemctl try-restart sing-box.service >/dev/null 2>&1 || true
   systemctl try-restart proxy-oneclick-sub.service >/dev/null 2>&1 || true
+  [ "\$restart_site" = 1 ] && systemctl try-restart proxy-oneclick-reality-site.service >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
-  for s in hysteria-server sing-box proxy-oneclick-sub; do
+  for s in hysteria-server sing-box proxy-oneclick-sub proxy-oneclick-reality-site; do
     if [ -x "/etc/init.d/\$s" ]; then rc-service "\$s" restart >/dev/null 2>&1 || true; fi
   done
 fi
@@ -6224,6 +6331,72 @@ RC
     systemctl daemon-reload
   fi
 }
+reality_site_install() {
+  (( ${SELF_SNI:-0} == 1 )) || return 0
+  [[ ${INIT_SYS:-} == systemd ]] || die "自有域名 SNI 的 HTTPS 回落服务目前需要 systemd。"
+  cert_is_public && cert_name_covered "$CERT_FULLCHAIN" "$SNI" || die "自有域名 SNI 需要覆盖 ${SNI} 的公开证书。"
+  [[ ${CERT_DOMAIN} == "$SNI" ]] || die "自有域名 SNI 的证书域名必须与 ${SNI} 相同。"
+  [[ ${SNI_TARGET} =~ ^127\.0\.0\.1:([0-9]+)$ ]] || die "自有域名 SNI 的本机回落地址无效: ${SNI_TARGET}"
+  local port=${BASH_REMATCH[1]} py
+  if ! svc_active proxy-oneclick-reality-site && port_in_use tcp "$port"; then
+    die "本机回落端口 ${port} 已被其它服务占用；请释放端口后重试，避免 REALITY target 与回落服务不一致。"
+  fi
+  cert_grant_readers
+  write_sub_python
+  py=$(command -v python3)
+  [[ -n $py ]] || die "未找到 python3，不能启动 REALITY HTTPS 回落服务。"
+  jq -n --argjson port "$port" --arg cert "$CERT_FULLCHAIN" --arg key "$CERT_PRIVKEY" \
+    '{mode:"site",port:$port,cert:$cert,key:$key}' >"${REALITY_SITE_CONF}.tmp"
+  chown "root:${CERT_GROUP}" "${REALITY_SITE_CONF}.tmp"
+  chmod 640 "${REALITY_SITE_CONF}.tmp"
+  mv -f "${REALITY_SITE_CONF}.tmp" "$REALITY_SITE_CONF"
+  cat >"$REALITY_SITE_UNIT" <<EOF
+# 由 proxy-oneclick 生成。仅供本机 REALITY 回落使用。
+[Unit]
+Description=proxy-oneclick REALITY HTTPS fallback
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SUB_USER}
+Group=${CERT_GROUP}
+WorkingDirectory=/
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+ExecStart=${py} ${SUB_PY} ${REALITY_SITE_CONF}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable proxy-oneclick-reality-site.service >/dev/null
+  systemctl restart proxy-oneclick-reality-site.service >/dev/null
+  local ready=0
+  for _ in {1..10}; do
+    if curl --noproxy '*' --resolve "${SNI}:${port}:127.0.0.1" --connect-timeout 2 -fsS -o /dev/null "https://${SNI}:${port}/"; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if (( ! ready )); then
+    journalctl -u proxy-oneclick-reality-site.service -n 20 --no-pager >&2 || true
+    die "本机 HTTPS 回落服务自检失败（${SNI_TARGET}）。"
+  fi
+  ok "REALITY 自有域名 HTTPS 回落已就绪：${SNI_TARGET}（仅监听 127.0.0.1）。"
+}
+reality_site_remove() {
+  svc_disable_stop proxy-oneclick-reality-site || true
+  rm -f "$REALITY_SITE_UNIT" "$REALITY_SITE_CONF" "${REALITY_SITE_CONF}.tmp"
+  sd_reload
+  SELF_SNI=0
+}
 write_renew_job() {
   local bin; bin=$(command -v certbot)
   [[ -n $bin ]] || die "未找到 certbot，无法安排续期。"
@@ -6300,6 +6473,7 @@ cert_start_sub() {
   cert_write_sub_conf
   cert_write_bodies
   write_sub_service
+  reality_site_install
   if cert_renew_unattended; then write_renew_job
   else
     cert_drop_renew_job
@@ -6917,6 +7091,7 @@ cert_switch_needed() {
 cert_retire_for_switch() {
   info "正在关闭当前证书，随后申请另一种。REALITY 的端口、密钥和伪装站点都不变。"
   svc_disable_stop proxy-oneclick-sub || true
+  if (( ${SELF_SNI:-0} == 1 )); then svc_disable_stop proxy-oneclick-reality-site || true; fi
   cert_drop_renew_job
   if have certbot; then certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true; fi
   rm -f "$CERT_FULLCHAIN" "$CERT_PRIVKEY" "$SUB_CONF" "$SUB_BODY" "$SUB_CLASH" "$XRAY_CERT_FULL" "$XRAY_CERT_KEY"
@@ -7156,6 +7331,9 @@ cert_issue_flow() {
   local keep_ca keep_scope keep_pub keep_ch keep_names keep_dom
   old_label=$(cert_kind_label)
   cert_plan_request
+  if (( ${SELF_SNI:-0} == 1 )); then
+    [[ $PLAN_KIND == le && $PLAN_DOMAIN == "$SNI" ]] || die "自有域名 SNI 只支持 ${SNI} 的 Let's Encrypt 单域名公开证书；请先切换为普通 SNI，再更换其它证书类型。"
+  fi
   cert_switch_needed && switching=1
   cert_kind_apply "$PLAN_KIND"
   CERT_NAMES=$PLAN_NAMES
@@ -7260,6 +7438,10 @@ cert_rewire_protocols() {
 }
 cert_turn_off() {
   local quiet=${1-} had_cdn=0
+  if (( ${SELF_SNI:-0} == 1 )); then
+    [[ $quiet == quiet ]] || die "当前 REALITY 使用自有域名 SNI，本机 HTTPS 回落依赖这张公开证书。请先用 proxy sni 切换为普通 SNI，再关闭证书。"
+    reality_site_remove
+  fi
   if cdn_wanted; then
     had_cdn=1
     XHTTP_TLS_ENABLED=0
@@ -7306,7 +7488,8 @@ cert_turn_off() {
 }
 cert_remove_files() {
   local had=0
-  [[ -d $CERT_DIR || -d $CERT_LIB || -f $SUB_UNIT || -f $SUB_RC || -f $CERT_TIMER_UNIT || -d /etc/letsencrypt/live/${CERT_NAME} ]] && had=1
+  [[ -d $CERT_DIR || -d $CERT_LIB || -f $SUB_UNIT || -f $SUB_RC || -f $CERT_TIMER_UNIT || -f $REALITY_SITE_UNIT || -f $REALITY_SITE_CONF || -d /etc/letsencrypt/live/${CERT_NAME} ]] && had=1
+  reality_site_remove
   svc_disable_stop proxy-oneclick-sub || true
   if have systemctl; then systemctl disable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || true; fi
   rm -f "$SUB_UNIT" "$SUB_RC" "$CERT_TIMER_UNIT" "$CERT_RENEW_UNIT" "$CERT_CRON"
@@ -9973,6 +10156,7 @@ do_install() {
   # 纯 --land（以及已是落地机且没写 --no-land / --with-land）仍只装落地机。
   # --with-land，或 --land 再加某个节点协议的开启开关，走下面的节点安装并带上落地入站。
   if installing_land_only; then
+    [[ -z $OPT_OWN_SNI ]] || die "--own-sni 不能用于纯落地机。"
     if cert_cli_requested; then
       die "落地机只运行 Shadowsocks 2022，不能申请证书，也不提供订阅。"
     fi
@@ -9988,6 +10172,7 @@ do_install() {
   LAND_MODE=0
   preflight      # decide_nat_mode：命令行 / 菜单设置 / Alpine / 已安装 / 自动检测，端口设置前确定 NAT_MODE
   resolve_mode
+  if (( NAT_MODE )) && [[ -n $OPT_OWN_SNI ]]; then die "--own-sni 需要普通 VPS 模式，NAT 模式不支持。"; fi
   if (( NAT_MODE )) && cdn_cli_requested; then
     cdn_explain nat
     die "请去掉 --xhttp-tls / --ws-tls。不带这两个参数时，安装方式和现在相同。"
@@ -10030,6 +10215,11 @@ do_install() {
   if (( INSTALLED )) && (( ! OPT_AUTO )); then
     warn "检测到已安装。重新安装将保留现有密钥/UUID/密码，仅更新组件与配置。"
     confirm "继续重新安装？" y || return 0
+  fi
+  if (( NAT_MODE && ${SELF_SNI:-0} == 1 )); then
+    warn "切换到 NAT 模式不支持本机 HTTPS 回落，改为重新选择普通 SNI。"
+    reality_site_remove
+    SNI="" SNI_TARGET=""
   fi
 
   pkg_update_upgrade
@@ -10082,7 +10272,7 @@ do_install() {
   save_state
 
   local pqrc=0 redo=n
-  if (( IMPORT_MODE )) && [[ -n $SNI && -z $OPT_SNI ]]; then
+  if (( IMPORT_MODE )) && [[ ${SELF_SNI:-0} != 1 && -n $SNI && -z $OPT_SNI ]]; then
     local sni_res=""
     sni_res=$(sni_probe "$SNI") || true
     if [[ $sni_res == FAIL* ]]; then
@@ -10098,11 +10288,17 @@ do_install() {
     warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），可继续使用，但建议优先选择支持 MLKEM 的目标。"
     redo=y
   fi
-  if [[ -z $SNI || -n $OPT_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新优选 SNI（当前: ${SNI}）？" "$redo"; }; then
-    select_sni
+  if [[ -z $SNI || -n $OPT_SNI || -n $OPT_OWN_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新选择 SNI（当前: ${SNI}）？" "$redo"; }; then
+    select_install_sni
   fi
-  SNI_TARGET="${SNI}:443"
-  mldsa_decide
+  if (( SELF_SNI )); then
+    SNI_TARGET=$(sni_own_pick_target)
+    MLDSA_ON=0
+  else
+    SNI_TARGET="${SNI}:443"
+    [[ -f $REALITY_SITE_UNIT ]] && reality_site_remove
+    mldsa_decide
+  fi
   save_state
 
   ensure_proto_secrets
@@ -10110,6 +10306,12 @@ do_install() {
   if land_in_on && [[ ${FWD_ON:-0} == 1 && -n ${FWD_LINK:-} ]]; then
     land_raw_active || die "原样转发链接无法解析，拒绝按直连安装。"
     land_fwd_check
+  fi
+  local own_cert_prepared=0
+  if (( SELF_SNI )); then
+    setup_cert
+    reality_site_install
+    own_cert_prepared=1
   fi
   if xray_inbound_needed; then
     local rc=0
@@ -10132,7 +10334,6 @@ do_install() {
     info "已关闭 TUIC / AnyTLS，停止 sing-box（密码保留）。"
     svc_disable_stop sing-box
   fi
-  setup_cert
   if (( HY2_ENABLED )); then
     write_hy2_config
     save_state
@@ -10143,6 +10344,7 @@ do_install() {
     save_state
     restart_singbox
   fi
+  (( own_cert_prepared )) || setup_cert
 
   apply_firewall
   land_sync_fwd_rules
@@ -12240,12 +12442,24 @@ menu_change_sni() {
   need_node; mktmp
   detect_ip; detect_geo
   (( NAT_MODE )) || SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
-  local old=$SNI
-  select_sni
-  [[ $SNI == "$old" ]] && { info "SNI 未变化。"; return 0; }
-  SNI_TARGET="${SNI}:443"
-  mldsa_decide
+  local old=$SNI old_self=${SELF_SNI:-0}
+  select_install_sni
+  if [[ $SNI == "$old" && ${SELF_SNI:-0} == "$old_self" ]]; then
+    info "SNI 未变化。"
+    return 0
+  fi
+  if (( SELF_SNI )); then
+    setup_cert
+    SNI_TARGET=$(sni_own_pick_target)
+    reality_site_install
+    MLDSA_ON=0
+  else
+    SNI_TARGET="${SNI}:443"
+    (( old_self )) && reality_site_remove
+    mldsa_decide
+  fi
   apply_all
+  if tls_present_real; then cert_start_sub; fi
   ( trap - ERR; set +e; reality_selftest ) || true
   if tls_present_real; then
     ok "SNI 已由 ${old} 更换为 ${SNI}。REALITY / XHTTP / Trojan 需要更新链接。Hysteria2 / TUIC / AnyTLS 仍使用 ${CERT_DOMAIN} 的证书。"
@@ -14263,6 +14477,8 @@ usage() {
   --outbound <策略>   出站：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6 / auto 按检测
                       内网 ULA（fc00::/7）若 NAT66 到公网 IPv6，按双栈，可选 IPv6优先
   --sni <域名>        指定 REALITY 目标网站（会进行合规检测）
+  --own-sni <域名>    使用解析到本机的自有域名作为 SNI；自动申请 Let's Encrypt 证书，
+                      并在 127.0.0.1 上启动 HTTPS 回落站（NAT 模式不可用）
   --force-sni         与 --sni 一起使用：检测不通过也强制使用
   --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
@@ -14490,6 +14706,14 @@ parse_args() {
         ;;
       --sni) [[ -n ${2-} ]] || die "--sni 需要参数"; OPT_SNI=$2; shift ;;
       --sni=*) OPT_SNI=${1#*=} ;;
+      --own-sni)
+        [[ -n ${2-} ]] || die "--own-sni 需要参数"
+        OPT_OWN_SNI=${2#https://}; OPT_OWN_SNI=${OPT_OWN_SNI%%/*}; OPT_OWN_SNI=${OPT_OWN_SNI,,}; OPT_OWN_SNI=${OPT_OWN_SNI%.}
+        cert_domain_syntax "$OPT_OWN_SNI" || die "--own-sni 不是可用的域名: $2（不能是 IP）"
+        shift ;;
+      --own-sni=*)
+        OPT_OWN_SNI=${1#*=}; OPT_OWN_SNI=${OPT_OWN_SNI#https://}; OPT_OWN_SNI=${OPT_OWN_SNI%%/*}; OPT_OWN_SNI=${OPT_OWN_SNI,,}; OPT_OWN_SNI=${OPT_OWN_SNI%.}
+        cert_domain_syntax "$OPT_OWN_SNI" || die "--own-sni 不是可用的域名: ${OPT_OWN_SNI}（不能是 IP）" ;;
       --force-sni) OPT_FORCE_SNI=1 ;;
       --scan) OPT_SCAN=1 ;;
       --port) is_port_opt "${2-}" || die "--port 参数无效"; OPT_PORT=$2; shift ;;
@@ -14815,6 +15039,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
+  [[ -z $OPT_ACTION && -n $OPT_OWN_SNI ]] && OPT_ACTION=install
   if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_WITH_LAND || -n $OPT_LAND_PORT || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || -n $OPT_XRAY_VER || -n $OPT_HY2_VER || -n $OPT_SINGBOX_VER || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi

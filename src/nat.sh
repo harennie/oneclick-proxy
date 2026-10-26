@@ -476,6 +476,7 @@ do_install() {
   # 纯 --land（以及已是落地机且没写 --no-land / --with-land）仍只装落地机。
   # --with-land，或 --land 再加某个节点协议的开启开关，走下面的节点安装并带上落地入站。
   if installing_land_only; then
+    [[ -z $OPT_OWN_SNI ]] || die "--own-sni 不能用于纯落地机。"
     if cert_cli_requested; then
       die "落地机只运行 Shadowsocks 2022，不能申请证书，也不提供订阅。"
     fi
@@ -491,6 +492,7 @@ do_install() {
   LAND_MODE=0
   preflight      # decide_nat_mode：命令行 / 菜单设置 / Alpine / 已安装 / 自动检测，端口设置前确定 NAT_MODE
   resolve_mode
+  if (( NAT_MODE )) && [[ -n $OPT_OWN_SNI ]]; then die "--own-sni 需要普通 VPS 模式，NAT 模式不支持。"; fi
   if (( NAT_MODE )) && cdn_cli_requested; then
     cdn_explain nat
     die "请去掉 --xhttp-tls / --ws-tls。不带这两个参数时，安装方式和现在相同。"
@@ -533,6 +535,11 @@ do_install() {
   if (( INSTALLED )) && (( ! OPT_AUTO )); then
     warn "检测到已安装。重新安装将保留现有密钥/UUID/密码，仅更新组件与配置。"
     confirm "继续重新安装？" y || return 0
+  fi
+  if (( NAT_MODE && ${SELF_SNI:-0} == 1 )); then
+    warn "切换到 NAT 模式不支持本机 HTTPS 回落，改为重新选择普通 SNI。"
+    reality_site_remove
+    SNI="" SNI_TARGET=""
   fi
 
   pkg_update_upgrade
@@ -585,7 +592,7 @@ do_install() {
   save_state
 
   local pqrc=0 redo=n
-  if (( IMPORT_MODE )) && [[ -n $SNI && -z $OPT_SNI ]]; then
+  if (( IMPORT_MODE )) && [[ ${SELF_SNI:-0} != 1 && -n $SNI && -z $OPT_SNI ]]; then
     local sni_res=""
     sni_res=$(sni_probe "$SNI") || true
     if [[ $sni_res == FAIL* ]]; then
@@ -601,11 +608,17 @@ do_install() {
     warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），可继续使用，但建议优先选择支持 MLKEM 的目标。"
     redo=y
   fi
-  if [[ -z $SNI || -n $OPT_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新优选 SNI（当前: ${SNI}）？" "$redo"; }; then
-    select_sni
+  if [[ -z $SNI || -n $OPT_SNI || -n $OPT_OWN_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新选择 SNI（当前: ${SNI}）？" "$redo"; }; then
+    select_install_sni
   fi
-  SNI_TARGET="${SNI}:443"
-  mldsa_decide
+  if (( SELF_SNI )); then
+    SNI_TARGET=$(sni_own_pick_target)
+    MLDSA_ON=0
+  else
+    SNI_TARGET="${SNI}:443"
+    [[ -f $REALITY_SITE_UNIT ]] && reality_site_remove
+    mldsa_decide
+  fi
   save_state
 
   ensure_proto_secrets
@@ -613,6 +626,12 @@ do_install() {
   if land_in_on && [[ ${FWD_ON:-0} == 1 && -n ${FWD_LINK:-} ]]; then
     land_raw_active || die "原样转发链接无法解析，拒绝按直连安装。"
     land_fwd_check
+  fi
+  local own_cert_prepared=0
+  if (( SELF_SNI )); then
+    setup_cert
+    reality_site_install
+    own_cert_prepared=1
   fi
   if xray_inbound_needed; then
     local rc=0
@@ -635,7 +654,6 @@ do_install() {
     info "已关闭 TUIC / AnyTLS，停止 sing-box（密码保留）。"
     svc_disable_stop sing-box
   fi
-  setup_cert
   if (( HY2_ENABLED )); then
     write_hy2_config
     save_state
@@ -646,6 +664,7 @@ do_install() {
     save_state
     restart_singbox
   fi
+  (( own_cert_prepared )) || setup_cert
 
   apply_firewall
   land_sync_fwd_rules
