@@ -386,7 +386,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;742:src/os.sh:1;1251:src/tune.sh:1;2051:src/xray.sh:1;4160:src/hy2.sh:1;4299:src/firewall.sh:1;5584:src/cert.sh:1;7747:src/cdn.sh:1;8732:src/link.sh:1;9125:src/singbox.sh:1;9709:src/nat.sh:1;10398:src/selftest.sh:1;10543:src/land.sh:1;12454:src/menu.sh:1;13063:src/route.sh:1;13578:src/export.sh:1;13794:src/doctor.sh:1;14193:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;742:src/os.sh:1;1251:src/tune.sh:1;2051:src/xray.sh:1;4160:src/hy2.sh:1;4299:src/firewall.sh:1;5584:src/cert.sh:1;7747:src/cdn.sh:1;8732:src/link.sh:1;9125:src/singbox.sh:1;9709:src/nat.sh:1;10397:src/selftest.sh:1;10542:src/land.sh:1;12453:src/menu.sh:1;13062:src/route.sh:1;13577:src/export.sh:1;13793:src/doctor.sh:1;14192:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -10299,7 +10299,7 @@ do_install() {
   fi
   save_state
 
-  local pqrc=0 redo=n
+  local pqrc=0
   if (( IMPORT_MODE )) && [[ ${SELF_SNI:-0} != 1 && -n $SNI && -z $OPT_SNI ]]; then
     local sni_res=""
     sni_res=$(sni_probe "$SNI") || true
@@ -10314,7 +10314,6 @@ do_install() {
   if (( pqrc == 1 )); then
     # 不支持 MLKEM 只是偏好问题：给出警告，交互模式默认建议重新优选，自动模式保留原 SNI
     warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），可继续使用，但建议优先选择支持 MLKEM 的目标。"
-    redo=y
   fi
   # 每次交互安装都重新进入 SNI 引导，避免卸载后从菜单重装时沿用旧内存状态。
   if install_should_select_sni; then
