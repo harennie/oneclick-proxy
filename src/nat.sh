@@ -591,7 +591,7 @@ do_install() {
   fi
   save_state
 
-  local pqrc=0 redo=n
+  local pqrc=0
   if (( IMPORT_MODE )) && [[ ${SELF_SNI:-0} != 1 && -n $SNI && -z $OPT_SNI ]]; then
     local sni_res=""
     sni_res=$(sni_probe "$SNI") || true
@@ -606,9 +606,9 @@ do_install() {
   if (( pqrc == 1 )); then
     # 不支持 MLKEM 只是偏好问题：给出警告，交互模式默认建议重新优选，自动模式保留原 SNI
     warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），可继续使用，但建议优先选择支持 MLKEM 的目标。"
-    redo=y
   fi
-  if [[ -z $SNI || -n $OPT_SNI || -n $OPT_OWN_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新选择 SNI（当前: ${SNI}）？" "$redo"; }; then
+  # 每次交互安装都重新进入 SNI 引导，避免卸载后从菜单重装时沿用旧内存状态。
+  if install_should_select_sni; then
     select_install_sni
   fi
   if (( SELF_SNI )); then

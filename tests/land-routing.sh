@@ -86,6 +86,14 @@ if [[ $OPT_OWN_SNI != node.example.com || $OPT_AUTO != 1 || -n $OPT_SNI ]]; then
 fi
 printf 'ok parse --own-sni\n'
 
+OPT_AUTO=0 OPT_SNI="" OPT_OWN_SNI="" SNI="www.example.com"
+if ! install_should_select_sni; then fail "交互重装应重新进入 SNI 引导"; fi
+OPT_AUTO=1 OPT_SNI="" OPT_OWN_SNI="" SNI="www.example.com"
+if install_should_select_sni; then fail "--auto 不应进入 SNI 交互引导"; fi
+OPT_AUTO=1 SNI=""
+if ! install_should_select_sni; then fail "--auto 首次安装应进入 SNI 选择流程"; fi
+printf 'ok SNI selection flow\n'
+
 reset_opts
 parse_args --own-sni=https://NODE.example.com/path
 if [[ $OPT_OWN_SNI != node.example.com || $OPT_ACTION != install ]]; then fail "normalize --own-sni URL"; fi
