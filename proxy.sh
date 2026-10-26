@@ -386,7 +386,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;742:src/os.sh:1;1251:src/tune.sh:1;2051:src/xray.sh:1;4156:src/hy2.sh:1;4295:src/firewall.sh:1;5580:src/cert.sh:1;7719:src/cdn.sh:1;8704:src/link.sh:1;9097:src/singbox.sh:1;9681:src/nat.sh:1;10369:src/selftest.sh:1;10514:src/land.sh:1;12425:src/menu.sh:1;13034:src/route.sh:1;13549:src/export.sh:1;13765:src/doctor.sh:1;14164:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;742:src/os.sh:1;1251:src/tune.sh:1;2051:src/xray.sh:1;4156:src/hy2.sh:1;4295:src/firewall.sh:1;5580:src/cert.sh:1;7721:src/cdn.sh:1;8706:src/link.sh:1;9099:src/singbox.sh:1;9683:src/nat.sh:1;10371:src/selftest.sh:1;10516:src/land.sh:1;12427:src/menu.sh:1;13036:src/route.sh:1;13551:src/export.sh:1;13767:src/doctor.sh:1;14166:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -6334,7 +6334,9 @@ RC
 reality_site_install() {
   (( ${SELF_SNI:-0} == 1 )) || return 0
   [[ ${INIT_SYS:-} == systemd ]] || die "自有域名 SNI 的 HTTPS 回落服务目前需要 systemd。"
-  cert_is_public && cert_name_covered "$CERT_FULLCHAIN" "$SNI" || die "自有域名 SNI 需要覆盖 ${SNI} 的公开证书。"
+  if ! cert_is_public || ! cert_name_covered "$CERT_FULLCHAIN" "$SNI"; then
+    die "自有域名 SNI 需要覆盖 ${SNI} 的公开证书。"
+  fi
   [[ ${CERT_DOMAIN} == "$SNI" ]] || die "自有域名 SNI 的证书域名必须与 ${SNI} 相同。"
   [[ ${SNI_TARGET} =~ ^127\.0\.0\.1:([0-9]+)$ ]] || die "自有域名 SNI 的本机回落地址无效: ${SNI_TARGET}"
   local port=${BASH_REMATCH[1]} py

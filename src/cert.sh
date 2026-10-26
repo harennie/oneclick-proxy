@@ -755,7 +755,9 @@ RC
 reality_site_install() {
   (( ${SELF_SNI:-0} == 1 )) || return 0
   [[ ${INIT_SYS:-} == systemd ]] || die "自有域名 SNI 的 HTTPS 回落服务目前需要 systemd。"
-  cert_is_public && cert_name_covered "$CERT_FULLCHAIN" "$SNI" || die "自有域名 SNI 需要覆盖 ${SNI} 的公开证书。"
+  if ! cert_is_public || ! cert_name_covered "$CERT_FULLCHAIN" "$SNI"; then
+    die "自有域名 SNI 需要覆盖 ${SNI} 的公开证书。"
+  fi
   [[ ${CERT_DOMAIN} == "$SNI" ]] || die "自有域名 SNI 的证书域名必须与 ${SNI} 相同。"
   [[ ${SNI_TARGET} =~ ^127\.0\.0\.1:([0-9]+)$ ]] || die "自有域名 SNI 的本机回落地址无效: ${SNI_TARGET}"
   local port=${BASH_REMATCH[1]} py
