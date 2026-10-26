@@ -314,6 +314,8 @@ usage() {
   --outbound <策略>   出站：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6 / auto 按检测
                       内网 ULA（fc00::/7）若 NAT66 到公网 IPv6，按双栈，可选 IPv6优先
   --sni <域名>        指定 REALITY 目标网站（会进行合规检测）
+  --own-sni <域名>    使用解析到本机的自有域名作为 SNI；自动申请 Let's Encrypt 证书，
+                      并在 127.0.0.1 上启动 HTTPS 回落站（NAT 模式不可用）
   --force-sni         与 --sni 一起使用：检测不通过也强制使用
   --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
@@ -541,6 +543,14 @@ parse_args() {
         ;;
       --sni) [[ -n ${2-} ]] || die "--sni 需要参数"; OPT_SNI=$2; shift ;;
       --sni=*) OPT_SNI=${1#*=} ;;
+      --own-sni)
+        [[ -n ${2-} ]] || die "--own-sni 需要参数"
+        OPT_OWN_SNI=${2#https://}; OPT_OWN_SNI=${OPT_OWN_SNI%%/*}; OPT_OWN_SNI=${OPT_OWN_SNI,,}; OPT_OWN_SNI=${OPT_OWN_SNI%.}
+        cert_domain_syntax "$OPT_OWN_SNI" || die "--own-sni 不是可用的域名: $2（不能是 IP）"
+        shift ;;
+      --own-sni=*)
+        OPT_OWN_SNI=${1#*=}; OPT_OWN_SNI=${OPT_OWN_SNI#https://}; OPT_OWN_SNI=${OPT_OWN_SNI%%/*}; OPT_OWN_SNI=${OPT_OWN_SNI,,}; OPT_OWN_SNI=${OPT_OWN_SNI%.}
+        cert_domain_syntax "$OPT_OWN_SNI" || die "--own-sni 不是可用的域名: ${OPT_OWN_SNI}（不能是 IP）" ;;
       --force-sni) OPT_FORCE_SNI=1 ;;
       --scan) OPT_SCAN=1 ;;
       --port) is_port_opt "${2-}" || die "--port 参数无效"; OPT_PORT=$2; shift ;;
@@ -866,6 +876,7 @@ parse_args() {
     shift
   done
   # 仅传了安装相关参数时默认执行安装
+  [[ -z $OPT_ACTION && -n $OPT_OWN_SNI ]] && OPT_ACTION=install
   if [[ -z $OPT_ACTION ]] && { (( OPT_AUTO )) || [[ ${OPT_FW_SET:-0} == 1 ]] || [[ -n $OPT_SNI || -n $OPT_PORT || -n $OPT_HY2 || -n $OPT_HOP || -n $OPT_NAT || -n $OPT_NAT_EXT || -n $OPT_LAND || -n $OPT_WITH_LAND || -n $OPT_LAND_PORT || -n $OPT_REALITY || -n $OPT_XHTTP || -n $OPT_XHTTP_ON_443 || -n $OPT_XHTTP_PORT || -n $OPT_TROJAN || -n $OPT_TROJAN_PORT || -n $OPT_TUIC || -n $OPT_TUIC_PORT || -n $OPT_ANYTLS || -n $OPT_ANYTLS_PORT || -n $OPT_XHTTP_TLS || -n $OPT_XHTTP_TLS_PORT || -n $OPT_WS || -n $OPT_WS_PORT || -n $OPT_VLESS_ENC || -n $OPT_CERT_DOMAIN || -n $OPT_CERT_KIND || -n $OPT_CERT_NAMES || -n $OPT_CF_ORIGIN_KEY || -n $OPT_ZEROSSL_KID || -n $OPT_XRAY_VER || -n $OPT_HY2_VER || -n $OPT_SINGBOX_VER || $OPT_CERT == 1 ]]; }; then
     OPT_ACTION=install
   fi
