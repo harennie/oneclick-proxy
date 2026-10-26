@@ -112,7 +112,6 @@ cert_normalize_domain() {
 sub_port_blocked() {
   local p=$1
   [[ $p == 80 ]] && return 0
-  (( ${SELF_SNI:-0} == 1 )) && [[ ${SNI_TARGET##*:} == "$p" ]] && return 0
   (( ${REALITY_ENABLED:-0} == 1 )) && [[ $p == "$XRAY_PORT" ]] && return 0
   (( ${XHTTP_ENABLED:-0} == 1 )) && [[ $p == "$XHTTP_PORT" ]] && return 0
   (( ${TROJAN_ENABLED:-0} == 1 )) && [[ $p == "$TROJAN_PORT" ]] && return 0
@@ -318,29 +317,18 @@ except ImportError:  # Python 3.6
 def load_conf(path):
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
-    for key in ("port", "cert", "key"):
+    for key in ("port", "cert", "key", "token", "body", "clash"):
         if key not in data:
             raise SystemExit("missing config field")
-    mode = data.get("mode", "sub")
-    if mode == "sub":
-        for key in ("token", "body", "clash"):
-            if key not in data:
-                raise SystemExit("missing config field")
-        token = str(data["token"])
-        if not token or "/" in token or ".." in token:
-            raise SystemExit("invalid token")
-        data["token"] = token
-    elif mode != "site":
-        raise SystemExit("invalid mode")
-    data["mode"] = mode
+    token = str(data["token"])
+    if not token or "/" in token or ".." in token:
+        raise SystemExit("invalid token")
+    data["token"] = token
     return data
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-
-    def version_string(self):
-        return "oneclick-proxy"
 
     def do_GET(self):
         self._reply(True)
@@ -352,39 +340,6 @@ class Handler(BaseHTTPRequestHandler):
         self._empty(404)
 
     def _reply(self, send_body):
-        if self.server.conf["mode"] == "site":
-            data = (b"<!doctype html><html lang=\"en\"><head>"
-                    b"<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                    b"<meta name=\"description\" content=\"A small index of public sample files for testing and reference.\">"
-                    b"<meta name=\"theme-color\" content=\"#f5f7fb\"><title>Public Sample Downloads</title>"
-                    b"<style>"
-                    b":root{color-scheme:light;--ink:#172033;--muted:#657086;--line:#dfe5ee;--accent:#2f6fed;--wash:#f5f7fb}"
-                    b"*{box-sizing:border-box}body{margin:0;background:var(--wash);color:var(--ink);font:16px/1.6 system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}"
-                    b"main{max-width:960px;margin:auto;padding:72px 24px 56px}header{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-bottom:88px}"
-                    b".brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:.02em}.mark{width:34px;height:34px;border-radius:10px;background:var(--accent);display:grid;place-items:center;color:white;font-weight:800}"
-                    b"nav a{color:var(--muted);text-decoration:none;margin-left:22px}nav a:hover{color:var(--accent)}.eyebrow{color:var(--accent);font-size:.8rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase}"
-                    b"h1{font-size:clamp(2.4rem,6vw,4.8rem);line-height:1.05;letter-spacing:-.04em;max-width:720px;margin:16px 0 24px}p{max-width:620px;color:var(--muted);font-size:1.1rem}"
-                    b".actions{display:flex;flex-wrap:wrap;gap:12px;margin:32px 0 76px}.button{display:inline-block;padding:11px 17px;border:1px solid var(--line);border-radius:8px;color:var(--ink);text-decoration:none;background:white}.button.primary{background:var(--accent);border-color:var(--accent);color:white}"
-                    b"section{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;border-top:1px solid var(--line);padding-top:28px}.item{padding-right:18px}.item strong{display:block;margin-bottom:6px}.item span{color:var(--muted);font-size:.95rem}.downloads{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin:0 0 48px}.download{background:white;border:1px solid var(--line);border-radius:12px;padding:22px;display:flex;flex-direction:column;min-height:190px}.download h2{font-size:1.15rem;margin:0 0 8px}.download p{font-size:.95rem;margin:0 0 18px}.download a{margin-top:auto;align-self:flex-start;color:var(--accent);font-weight:700;text-decoration:none}.download a:hover{text-decoration:underline}.meta{color:var(--muted);font-size:.82rem;margin-top:8px}footer{margin-top:72px;color:var(--muted);font-size:.9rem}@media(max-width:680px){main{padding-top:32px}header{margin-bottom:64px}nav{display:none}.downloads{grid-template-columns:1fr}section{grid-template-columns:1fr;gap:24px}.actions{margin-bottom:56px}}"
-                    b"</style></head><body><main><header><div class=\"brand\"><span class=\"mark\">S</span><span>Sample Files</span></div><nav><a href=\"/\">Home</a><a href=\"/#downloads\">Downloads</a><a href=\"/#notes\">References</a></nav></header>"
-                    b"<div class=\"eyebrow\">Public file index</div><h1>Sample files for testing and reference.</h1>"
-                    b"<p>A small catalog of public PDF, video, and technical reference files. Downloads are hosted by their respective publishers; this page links directly to the source.</p>"
-                    b"<div class=\"actions\"><a class=\"button primary\" href=\"/#downloads\">Browse downloads</a><a class=\"button\" href=\"/#notes\">Read the notes</a></div>"
-                    b"<div class=\"downloads\" id=\"downloads\"><article class=\"download\"><h2>W3C sample PDF</h2><p>A public document for testing browser downloads and PDF handling.</p><a href=\"https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf\" rel=\"noopener noreferrer\">Open PDF &#8599;</a><span class=\"meta\">W3C test file &#183; PDF</span></article><article class=\"download\"><h2>Sample MP4 video</h2><p>A short public video sample for testing media downloads and playback.</p><a href=\"https://download.samplelib.com/mp4/sample-5s.mp4\" rel=\"noopener noreferrer\">Open video &#8599;</a><span class=\"meta\">Samplelib &#183; MP4</span></article></div>"
-                    b"<section id=\"notes\"><div class=\"item\"><strong>RFC 9110</strong><span>HTTP Semantics, published by the RFC Editor.</span><a href=\"https://www.rfc-editor.org/rfc/rfc9110.txt\" rel=\"noopener noreferrer\">Read plain text &#8599;</a></div><div class=\"item\"><strong>Original sources</strong><span>Each file remains hosted by its original publisher.</span></div><div class=\"item\"><strong>File formats</strong><span>PDF, MP4 video, and plain-text RFC reference.</span></div></section>"
-                    b"<footer>Public sample links &#183; Files remain hosted by their original publishers.</footer></main></body></html>")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "public, max-age=300")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; frame-ancestors 'none'")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            if send_body:
-                self.wfile.write(data)
-            return
         path = self.path.split("?", 1)[0]
         if path.endswith("/") and path != "/":
             path = path[:-1]
@@ -436,11 +391,7 @@ class TLSServer(_HTTPServer):
         self.socket = context.wrap_socket(self.socket, server_side=True)
 
 
-def make_server(port, context, site=False):
-    if site:
-        class LocalV4(TLSServer):
-            address_family = socket.AF_INET
-        return LocalV4(("127.0.0.1", port), Handler, context)
+def make_server(port, context):
     last_err = None
     try:
         class V6(TLSServer):
@@ -473,7 +424,7 @@ def main():
     else:
         ctx.options |= getattr(ssl, "OP_NO_TLSv1", 0) | getattr(ssl, "OP_NO_TLSv1_1", 0)
     ctx.load_cert_chain(conf["cert"], conf["key"])
-    httpd = make_server(int(conf["port"]), ctx, conf["mode"] == "site")
+    httpd = make_server(int(conf["port"]), ctx)
     httpd.conf = conf
     httpd.serve_forever()
 
@@ -485,8 +436,6 @@ PY
 }
 write_cert_hook() {
   mkdir -p "$CERT_LIB"
-  local restart_site=0
-  (( ${SELF_SNI:-0} == 1 )) && restart_site=1
   cat >"$CERT_HOOK" <<EOF
 #!/bin/sh
 # 由 proxy-oneclick 生成。certbot 续期成功后调用。
@@ -495,7 +444,6 @@ write_cert_hook() {
 src="/etc/letsencrypt/live/${CERT_NAME}"
 dst="${CERT_DIR}"
 grp="${CERT_GROUP}"
-restart_site="${restart_site}"
 case \${RENEWED_LINEAGE:-} in
   "") ;;
   */${CERT_NAME}|*/${CERT_NAME}/) ;;
@@ -521,9 +469,8 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
   systemctl try-restart hysteria-server.service >/dev/null 2>&1 || true
   systemctl try-restart sing-box.service >/dev/null 2>&1 || true
   systemctl try-restart proxy-oneclick-sub.service >/dev/null 2>&1 || true
-  [ "\$restart_site" = 1 ] && systemctl try-restart proxy-oneclick-reality-site.service >/dev/null 2>&1 || true
 elif command -v rc-service >/dev/null 2>&1; then
-  for s in hysteria-server sing-box proxy-oneclick-sub proxy-oneclick-reality-site; do
+  for s in hysteria-server sing-box proxy-oneclick-sub; do
     if [ -x "/etc/init.d/\$s" ]; then rc-service "\$s" restart >/dev/null 2>&1 || true; fi
   done
 fi
@@ -774,74 +721,6 @@ RC
     systemctl daemon-reload
   fi
 }
-reality_site_install() {
-  (( ${SELF_SNI:-0} == 1 )) || return 0
-  [[ ${INIT_SYS:-} == systemd ]] || die "自有域名 SNI 的 HTTPS 回落服务目前需要 systemd。"
-  if ! cert_is_public || ! cert_name_covered "$CERT_FULLCHAIN" "$SNI"; then
-    die "自有域名 SNI 需要覆盖 ${SNI} 的公开证书。"
-  fi
-  [[ ${CERT_DOMAIN} == "$SNI" ]] || die "自有域名 SNI 的证书域名必须与 ${SNI} 相同。"
-  [[ ${SNI_TARGET} =~ ^127\.0\.0\.1:([0-9]+)$ ]] || die "自有域名 SNI 的本机回落地址无效: ${SNI_TARGET}"
-  local port=${BASH_REMATCH[1]} py
-  if ! svc_active proxy-oneclick-reality-site && port_in_use tcp "$port"; then
-    die "本机回落端口 ${port} 已被其它服务占用；请释放端口后重试，避免 REALITY target 与回落服务不一致。"
-  fi
-  cert_grant_readers
-  write_sub_python
-  py=$(command -v python3)
-  [[ -n $py ]] || die "未找到 python3，不能启动 REALITY HTTPS 回落服务。"
-  jq -n --argjson port "$port" --arg cert "$CERT_FULLCHAIN" --arg key "$CERT_PRIVKEY" \
-    '{mode:"site",port:$port,cert:$cert,key:$key}' >"${REALITY_SITE_CONF}.tmp"
-  chown "root:${CERT_GROUP}" "${REALITY_SITE_CONF}.tmp"
-  chmod 640 "${REALITY_SITE_CONF}.tmp"
-  mv -f "${REALITY_SITE_CONF}.tmp" "$REALITY_SITE_CONF"
-  cat >"$REALITY_SITE_UNIT" <<EOF
-# 由 proxy-oneclick 生成。仅供本机 REALITY 回落使用。
-[Unit]
-Description=proxy-oneclick REALITY HTTPS fallback
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SUB_USER}
-Group=${CERT_GROUP}
-WorkingDirectory=/
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-RestrictAddressFamilies=AF_INET AF_UNIX
-ExecStart=${py} ${SUB_PY} ${REALITY_SITE_CONF}
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable proxy-oneclick-reality-site.service >/dev/null
-  systemctl restart proxy-oneclick-reality-site.service >/dev/null
-  local ready=0
-  for _ in {1..10}; do
-    if curl --noproxy '*' --resolve "${SNI}:${port}:127.0.0.1" --connect-timeout 2 -fsS -o /dev/null "https://${SNI}:${port}/"; then
-      ready=1
-      break
-    fi
-    sleep 1
-  done
-  if (( ! ready )); then
-    journalctl -u proxy-oneclick-reality-site.service -n 20 --no-pager >&2 || true
-    die "本机 HTTPS 回落服务自检失败（${SNI_TARGET}）。"
-  fi
-  ok "REALITY 自有域名 HTTPS 回落已就绪：${SNI_TARGET}（仅监听 127.0.0.1）。"
-}
-reality_site_remove() {
-  svc_disable_stop proxy-oneclick-reality-site || true
-  rm -f "$REALITY_SITE_UNIT" "$REALITY_SITE_CONF" "${REALITY_SITE_CONF}.tmp"
-  sd_reload
-  SELF_SNI=0
-}
 write_renew_job() {
   local bin; bin=$(command -v certbot)
   [[ -n $bin ]] || die "未找到 certbot，无法安排续期。"
@@ -918,7 +797,6 @@ cert_start_sub() {
   cert_write_sub_conf
   cert_write_bodies
   write_sub_service
-  reality_site_install
   if cert_renew_unattended; then write_renew_job
   else
     cert_drop_renew_job
@@ -1536,7 +1414,6 @@ cert_switch_needed() {
 cert_retire_for_switch() {
   info "正在关闭当前证书，随后申请另一种。REALITY 的端口、密钥和伪装站点都不变。"
   svc_disable_stop proxy-oneclick-sub || true
-  if (( ${SELF_SNI:-0} == 1 )); then svc_disable_stop proxy-oneclick-reality-site || true; fi
   cert_drop_renew_job
   if have certbot; then certbot delete --cert-name "$CERT_NAME" --non-interactive >/dev/null 2>&1 || true; fi
   rm -f "$CERT_FULLCHAIN" "$CERT_PRIVKEY" "$SUB_CONF" "$SUB_BODY" "$SUB_CLASH" "$XRAY_CERT_FULL" "$XRAY_CERT_KEY"
@@ -1776,9 +1653,6 @@ cert_issue_flow() {
   local keep_ca keep_scope keep_pub keep_ch keep_names keep_dom
   old_label=$(cert_kind_label)
   cert_plan_request
-  if (( ${SELF_SNI:-0} == 1 )); then
-    [[ $PLAN_KIND == le && $PLAN_DOMAIN == "$SNI" ]] || die "自有域名 SNI 只支持 ${SNI} 的 Let's Encrypt 单域名公开证书；请先切换为普通 SNI，再更换其它证书类型。"
-  fi
   cert_switch_needed && switching=1
   cert_kind_apply "$PLAN_KIND"
   CERT_NAMES=$PLAN_NAMES
@@ -1883,10 +1757,6 @@ cert_rewire_protocols() {
 }
 cert_turn_off() {
   local quiet=${1-} had_cdn=0
-  if (( ${SELF_SNI:-0} == 1 )); then
-    [[ $quiet == quiet ]] || die "当前 REALITY 使用自有域名 SNI，本机 HTTPS 回落依赖这张公开证书。请先用 proxy sni 切换为普通 SNI，再关闭证书。"
-    reality_site_remove
-  fi
   if cdn_wanted; then
     had_cdn=1
     XHTTP_TLS_ENABLED=0
@@ -1933,8 +1803,7 @@ cert_turn_off() {
 }
 cert_remove_files() {
   local had=0
-  [[ -d $CERT_DIR || -d $CERT_LIB || -f $SUB_UNIT || -f $SUB_RC || -f $CERT_TIMER_UNIT || -f $REALITY_SITE_UNIT || -f $REALITY_SITE_CONF || -d /etc/letsencrypt/live/${CERT_NAME} ]] && had=1
-  reality_site_remove
+  [[ -d $CERT_DIR || -d $CERT_LIB || -f $SUB_UNIT || -f $SUB_RC || -f $CERT_TIMER_UNIT || -d /etc/letsencrypt/live/${CERT_NAME} ]] && had=1
   svc_disable_stop proxy-oneclick-sub || true
   if have systemctl; then systemctl disable --now proxy-oneclick-cert.timer >/dev/null 2>&1 || true; fi
   rm -f "$SUB_UNIT" "$SUB_RC" "$CERT_TIMER_UNIT" "$CERT_RENEW_UNIT" "$CERT_CRON"
