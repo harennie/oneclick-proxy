@@ -386,7 +386,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;742:src/os.sh:1;1251:src/tune.sh:1;2051:src/xray.sh:1;4160:src/hy2.sh:1;4299:src/firewall.sh:1;5584:src/cert.sh:1;7747:src/cdn.sh:1;8732:src/link.sh:1;9125:src/singbox.sh:1;9709:src/nat.sh:1;10397:src/selftest.sh:1;10542:src/land.sh:1;12453:src/menu.sh:1;13062:src/route.sh:1;13577:src/export.sh:1;13793:src/doctor.sh:1;14192:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;742:src/os.sh:1;1251:src/tune.sh:1;2051:src/xray.sh:1;4171:src/hy2.sh:1;4310:src/firewall.sh:1;5595:src/cert.sh:1;7758:src/cdn.sh:1;8743:src/link.sh:1;9136:src/singbox.sh:1;9720:src/nat.sh:1;10408:src/selftest.sh:1;10553:src/land.sh:1;12464:src/menu.sh:1;13073:src/route.sh:1;13588:src/export.sh:1;13804:src/doctor.sh:1;14203:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -3940,7 +3940,7 @@ singbox_apply_ip_strategy() { # $1 临时配置。TUIC / AnyTLS 走 sing-box 的
 # NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
 PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
 
-# 配置只给服务进程读：root 拥有，该用户主组 640。
+# 配置只给服务进程读：root 拥有，该用户主组 640。父目录也必须允许该组遍历。
 own_svc_config() { # $1 文件 $2 运行用户
   local f=$1 user=$2 grp=root
   if id "$user" >/dev/null 2>&1; then
@@ -3950,6 +3950,16 @@ own_svc_config() { # $1 文件 $2 运行用户
   fi
   chown "root:${grp}" "$f" || die "无法设置 ${f} 的属主，${user} 将读不到配置。"
   chmod 640 "$f" || die "无法设置 ${f} 的权限。"
+}
+own_svc_config_dir() { # $1 目录 $2 运行用户
+  local d=$1 user=$2 grp=root
+  if id "$user" >/dev/null 2>&1; then
+    grp=$(id -gn "$user")
+  elif [[ $user == nobody ]]; then
+    grp=nogroup
+  fi
+  chown "root:${grp}" "$d" || die "无法设置 ${d} 的属主，${user} 将无法遍历配置目录。"
+  chmod 710 "$d" || die "无法设置 ${d} 的权限，${user} 将无法遍历配置目录。"
 }
 xray_unit_user() { # $1 unit。没有 User= 时按 nobody（与自建服务一致）。
   local unit=${1:-$XRAY_UNIT} u=""
@@ -4112,6 +4122,7 @@ write_xray_config() {
     xu=$(xray_unit_user "$XRAY_UNIT")
     warn "系统没有 nobody 用户，已按 Xray 服务用户 ${xu} 设置配置权限。"
   fi
+  own_svc_config_dir "$(dirname "$XRAY_CONF")" "$xu"
   own_svc_config "$tmp" "$xu"
   if [[ -f $XRAY_CONF ]]; then mkdir -p "$BACKUP_DIR"; cp -a "$XRAY_CONF" "${BACKUP_DIR}/xray-config.json.bak" 2>/dev/null || true; fi
   mv -f "$tmp" "$XRAY_CONF"
