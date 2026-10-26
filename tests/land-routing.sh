@@ -9,6 +9,19 @@ trap - ERR INT TERM
 
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 
+if id nobody >/dev/null 2>&1; then
+  (
+    calls=()
+    chown() { calls+=("chown:$*"); }
+    chmod() { calls+=("chmod:$*"); }
+    own_svc_config_dir /tmp/xray nobody
+    group=$(id -gn nobody)
+    [[ ${calls[0]} == "chown:root:${group} /tmp/xray" ]] || fail "Xray config directory owner/group"
+    [[ ${calls[1]} == "chmod:710 /tmp/xray" ]] || fail "Xray config directory mode"
+  )
+  printf 'ok Xray config directory permissions\n'
+fi
+
 reset_opts() {
   OPT_LAND="" OPT_WITH_LAND="" OPT_REALITY="" OPT_HY2="" OPT_XHTTP="" OPT_TROJAN=""
   OPT_TUIC="" OPT_ANYTLS="" OPT_XHTTP_TLS="" OPT_WS=""
