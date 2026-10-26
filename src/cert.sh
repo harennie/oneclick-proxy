@@ -339,6 +339,9 @@ def load_conf(path):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def version_string(self):
+        return "oneclick-proxy"
+
     def do_GET(self):
         self._reply(True)
 
@@ -350,14 +353,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def _reply(self, send_body):
         if self.server.conf["mode"] == "site":
-            data = (b"<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
-                    b"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                    b"<title>Welcome</title><body><h1>Welcome</h1></body></html>")
+            data = (b"<!doctype html><html lang=\"en\"><head>"
+                    b"<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                    b"<meta name=\"description\" content=\"A small index of public sample files for testing and reference.\">"
+                    b"<meta name=\"theme-color\" content=\"#f5f7fb\"><title>Public Sample Downloads</title>"
+                    b"<style>"
+                    b":root{color-scheme:light;--ink:#172033;--muted:#657086;--line:#dfe5ee;--accent:#2f6fed;--wash:#f5f7fb}"
+                    b"*{box-sizing:border-box}body{margin:0;background:var(--wash);color:var(--ink);font:16px/1.6 system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}"
+                    b"main{max-width:960px;margin:auto;padding:72px 24px 56px}header{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-bottom:88px}"
+                    b".brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:.02em}.mark{width:34px;height:34px;border-radius:10px;background:var(--accent);display:grid;place-items:center;color:white;font-weight:800}"
+                    b"nav a{color:var(--muted);text-decoration:none;margin-left:22px}nav a:hover{color:var(--accent)}.eyebrow{color:var(--accent);font-size:.8rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase}"
+                    b"h1{font-size:clamp(2.4rem,6vw,4.8rem);line-height:1.05;letter-spacing:-.04em;max-width:720px;margin:16px 0 24px}p{max-width:620px;color:var(--muted);font-size:1.1rem}"
+                    b".actions{display:flex;flex-wrap:wrap;gap:12px;margin:32px 0 76px}.button{display:inline-block;padding:11px 17px;border:1px solid var(--line);border-radius:8px;color:var(--ink);text-decoration:none;background:white}.button.primary{background:var(--accent);border-color:var(--accent);color:white}"
+                    b"section{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;border-top:1px solid var(--line);padding-top:28px}.item{padding-right:18px}.item strong{display:block;margin-bottom:6px}.item span{color:var(--muted);font-size:.95rem}.downloads{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin:0 0 48px}.download{background:white;border:1px solid var(--line);border-radius:12px;padding:22px;display:flex;flex-direction:column;min-height:190px}.download h2{font-size:1.15rem;margin:0 0 8px}.download p{font-size:.95rem;margin:0 0 18px}.download a{margin-top:auto;align-self:flex-start;color:var(--accent);font-weight:700;text-decoration:none}.download a:hover{text-decoration:underline}.meta{color:var(--muted);font-size:.82rem;margin-top:8px}footer{margin-top:72px;color:var(--muted);font-size:.9rem}@media(max-width:680px){main{padding-top:32px}header{margin-bottom:64px}nav{display:none}.downloads{grid-template-columns:1fr}section{grid-template-columns:1fr;gap:24px}.actions{margin-bottom:56px}}"
+                    b"</style></head><body><main><header><div class=\"brand\"><span class=\"mark\">S</span><span>Sample Files</span></div><nav><a href=\"/\">Home</a><a href=\"/#downloads\">Downloads</a><a href=\"/#notes\">References</a></nav></header>"
+                    b"<div class=\"eyebrow\">Public file index</div><h1>Sample files for testing and reference.</h1>"
+                    b"<p>A small catalog of public PDF, video, and technical reference files. Downloads are hosted by their respective publishers; this page links directly to the source.</p>"
+                    b"<div class=\"actions\"><a class=\"button primary\" href=\"/#downloads\">Browse downloads</a><a class=\"button\" href=\"/#notes\">Read the notes</a></div>"
+                    b"<div class=\"downloads\" id=\"downloads\"><article class=\"download\"><h2>W3C sample PDF</h2><p>A public document for testing browser downloads and PDF handling.</p><a href=\"https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf\" rel=\"noopener noreferrer\">Open PDF ↗</a><span class=\"meta\">W3C test file · PDF</span></article><article class=\"download\"><h2>Sample MP4 video</h2><p>A short public video sample for testing media downloads and playback.</p><a href=\"https://download.samplelib.com/mp4/sample-5s.mp4\" rel=\"noopener noreferrer\">Open video ↗</a><span class=\"meta\">Samplelib · MP4</span></article></div>"
+                    b"<section id=\"notes\"><div class=\"item\"><strong>RFC 9110</strong><span>HTTP Semantics, published by the RFC Editor.</span><a href=\"https://www.rfc-editor.org/rfc/rfc9110.txt\" rel=\"noopener noreferrer\">Read plain text ↗</a></div><div class=\"item\"><strong>Original sources</strong><span>Each file remains hosted by its original publisher.</span></div><div class=\"item\"><strong>File formats</strong><span>PDF, MP4 video, and plain-text RFC reference.</span></div></section>"
+                    b"<footer>Public sample links · Files remain hosted by their original publishers.</footer></main></body></html>")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", "public, max-age=300")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; frame-ancestors 'none'")
             self.send_header("Connection", "close")
             self.end_headers()
             if send_body:
