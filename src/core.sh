@@ -130,9 +130,6 @@ readonly CERT_BASE="/etc/proxy-oneclick"
 readonly CERT_DIR="${CERT_BASE}/certs"
 readonly CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
 readonly CERT_PRIVKEY="${CERT_DIR}/privkey.pem"
-readonly REALITY_SITE_DEFAULT_PORT=9443
-readonly REALITY_SITE_UNIT="/etc/systemd/system/proxy-oneclick-reality-site.service"
-readonly REALITY_SITE_CONF="${CERT_DIR}/reality-site.json"
 readonly CERT_LIB="/usr/local/lib/proxy-oneclick"
 readonly SUB_PY="${CERT_LIB}/sub_https.py"
 readonly CERT_HOOK="${CERT_LIB}/cert-deploy.sh"
@@ -175,7 +172,6 @@ readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 # ----------------------------- 默认值 / 运行参数 -----------------------------
 OPT_AUTO=0
 OPT_SNI=""
-OPT_OWN_SNI=""
 OPT_FORCE_SNI=0
 OPT_PORT=""
 OPT_HY2=""          # 空=询问(交互)/默认启用(auto); 1/0
@@ -643,7 +639,7 @@ take_lock() {
 
 # ----------------------------- 状态持久化 -----------------------------
 # 持久化的键
-STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY MLDSA_ON SNI SNI_TARGET SELF_SNI
+STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_VERIFY MLDSA_ON SNI SNI_TARGET
             HY2_ENABLED HY2_PORT HY2_PASS HY2_PIN HOP_RANGE NODE_NAME FW_ENABLED FW_MODE FW_HOST_SYNC SSH_PORTS
             EXTRA_TCP EXTRA_UDP DISABLED_FW SWAP_CREATED SERVER_ADDR
             NAT_MODE NAT_PORTS NAT_EXCLUDE XRAY_EXT_PORT HY2_EXT_PORT HOP_EXT_RANGE
@@ -660,7 +656,7 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             OUTBOUND_IP
             CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
             CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
-INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET="" SELF_SNI=0
+INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
 HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" FW_HOST_SYNC=0 SSH_PORTS=""
 # 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
 # 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。

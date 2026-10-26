@@ -364,7 +364,6 @@ scanner_collect() { # $1 输出候选列表文件
 
 # 主流程：自动优选 SNI。结果写入全局 SNI
 select_sni() {
-  SELF_SNI=0
   mktmp
   local keys main near cands="" k res="${TMP_DIR}/sni.res" sorted="${TMP_DIR}/sni.sorted"
   # 1) 命令行指定
@@ -456,79 +455,6 @@ select_sni() {
     fi
   done
   ok "已选择 SNI: ${SNI}"
-}
-
-sni_own_port_busy() {
-  local candidate=$1 v
-  for v in "$XRAY_PORT" "$XHTTP_PORT" "$TROJAN_PORT" "$ANYTLS_PORT" "$XHTTP_TLS_PORT" "$WS_PORT" "$SUB_PORT" "$OPT_SUB_PORT" "$LAND_PORT" "$OPT_LAND_PORT"; do
-    [[ -n $v && $v == "$candidate" ]] && return 0
-  done
-  port_in_use tcp "$candidate"
-}
-sni_own_port_planned() {
-  local candidate=$1 v
-  for v in "$XRAY_PORT" "$XHTTP_PORT" "$TROJAN_PORT" "$ANYTLS_PORT" "$XHTTP_TLS_PORT" "$WS_PORT" "$SUB_PORT" "$OPT_SUB_PORT" "$LAND_PORT" "$OPT_LAND_PORT"; do
-    [[ -n $v && $v == "$candidate" ]] && return 0
-  done
-  return 1
-}
-sni_own_pick_target() {
-  local old=${SNI_TARGET##*:} p
-  if [[ ${SELF_SNI:-0} == 1 && $old =~ ^[0-9]+$ ]] && ! sni_own_port_planned "$old" \
-      && svc_active proxy-oneclick-reality-site; then
-    printf '127.0.0.1:%s' "$old"
-    return 0
-  fi
-  for ((p=REALITY_SITE_DEFAULT_PORT; p<REALITY_SITE_DEFAULT_PORT+20; p++)); do
-    sni_own_port_busy "$p" || { printf '127.0.0.1:%s' "$p"; return 0; }
-  done
-  die "没有可用于自有域名 HTTPS 回落服务的本机端口（${REALITY_SITE_DEFAULT_PORT}–$((REALITY_SITE_DEFAULT_PORT + 19))）。"
-}
-select_self_sni() { # $1 自有域名；REALITY TLS 回落到本机 HTTPS 服务
-  local d=${1#https://} kind
-  d=${d%%/*}; d=${d,,}; d=${d%.}; d=${d// /}
-  cert_domain_syntax "$d" || die "自有 SNI 必须是有效域名，例如 node.example.com。"
-  (( NAT_MODE )) && die "自有域名 SNI 需要公网证书和本机 HTTPS 回落服务，NAT 模式不支持。"
-  (( REALITY_ENABLED )) || die "自有域名 SNI 只适用于 VLESS-REALITY；请启用 REALITY。"
-  [[ ${INIT_SYS:-} == systemd ]] || die "自有域名 SNI 的本机 HTTPS 回落服务目前需要 systemd。"
-  [[ -z $OPT_SNI ]] || die "--own-sni 不能和 --sni 同时使用。"
-  [[ ${OPT_CERT:-1} != 0 ]] || die "自有域名 SNI 需要公开证书，不能同时使用 --no-cert。"
-  [[ -z ${OPT_CERT_DOMAIN:-} || ${OPT_CERT_DOMAIN} == "$d" ]] || die "--cert-domain 必须与 --own-sni 相同。"
-  [[ -z ${OPT_CERT_NAMES:-} || ${OPT_CERT_NAMES} == "$d" ]] || die "--cert-names 必须与 --own-sni 相同。"
-  [[ -z ${OPT_CERT_NAMES:-}${OPT_CF_ORIGIN_KEY:-}${OPT_ZEROSSL_KID:-}${OPT_ZEROSSL_HMAC:-} ]] || die "自有域名 SNI 使用 Let's Encrypt 单域名证书，不能同时指定其它证书类型或凭据。"
-  if [[ -n ${OPT_CERT_KIND:-} ]]; then
-    kind=$(cert_normalize_kind "$OPT_CERT_KIND") || die "自有域名 SNI 只支持 Let's Encrypt 单域名证书。"
-    [[ $kind == le ]] || die "自有域名 SNI 只支持 Let's Encrypt 单域名证书。"
-  fi
-  [[ -n ${PUBLIC_IP4:-}${PUBLIC_IP6:-} ]] || detect_ip
-  cert_domain_points_here "$d" || die "域名 ${d} 没有全部解析到本机；请先修改 A/AAAA 记录并关闭 CDN 代理。"
-  SELF_SNI=1
-  SNI=$d
-  OPT_CERT=1
-  OPT_CERT_KIND=le
-  OPT_CERT_DOMAIN=$d
-  SNI_TARGET=$(sni_own_pick_target)
-  # 自有域名的回落证书链长度不保证满足 Xray 的 ML-DSA pqv 门槛；保留 REALITY，关闭可选的 pqv。
-  MLDSA_ON=0
-  info "SNI ${SNI} 将回落到本机 HTTPS 服务 ${SNI_TARGET}。请将域名 A/AAAA 指向本机、关闭 CDN 代理，并确保公网 TCP 80 可用于签发证书。"
-  warn "自有域名模式不输出 ML-DSA pqv（可选增强）；REALITY 仍正常工作。"
-}
-
-select_install_sni() {
-  local d
-  if [[ -n $OPT_OWN_SNI ]]; then select_self_sni "$OPT_OWN_SNI"; return; fi
-  if [[ -z $OPT_SNI ]] && (( ! OPT_AUTO )) && confirm "是否使用自己的域名作为 REALITY SNI？域名需解析到本机，并通过 TCP 80 申请公开证书。" y; then
-    ask d "请输入指向本机的域名（例如 node.example.com，留空继续普通 SNI）" ""
-    if [[ -n $d ]]; then select_self_sni "$d"; return; fi
-    warn "没有输入自有域名，继续原有 SNI 优选流程。"
-  fi
-  SELF_SNI=0
-  select_sni
-  SNI_TARGET="${SNI}:443"
-}
-
-install_should_select_sni() {
-  (( ! OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_OWN_SNI || -z $SNI ]]
 }
 
 manual_sni() {
@@ -1146,8 +1072,6 @@ install_xray() {
   if (( ! same )); then bin_backup "$XRAY_BIN" xray; backed=$BIN_BAK_MADE; fi
   fetch -o "${TMP_DIR}/xray-install.sh" "$XRAY_INSTALL_URL" || { bin_backup_drop "$XRAY_BIN"; die "下载 Xray 安装脚本失败，请检查网络（GitHub 可达性）。"; }
   if (( same )); then force=(--force); fi
-  # 官方安装器会在返回前尝试启动服务；先固定用户，避免它用 xray 用户读取 nobody 组的 640 配置而失败。
-  ensure_xray_runs_as_nobody "$XRAY_UNIT" || true
   xray_geo_snapshot
   if ! TERM=${TERM:-dumb} bash "${TMP_DIR}/xray-install.sh" install --version "$tag" "${force[@]}" >"${TMP_DIR}/xray-install.log" 2>&1; then
     tail -n 20 "${TMP_DIR}/xray-install.log" >&2 || true
@@ -1890,7 +1814,7 @@ singbox_apply_ip_strategy() { # $1 临时配置。TUIC / AnyTLS 走 sing-box 的
 # NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
 PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
 
-# 配置只给服务进程读：root 拥有，该用户主组 640。父目录也必须允许该组遍历。
+# 配置只给服务进程读：root 拥有，该用户主组 640。
 own_svc_config() { # $1 文件 $2 运行用户
   local f=$1 user=$2 grp=root
   if id "$user" >/dev/null 2>&1; then
@@ -1900,16 +1824,6 @@ own_svc_config() { # $1 文件 $2 运行用户
   fi
   chown "root:${grp}" "$f" || die "无法设置 ${f} 的属主，${user} 将读不到配置。"
   chmod 640 "$f" || die "无法设置 ${f} 的权限。"
-}
-own_svc_config_dir() { # $1 目录 $2 运行用户
-  local d=$1 user=$2 grp=root
-  if id "$user" >/dev/null 2>&1; then
-    grp=$(id -gn "$user")
-  elif [[ $user == nobody ]]; then
-    grp=nogroup
-  fi
-  chown "root:${grp}" "$d" || die "无法设置 ${d} 的属主，${user} 将无法遍历配置目录。"
-  chmod 710 "$d" || die "无法设置 ${d} 的权限，${user} 将无法遍历配置目录。"
 }
 xray_unit_user() { # $1 unit。没有 User= 时按 nobody（与自建服务一致）。
   local unit=${1:-$XRAY_UNIT} u=""
@@ -2072,7 +1986,6 @@ write_xray_config() {
     xu=$(xray_unit_user "$XRAY_UNIT")
     warn "系统没有 nobody 用户，已按 Xray 服务用户 ${xu} 设置配置权限。"
   fi
-  own_svc_config_dir "$(dirname "$XRAY_CONF")" "$xu"
   own_svc_config "$tmp" "$xu"
   if [[ -f $XRAY_CONF ]]; then mkdir -p "$BACKUP_DIR"; cp -a "$XRAY_CONF" "${BACKUP_DIR}/xray-config.json.bak" 2>/dev/null || true; fi
   mv -f "$tmp" "$XRAY_CONF"

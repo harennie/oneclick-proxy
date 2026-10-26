@@ -1,9 +1,9 @@
 # oneclick proxy
 
-一键在 VPS 上安装代理节点，不需要自己的域名；也可以选择把解析到本机的自有域名用作 REALITY SNI。给用户运行的是仓库根目录拼好的 `proxy.sh`；源码在 `src/*.sh`，由 `build.sh` 按固定顺序拼起来。
+一键在 VPS 上安装代理节点，不需要自己的域名。给用户运行的是仓库根目录拼好的 `proxy.sh`；源码在 `src/*.sh`，由 `build.sh` 按固定顺序拼起来。
 
 - 默认装好 VLESS + REALITY + Vision、VLESS + XHTTP + REALITY 和 Hysteria2，可选 Trojan、TUIC、AnyTLS 与 CDN 线路
-- 自动优选 REALITY 伪装站点，Hysteria2 支持端口跳跃；自有域名模式会申请公开证书并提供本机 HTTPS 回落站
+- 自动优选 REALITY 伪装站点，Hysteria2 支持端口跳跃；有域名时可以另外申请证书
 - 防火墙可严格默认拒绝，也可只放行代理端口；检测到 Docker 等环境时默认用温和模式，避免挡住现有服务
 - 支持 Debian / Ubuntu / RHEL 系（systemd）和 Alpine NAT（OpenRC），装完用 `proxy` 菜单管理
 - 可安装为落地机（Shadowsocks 2022），并用 `proxy route` 检测回程线路
@@ -79,7 +79,6 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--auto` | 全部默认值、非交互安装 |
 | `--outbound <策略>` | 出站：`46` IPv4优先、`64` IPv6优先、`4` 仅IPv4、`6` 仅IPv6、`auto` 清掉已记住的选择再按本次检测。可与 `--land` 一起用。检测不到所写的地址族时只警告，仍按指定的写 |
 | `--sni <域名>` | 指定 REALITY 目标网站（依然会做合规检测，不合格则拒绝） |
-| `--own-sni <域名>` | 使用解析到本机的自有域名作为 REALITY SNI。脚本会校验 A/AAAA 解析、申请 Let's Encrypt 单域名证书，并在 `127.0.0.1:9443`（必要时顺延到 9462）启动 HTTPS 回落站；要求关闭 CDN 代理、TCP 80 可从公网访问。与 `--sni`、`--no-cert`、NAT 模式及其它证书类型互斥 |
 | `--force-sni` | 配合 `--sni`，检测不通过也强制使用 |
 | `--scan` | 高级：用 [RealiTLScanner](https://github.com/XTLS/RealiTLScanner) 扫描 VPS 附近 IP 寻找同机房目标（约 60 秒） |
 | `--port <N>` | VLESS-REALITY TCP 端口，默认 443（NAT 模式可写 `外部:内部`，如 `59221:443`） |
@@ -134,9 +133,6 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 示例：`bash proxy.sh --auto --sni www.case.edu --port 443 --hop 30000-40000`
 
 NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239.14.191`
-
-自有 SNI 示例（域名必须先把 A/AAAA 全部解析到这台 VPS，并关闭 CDN 代理）：
-`bash proxy.sh --own-sni node.example.com --auto`
 
 纯落地机示例：`bash proxy.sh --land --auto --land-allow 203.0.113.10`（只允许中转机 203.0.113.10 连接）
 
@@ -624,18 +620,6 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 6. **不是被墙网站或大厂默认域名**：google / yahoo / apple / microsoft / amazon / cloudflare / github / 各大社交平台等被列入黑名单（这些域名要么被墙，要么是所有人都在用的“默认值”，特征明显）；`.cn` 域名也会被排除。
 
 检测通过的候选会列出前几名（TCP 延迟、TLS 握手时间、IP 归属），默认选第一名，也可以手动输入域名（同样会检测，不合格时需二次确认）。高级选项 `--scan` 会下载官方 RealiTLScanner，对 VPS 附近 IP 做 60 秒低并发扫描，找出同机房的 TLS1.3 + h2 站点后再走同样的检测流程；扫描可能被少数服务商视为端口扫描，请自行权衡。
-
-### 使用自己的域名作为 SNI
-
-交互安装开始选择 SNI 时默认引导「自己的域名」；输入 `n` 才进入原有自动优选 / 扫描流程。自动安装没有可猜测的域名，需显式传入：
-
-```bash
-bash proxy.sh --own-sni node.example.com --auto
-```
-
-使用前请把该域名的 **全部 A/AAAA 记录指向当前 VPS**，关闭 Cloudflare 等 CDN 代理，并确保公网 TCP 80 能访问。脚本会在申请证书前再次检查解析结果；解析到其它地址、没有解析结果或处于 NAT 模式都会中止。该模式固定申请 Let's Encrypt 单域名证书，证书签发后在 `127.0.0.1:9443` 起一个低权限 HTTPS 回落站（端口被占用时自动顺延到 9462），REALITY 的 `target` 指向这个回落站，公网只暴露 REALITY 端口。证书续期时会自动重启回落站；退出自有 SNI 或卸载时会停止并删除该服务。
-
-自有 SNI 的证书依赖公网 HTTP-01 验证，因此不能使用 `--no-cert`、通配符 / 多域名 / ZeroSSL / Cloudflare 源站证书参数，也不能和 `--sni` 同时指定。自有域名模式会关闭可选的 ML-DSA `pqv`，不影响 REALITY 本身或 XHTTP + REALITY。
 
 ---
 

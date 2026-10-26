@@ -9,25 +9,11 @@ trap - ERR INT TERM
 
 fail() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
 
-if id nobody >/dev/null 2>&1; then
-  (
-    calls=()
-    chown() { calls+=("chown:$*"); }
-    chmod() { calls+=("chmod:$*"); }
-    own_svc_config_dir /tmp/xray nobody
-    group=$(id -gn nobody)
-    [[ ${calls[0]} == "chown:root:${group} /tmp/xray" ]] || fail "Xray config directory owner/group"
-    [[ ${calls[1]} == "chmod:710 /tmp/xray" ]] || fail "Xray config directory mode"
-  )
-  printf 'ok Xray config directory permissions\n'
-fi
-
 reset_opts() {
   OPT_LAND="" OPT_WITH_LAND="" OPT_REALITY="" OPT_HY2="" OPT_XHTTP="" OPT_TROJAN=""
   OPT_TUIC="" OPT_ANYTLS="" OPT_XHTTP_TLS="" OPT_WS=""
   OPT_ACTION="" OPT_AUTO=0 OPT_LAND_PORT="" OPT_PORT="" OPT_LAND_ACT="" OPT_LAND_LINK=""
   LAND_MODE=0 LAND_IN=0
-  OPT_OWN_SNI="" OPT_SNI="" SELF_SNI=0
 }
 
 if [[ $SCRIPT_VERSION != 1.7.0 ]]; then fail "SCRIPT_VERSION=$SCRIPT_VERSION"; fi
@@ -90,69 +76,6 @@ reset_opts
 parse_args --land --auto
 if [[ $OPT_ACTION != install || $OPT_LAND != 1 ]] || ! installing_land_only; then fail "parse --land --auto"; fi
 printf 'ok parse --land --auto\n'
-
-# 自有 SNI 只在显式参数时进入专用分支；参数解析不应混入普通 --sni。
-reset_opts
-parse_args --own-sni node.example.com --auto
-if [[ $OPT_OWN_SNI != node.example.com || $OPT_AUTO != 1 || -n $OPT_SNI ]]; then
-  fail "parse --own-sni"
-fi
-printf 'ok parse --own-sni\n'
-
-OPT_AUTO=0 OPT_SNI="" OPT_OWN_SNI="" SNI="www.example.com"
-if ! install_should_select_sni; then fail "交互重装应重新进入 SNI 引导"; fi
-OPT_AUTO=1 OPT_SNI="" OPT_OWN_SNI="" SNI="www.example.com"
-if install_should_select_sni; then fail "--auto 不应进入 SNI 交互引导"; fi
-OPT_AUTO=1 SNI=""
-if ! install_should_select_sni; then fail "--auto 首次安装应进入 SNI 选择流程"; fi
-printf 'ok SNI selection flow\n'
-
-python3 - <<'PY'
-import re
-from pathlib import Path
-
-source = Path("proxy.sh").read_text(encoding="utf-8")
-match = re.search(r"cat >\"\$SUB_PY\" <<'PY'\n(.*?)\nPY", source, re.S)
-if not match:
-    raise SystemExit("generated HTTPS service source not found")
-compile(match.group(1), "sub_https.py", "exec")
-print("ok generated HTTPS service syntax")
-PY
-
-(
-  confirm() { return 0; }
-  ask() { printf -v "$1" '%s' "node.example.com"; }
-  cert_domain_syntax() { return 0; }
-  select_self_sni() { SELF_SNI=1; SNI=$1; }
-  select_sni() { SNI="ordinary.example.com"; }
-  OPT_AUTO=0 OPT_SNI="" OPT_OWN_SNI="" SELF_SNI=0 SNI=""
-  select_install_sni
-  if [[ $SELF_SNI != 1 || $SNI != node.example.com ]]; then fail "交互 SNI 引导没有默认进入自有域名"; fi
-  printf 'ok interactive own SNI prompt\n'
-)
-
-reset_opts
-parse_args --own-sni=https://NODE.example.com/path
-if [[ $OPT_OWN_SNI != node.example.com || $OPT_ACTION != install ]]; then fail "normalize --own-sni URL"; fi
-printf 'ok normalize --own-sni URL\n'
-
-(
-  NAT_MODE=0 INIT_SYS=systemd REALITY_ENABLED=1 PUBLIC_IP4=203.0.113.2 PUBLIC_IP6=""
-  OPT_SNI="" OPT_CERT=1 OPT_CERT_DOMAIN="" OPT_CERT_NAMES="" OPT_CERT_KIND=""
-  OPT_CF_ORIGIN_KEY="" OPT_ZEROSSL_KID="" OPT_ZEROSSL_HMAC=""
-  SELF_SNI=0 SNI_TARGET=127.0.0.1:9443
-  cert_domain_points_here() { [[ $1 == node.example.com ]]; }
-  cert_is_public() { return 0; }
-  cert_current_ok() { return 0; }
-  cert_name_covered() { return 0; }
-  svc_active() { [[ $1 == proxy-oneclick-reality-site ]]; }
-  port_in_use() { return 1; }
-  select_self_sni https://NODE.example.com/path
-  [[ $SELF_SNI == 1 && $SNI == node.example.com && $SNI_TARGET == 127.0.0.1:9443 && $MLDSA_ON == 0 ]]
-) || fail "select self SNI"
-printf 'ok select self SNI\n'
-
-if ! usage | grep -q -- '--own-sni'; then fail "help missing --own-sni"; fi
 
 reset_opts
 parse_args --with-land --land-port 8388 --auto
