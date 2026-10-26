@@ -1890,7 +1890,7 @@ singbox_apply_ip_strategy() { # $1 临时配置。TUIC / AnyTLS 走 sing-box 的
 # NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
 PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
 
-# 配置只给服务进程读：root 拥有，该用户主组 640。
+# 配置只给服务进程读：root 拥有，该用户主组 640。父目录也必须允许该组遍历。
 own_svc_config() { # $1 文件 $2 运行用户
   local f=$1 user=$2 grp=root
   if id "$user" >/dev/null 2>&1; then
@@ -1900,6 +1900,16 @@ own_svc_config() { # $1 文件 $2 运行用户
   fi
   chown "root:${grp}" "$f" || die "无法设置 ${f} 的属主，${user} 将读不到配置。"
   chmod 640 "$f" || die "无法设置 ${f} 的权限。"
+}
+own_svc_config_dir() { # $1 目录 $2 运行用户
+  local d=$1 user=$2 grp=root
+  if id "$user" >/dev/null 2>&1; then
+    grp=$(id -gn "$user")
+  elif [[ $user == nobody ]]; then
+    grp=nogroup
+  fi
+  chown "root:${grp}" "$d" || die "无法设置 ${d} 的属主，${user} 将无法遍历配置目录。"
+  chmod 710 "$d" || die "无法设置 ${d} 的权限，${user} 将无法遍历配置目录。"
 }
 xray_unit_user() { # $1 unit。没有 User= 时按 nobody（与自建服务一致）。
   local unit=${1:-$XRAY_UNIT} u=""
@@ -2062,6 +2072,7 @@ write_xray_config() {
     xu=$(xray_unit_user "$XRAY_UNIT")
     warn "系统没有 nobody 用户，已按 Xray 服务用户 ${xu} 设置配置权限。"
   fi
+  own_svc_config_dir "$(dirname "$XRAY_CONF")" "$xu"
   own_svc_config "$tmp" "$xu"
   if [[ -f $XRAY_CONF ]]; then mkdir -p "$BACKUP_DIR"; cp -a "$XRAY_CONF" "${BACKUP_DIR}/xray-config.json.bak" 2>/dev/null || true; fi
   mv -f "$tmp" "$XRAY_CONF"
