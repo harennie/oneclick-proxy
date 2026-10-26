@@ -527,6 +527,10 @@ select_install_sni() {
   SNI_TARGET="${SNI}:443"
 }
 
+install_should_select_sni() {
+  (( ! OPT_AUTO )) || [[ -n $OPT_SNI || -n $OPT_OWN_SNI || -z $SNI ]]
+}
+
 manual_sni() {
   local d r
   while :; do

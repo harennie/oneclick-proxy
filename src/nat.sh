@@ -608,7 +608,8 @@ do_install() {
     warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），可继续使用，但建议优先选择支持 MLKEM 的目标。"
     redo=y
   fi
-  if [[ -z $SNI || -n $OPT_SNI || -n $OPT_OWN_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新选择 SNI（当前: ${SNI}）？" "$redo"; }; then
+  # 每次交互安装都重新进入 SNI 引导，避免卸载后从菜单重装时沿用旧内存状态。
+  if install_should_select_sni; then
     select_install_sni
   fi
   if (( SELF_SNI )); then
