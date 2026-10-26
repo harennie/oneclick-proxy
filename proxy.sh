@@ -2567,7 +2567,7 @@ select_self_sni() { # $1 自有域名；REALITY TLS 回落到本机 HTTPS 服务
 select_install_sni() {
   local d
   if [[ -n $OPT_OWN_SNI ]]; then select_self_sni "$OPT_OWN_SNI"; return; fi
-  if [[ -z $OPT_SNI && ! $OPT_AUTO ]] && confirm "是否使用自己的域名作为 REALITY SNI？域名需解析到本机，并通过 TCP 80 申请公开证书。" y; then
+  if [[ -z $OPT_SNI ]] && (( ! OPT_AUTO )) && confirm "是否使用自己的域名作为 REALITY SNI？域名需解析到本机，并通过 TCP 80 申请公开证书。" y; then
     ask d "请输入指向本机的域名（例如 node.example.com，留空继续普通 SNI）" ""
     if [[ -n $d ]]; then select_self_sni "$d"; return; fi
     warn "没有输入自有域名，继续原有 SNI 优选流程。"
@@ -5953,9 +5953,9 @@ class Handler(BaseHTTPRequestHandler):
                     b"<div class=\"eyebrow\">Public file index</div><h1>Sample files for testing and reference.</h1>"
                     b"<p>A small catalog of public PDF, video, and technical reference files. Downloads are hosted by their respective publishers; this page links directly to the source.</p>"
                     b"<div class=\"actions\"><a class=\"button primary\" href=\"/#downloads\">Browse downloads</a><a class=\"button\" href=\"/#notes\">Read the notes</a></div>"
-                    b"<div class=\"downloads\" id=\"downloads\"><article class=\"download\"><h2>W3C sample PDF</h2><p>A public document for testing browser downloads and PDF handling.</p><a href=\"https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf\" rel=\"noopener noreferrer\">Open PDF ↗</a><span class=\"meta\">W3C test file · PDF</span></article><article class=\"download\"><h2>Sample MP4 video</h2><p>A short public video sample for testing media downloads and playback.</p><a href=\"https://download.samplelib.com/mp4/sample-5s.mp4\" rel=\"noopener noreferrer\">Open video ↗</a><span class=\"meta\">Samplelib · MP4</span></article></div>"
-                    b"<section id=\"notes\"><div class=\"item\"><strong>RFC 9110</strong><span>HTTP Semantics, published by the RFC Editor.</span><a href=\"https://www.rfc-editor.org/rfc/rfc9110.txt\" rel=\"noopener noreferrer\">Read plain text ↗</a></div><div class=\"item\"><strong>Original sources</strong><span>Each file remains hosted by its original publisher.</span></div><div class=\"item\"><strong>File formats</strong><span>PDF, MP4 video, and plain-text RFC reference.</span></div></section>"
-                    b"<footer>Public sample links · Files remain hosted by their original publishers.</footer></main></body></html>")
+                    b"<div class=\"downloads\" id=\"downloads\"><article class=\"download\"><h2>W3C sample PDF</h2><p>A public document for testing browser downloads and PDF handling.</p><a href=\"https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf\" rel=\"noopener noreferrer\">Open PDF &#8599;</a><span class=\"meta\">W3C test file &#183; PDF</span></article><article class=\"download\"><h2>Sample MP4 video</h2><p>A short public video sample for testing media downloads and playback.</p><a href=\"https://download.samplelib.com/mp4/sample-5s.mp4\" rel=\"noopener noreferrer\">Open video &#8599;</a><span class=\"meta\">Samplelib &#183; MP4</span></article></div>"
+                    b"<section id=\"notes\"><div class=\"item\"><strong>RFC 9110</strong><span>HTTP Semantics, published by the RFC Editor.</span><a href=\"https://www.rfc-editor.org/rfc/rfc9110.txt\" rel=\"noopener noreferrer\">Read plain text &#8599;</a></div><div class=\"item\"><strong>Original sources</strong><span>Each file remains hosted by its original publisher.</span></div><div class=\"item\"><strong>File formats</strong><span>PDF, MP4 video, and plain-text RFC reference.</span></div></section>"
+                    b"<footer>Public sample links &#183; Files remain hosted by their original publishers.</footer></main></body></html>")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))

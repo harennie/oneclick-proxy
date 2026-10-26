@@ -94,6 +94,30 @@ OPT_AUTO=1 SNI=""
 if ! install_should_select_sni; then fail "--auto 首次安装应进入 SNI 选择流程"; fi
 printf 'ok SNI selection flow\n'
 
+python3 - <<'PY'
+import re
+from pathlib import Path
+
+source = Path("proxy.sh").read_text(encoding="utf-8")
+match = re.search(r"cat >\"\$SUB_PY\" <<'PY'\n(.*?)\nPY", source, re.S)
+if not match:
+    raise SystemExit("generated HTTPS service source not found")
+compile(match.group(1), "sub_https.py", "exec")
+print("ok generated HTTPS service syntax")
+PY
+
+(
+  confirm() { return 0; }
+  ask() { printf -v "$1" '%s' "node.example.com"; }
+  cert_domain_syntax() { return 0; }
+  select_self_sni() { SELF_SNI=1; SNI=$1; }
+  select_sni() { SNI="ordinary.example.com"; }
+  OPT_AUTO=0 OPT_SNI="" OPT_OWN_SNI="" SELF_SNI=0 SNI=""
+  select_install_sni
+  if [[ $SELF_SNI != 1 || $SNI != node.example.com ]]; then fail "交互 SNI 引导没有默认进入自有域名"; fi
+  printf 'ok interactive own SNI prompt\n'
+)
+
 reset_opts
 parse_args --own-sni=https://NODE.example.com/path
 if [[ $OPT_OWN_SNI != node.example.com || $OPT_ACTION != install ]]; then fail "normalize --own-sni URL"; fi

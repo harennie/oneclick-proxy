@@ -517,7 +517,7 @@ select_self_sni() { # $1 自有域名；REALITY TLS 回落到本机 HTTPS 服务
 select_install_sni() {
   local d
   if [[ -n $OPT_OWN_SNI ]]; then select_self_sni "$OPT_OWN_SNI"; return; fi
-  if [[ -z $OPT_SNI && ! $OPT_AUTO ]] && confirm "是否使用自己的域名作为 REALITY SNI？域名需解析到本机，并通过 TCP 80 申请公开证书。" y; then
+  if [[ -z $OPT_SNI ]] && (( ! OPT_AUTO )) && confirm "是否使用自己的域名作为 REALITY SNI？域名需解析到本机，并通过 TCP 80 申请公开证书。" y; then
     ask d "请输入指向本机的域名（例如 node.example.com，留空继续普通 SNI）" ""
     if [[ -n $d ]]; then select_self_sni "$d"; return; fi
     warn "没有输入自有域名，继续原有 SNI 优选流程。"
