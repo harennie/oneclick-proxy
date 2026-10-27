@@ -78,8 +78,8 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 |---|---|
 | `--auto` | 全部默认值、非交互安装 |
 | `--outbound <策略>` | 出站：`46` IPv4优先、`64` IPv6优先、`4` 仅IPv4、`6` 仅IPv6、`auto` 清掉已记住的选择再按本次检测。可与 `--land` 一起用。检测不到所写的地址族时只警告，仍按指定的写 |
-| `--sni <域名>` | 指定 REALITY 目标网站（依然会做合规检测，不合格则拒绝） |
-| `--force-sni` | 配合 `--sni`，检测不通过也强制使用 |
+| `--sni <域名>` | 指定 REALITY 目标网站，照常检测；不合格只警告并继续使用 |
+| `--force-sni` | 保留兼容旧命令；手填 SNI 已默认在检测失败后继续使用 |
 | `--scan` | 高级：用 [RealiTLScanner](https://github.com/XTLS/RealiTLScanner) 扫描 VPS 附近 IP 寻找同机房目标（约 60 秒） |
 | `--port <N>` | VLESS-REALITY TCP 端口，默认 443（NAT 模式可写 `外部:内部`，如 `59221:443`） |
 | `--no-hy2` / `--hy2` | 不安装 / 安装 Hysteria2（默认安装） |
@@ -619,7 +619,9 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 5. **不在 CDN / WAF 后面**：解析 IP 对照 <https://www.cloudflare.com/ips-v4>、ips-v6，并按响应头识别 Cloudflare（`server: cloudflare`、`cf-ray`）、Imperva/Incapsula（`x-iinfo`、`x-cdn: Imperva`、`incap_ses` / `visid_incap` Cookie）、Fastly（`x-served-by: cache-…`、`x-fastly-*`、`via: … varnish`）、Akamai（`server: AkamaiGHost`、`x-akamai-*`）、CloudFront（`via: … cloudfront`、`x-amz-cf-*`）、Azure Front Door（`x-azure-ref`）以及 Sucuri、BunnyCDN。CDN 节点与你的 VPS 明显不属于同一网络，且这类站点被大量滥用做 REALITY 目标（只用 `tr` + `grep -iE`，Alpine / busybox 下同样可用）。
 6. **不是被墙网站或大厂默认域名**：google / yahoo / apple / microsoft / amazon / cloudflare / github / 各大社交平台等被列入黑名单（这些域名要么被墙，要么是所有人都在用的“默认值”，特征明显）；`.cn` 域名也会被排除。
 
-检测通过的候选会列出前几名（TCP 延迟、TLS 握手时间、IP 归属），默认选第一名，也可以手动输入域名（同样会检测，不合格时需二次确认）。高级选项 `--scan` 会下载官方 RealiTLScanner，对 VPS 附近 IP 做 60 秒低并发扫描，找出同机房的 TLS1.3 + h2 站点后再走同样的检测流程；扫描可能被少数服务商视为端口扫描，请自行权衡。
+交互安装、重装和安装后的 `proxy sni` 都先询问 SNI 域名：可以自由填写，留空进入原有自动优选。手填域名与候选域名使用同一套检测；不合格时显示原因，并让你选择重新填写或继续使用。自动优选只列出检测通过的候选（TCP 延迟、TLS 握手时间、IP 归属），默认选第一名，也可以输入 `m` 手填域名。`--auto` 沿用已有 SNI，没有时自动优选；`--sni` 显式指定时同样检测，失败后警告并继续，避免非交互命令卡住。
+
+填写域名不会自动部署网站或申请证书；目标网站是否支持 TLS 1.3 / HTTP/2 由检测结果说明，仍需以实际节点连接测试为准。高级选项 `--scan` 会下载官方 RealiTLScanner，对 VPS 附近 IP 做 60 秒低并发扫描，找出同机房的 TLS1.3 + h2 站点后再走同样的检测流程；扫描可能被少数服务商视为端口扫描，请自行权衡。
 
 ---
 
@@ -937,7 +939,7 @@ Hysteria2 ▶ …              sing-box  ▶ 未安装
 ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
    1. 安装 / 重新安装                               12. 添加 / 修改落地转发（本机作中转，出口走落地机）
    2. 查看链接 / 二维码 / Clash 配置                13. 安装为落地机（Shadowsocks 2022 出口，给其它中转机用）
-   3. 更换 SNI（重新优选目标网站）                  14. 卸载
+   3. 更换 SNI（手填 / 自动优选）                   14. 卸载
    4. 重新生成密钥 / UUID                           15. 切换 NAT 模式（当前: 自动/开/关）
    5. 修改端口 / 端口跳跃                           16. 协议开关
    6. 用户管理（添加 / 删除）                       17. 申请证书

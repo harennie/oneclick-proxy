@@ -180,7 +180,7 @@ show_menu() {
   ui_columns "oneclick proxy" "退出" \
     "安装 / 重新安装" \
     "查看链接 / 二维码 / Clash 配置" \
-    "更换 SNI（重新优选目标网站）" \
+    "更换 SNI（手填 / 自动优选）" \
     "重新生成密钥 / UUID" \
     "修改端口 / 端口跳跃" \
     "用户管理（添加 / 删除）" \
@@ -313,8 +313,8 @@ usage() {
   --auto              使用全部默认值自动安装（非交互）
   --outbound <策略>   出站：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6 / auto 按检测
                       内网 ULA（fc00::/7）若 NAT66 到公网 IPv6，按双栈，可选 IPv6优先
-  --sni <域名>        指定 REALITY 目标网站（会进行合规检测）
-  --force-sni         与 --sni 一起使用：检测不通过也强制使用
+  --sni <域名>        指定 REALITY 目标网站（照常检测，不合格只警告并继续使用）
+  --force-sni         保留兼容旧命令；手填 SNI 检测不通过也会继续使用
   --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
   --hy2 / --no-hy2    安装 / 不安装 Hysteria2（默认安装）
@@ -478,7 +478,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
                       Vision 和 XHTTP 都开着时，菜单里的 s 切换是否共用 TCP 端口
   proxy proto xhttp-443 on|off
                       XHTTP 与 Vision 共用 / 分开 TCP 端口（Xray fallbacks）
-  proxy sni           重新优选 / 更换 SNI
+  proxy sni           手填 SNI 并检测（不合格只警告）；留空进入自动优选
   proxy regen         重新生成全部密钥
   proxy port          修改端口。可带 --port、--hy2-port、--xhttp-port；同步开启时 ufw/firewalld 跟着改
   proxy user          用户管理
@@ -541,7 +541,7 @@ parse_args() {
         ;;
       --sni) [[ -n ${2-} ]] || die "--sni 需要参数"; OPT_SNI=$2; shift ;;
       --sni=*) OPT_SNI=${1#*=} ;;
-      --force-sni) OPT_FORCE_SNI=1 ;;
+      --force-sni) : ;;
       --scan) OPT_SCAN=1 ;;
       --port) is_port_opt "${2-}" || die "--port 参数无效"; OPT_PORT=$2; shift ;;
       --port=*) OPT_PORT=${1#*=}; is_port_opt "$OPT_PORT" || die "--port 参数无效" ;;

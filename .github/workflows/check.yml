@@ -19,3 +19,5 @@ jobs:
         run: bash -n proxy.sh
       - name: Landing inbound routing
         run: bash tests/land-routing.sh
+      - name: SNI selection
+        run: bash tests/sni-selection.sh
