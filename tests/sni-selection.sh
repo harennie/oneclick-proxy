@@ -11,6 +11,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 setup_case() {
+  unset TEST_RESULTS_FILE
   TMP_DIR="$work/$1"
   mkdir -p "$TMP_DIR"
   OPT_AUTO=0 OPT_SNI="" OPT_SCAN=0 NAT_MODE=0 SNI=""
@@ -29,7 +30,11 @@ ask() {
 }
 sni_probe() {
   printf '%s\n' "$1" >>"$TMP_DIR/probes"
-  printf '%s\n' "$TEST_RESULT"
+  local line result
+  line=$(wc -l <"$TMP_DIR/probes")
+  if [[ -s ${TEST_RESULTS_FILE:-} ]]; then result=$(sed -n "${line}p" "$TEST_RESULTS_FILE")
+  else result=$TEST_RESULT; fi
+  printf '%s\n' "$result"
   return "$TEST_RC"
 }
 sni_region_keys() { printf 'TEST|'; }
@@ -49,15 +54,23 @@ printf 'ok manual SNI is normalized and checked\n'
 setup_case warning
 TEST_RESULT='FAIL|manual.example.com|不支持 ALPN h2'
 TEST_RC=1
-select_sni 3<<<'manual.example.com' >"$TMP_DIR/log" 2>&1
+select_sni 3<<<$'manual.example.com\n2' >"$TMP_DIR/log" 2>&1
 [[ $SNI == manual.example.com ]] || fail '检测不通过阻止了手填选择'
 grep -q '不支持 ALPN h2' "$TMP_DIR/log" || fail '未说明检测失败原因'
-grep -q '仍使用此 SNI' "$TMP_DIR/log" || fail '未提示继续使用'
-printf 'ok failed checks warn and keep the chosen SNI\n'
+grep -q '1) 重新填写  2) 继续使用 manual.example.com' "$TMP_DIR/prompts" || fail '未提供重填/继续选择'
+printf 'ok failed checks offer re-entry or continue\n'
+
+setup_case retry
+TEST_RESULTS_FILE="$TMP_DIR/results"
+printf '%s\n' 'FAIL|manual.example.com|证书链/域名校验失败' 'PASS|second.example.com|10|20|192.0.2.1|US|Test|AS1|Y|4000' >"$TEST_RESULTS_FILE"
+select_sni 3<<<$'manual.example.com\n1\nsecond.example.com' >"$TMP_DIR/log" 2>&1
+[[ $SNI == second.example.com ]] || fail '选择重填没有重新检测新域名'
+[[ $(wc -l <"$TMP_DIR/probes") == 2 ]] || fail '重填后的域名未重新检测'
+printf 'ok choosing re-entry checks the new SNI\n'
 
 setup_case no_result
 TEST_RESULT="" TEST_RC=1
-select_sni 3<<<'manual.example.com' >"$TMP_DIR/log" 2>&1
+select_sni 3<<<$'manual.example.com\n2' >"$TMP_DIR/log" 2>&1
 [[ $SNI == manual.example.com ]] || fail '探测错误阻止了手填选择'
 grep -q '未得到检测结果' "$TMP_DIR/log" || fail '探测错误未提示'
 printf 'ok probe errors warn without discarding the SNI\n'
@@ -70,7 +83,7 @@ printf 'ok blank input enters the original candidate selection\n'
 
 setup_case candidate_manual
 TEST_RESULT='FAIL|other.example.com|证书链/域名校验失败'
-select_sni 3<<<$'\nm\nother.example.com' >"$TMP_DIR/log" 2>&1
+select_sni 3<<<$'\nm\nother.example.com\n2' >"$TMP_DIR/log" 2>&1
 [[ $SNI == other.example.com ]] || fail '候选列表中的手填入口未继续使用不合格域名'
 printf 'ok candidate manual override uses the same warning policy\n'
 
@@ -100,7 +113,7 @@ show_info() { :; }
 setup_case menu_manual
 SNI=old.example.com
 TEST_RESULT='FAIL|manual.example.com|不支持 ALPN h2'
-menu_change_sni 3<<<'manual.example.com' >"$TMP_DIR/log" 2>&1
+menu_change_sni 3<<<$'manual.example.com\n2' >"$TMP_DIR/log" 2>&1
 [[ $SNI == manual.example.com && $(cat "$TMP_DIR/applied") == manual.example.com:443 ]] || fail '安装后更换 SNI 未应用手填域名'
 printf 'ok installed-node SNI changes use the same manual flow\n'
 

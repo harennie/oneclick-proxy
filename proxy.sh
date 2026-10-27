@@ -381,7 +381,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;737:src/os.sh:1;1246:src/tune.sh:1;2046:src/xray.sh:1;4085:src/hy2.sh:1;4224:src/firewall.sh:1;5509:src/cert.sh:1;7541:src/cdn.sh:1;8526:src/link.sh:1;8919:src/singbox.sh:1;9503:src/nat.sh:1;10165:src/selftest.sh:1;10310:src/land.sh:1;12221:src/menu.sh:1;12818:src/route.sh:1;13333:src/export.sh:1;13549:src/doctor.sh:1;13948:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;737:src/os.sh:1;1246:src/tune.sh:1;2046:src/xray.sh:1;4098:src/hy2.sh:1;4237:src/firewall.sh:1;5522:src/cert.sh:1;7554:src/cdn.sh:1;8539:src/link.sh:1;8932:src/singbox.sh:1;9516:src/nat.sh:1;10178:src/selftest.sh:1;10323:src/land.sh:1;12234:src/menu.sh:1;12831:src/route.sh:1;13346:src/export.sh:1;13562:src/doctor.sh:1;13961:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -2498,25 +2498,38 @@ select_sni() {
 }
 
 manual_sni() {
-  local d=${1:-} r rtt ip cc city org pq
-  [[ -n $d ]] || ask d "请输入 SNI 域名（留空进入自动优选）" ""
-  d=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<<"$d")
-  [[ -n $d ]] || return 1
-  d=${d,,}; d=${d#https://}; d=${d%%/*}; d=${d%.}
-  info "正在检测 ${d} ..."
-  load_cf_ranges
-  r=$( ( trap - ERR; set +e; sni_probe "$d" ) ) || true
-  if [[ $r == PASS\|* ]]; then
-    IFS='|' read -r _ _ _ rtt ip cc city org pq _ <<<"$r"
-    ok "${d} 通过检测：TLS 握手 ${rtt}ms，IP ${ip} (${cc} ${city} ${org})，X25519MLKEM768: $(sni_pq_label "$pq")"
-    [[ -n $GEO_CC && $cc != "$GEO_CC" ]] && warn "该网站 IP 与 VPS 不在同一国家，不推荐。"
-    sni_pq_warn "$d" "$pq"
-  else
+  local d=${1:-} r rtt ip cc city org pq choice
+  while :; do
+    [[ -n $d ]] || ask d "请输入 SNI 域名（留空进入自动优选）" ""
+    d=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<<"$d")
+    [[ -n $d ]] || return 1
+    d=${d,,}; d=${d#https://}; d=${d%%/*}; d=${d%.}
+    info "正在检测 ${d} ..."
+    load_cf_ranges
+    r=$( ( trap - ERR; set +e; sni_probe "$d" ) ) || true
+    if [[ $r == PASS\|* ]]; then
+      IFS='|' read -r _ _ _ rtt ip cc city org pq _ <<<"$r"
+      ok "${d} 通过检测：TLS 握手 ${rtt}ms，IP ${ip} (${cc} ${city} ${org})，X25519MLKEM768: $(sni_pq_label "$pq")"
+      [[ -n $GEO_CC && $cc != "$GEO_CC" ]] && warn "该网站 IP 与 VPS 不在同一国家，不推荐。"
+      sni_pq_warn "$d" "$pq"
+      break
+    fi
     warn "${d} 未通过检测：$(cut -d'|' -f3 <<<"${r:-FAIL|$d|未得到检测结果}")"
-    warn "仍使用此 SNI；节点可能无法连接，请留意安装后的自检结果。"
-  fi
+    if (( OPT_AUTO )); then
+      warn "仍使用此 SNI；节点可能无法连接，请留意安装后的自检结果。"
+      break
+    fi
+    while :; do
+      ask choice "1) 重新填写  2) 继续使用 ${d}" "2"
+      case $choice in
+        1) d=""; continue 2 ;;
+        2) break ;;
+        *) warn "请输入 1 或 2。" ;;
+      esac
+    done
+    break
+  done
   SNI=$d
-  return 0
 }
 
 # ============================================================
