@@ -362,23 +362,18 @@ scanner_collect() { # $1 输出候选列表文件
   info "扫描得到 $(wc -l <"$out") 个候选域名，开始逐一验证 ..."
 }
 
-# 主流程：自动优选 SNI。结果写入全局 SNI
+# 手填优先，留空进入自动优选。结果写入全局 SNI。
 select_sni() {
   mktmp
   local keys main near cands="" k res="${TMP_DIR}/sni.res" sorted="${TMP_DIR}/sni.sorted"
-  # 1) 命令行指定
   if [[ -n $OPT_SNI ]]; then
-    info "验证指定的 SNI: ${OPT_SNI} ..."
-    load_cf_ranges
-    local r; r=$( ( trap - ERR; set +e; sni_probe "$OPT_SNI" ) )
-    if [[ $r == PASS* ]]; then
-      SNI=${OPT_SNI,,}; ok "SNI ${SNI} 通过检测（TLS 握手 $(cut -d'|' -f4 <<<"$r")ms，X25519MLKEM768: $(sni_pq_label "$(cut -d'|' -f9 <<<"$r")")）。"
-      sni_pq_warn "$SNI" "$(cut -d'|' -f9 <<<"$r")"
-      return 0
-    fi
-    warn "SNI ${OPT_SNI} 未通过检测：$(cut -d'|' -f3 <<<"$r")"
-    if (( OPT_FORCE_SNI )); then warn "已指定 --force-sni，仍然使用。"; SNI=${OPT_SNI,,}; return 0; fi
-    (( OPT_AUTO )) && die "指定的 SNI 不合格。如确认要使用，请追加 --force-sni。"
+    manual_sni "$OPT_SNI"
+    return 0
+  fi
+  if (( ! OPT_AUTO )); then
+    step "选择 REALITY 目标网站 (SNI)"
+    [[ -z $SNI ]] || info "当前 SNI: ${SNI}"
+    manual_sni && return 0
   fi
 
   keys=$(sni_region_keys)
@@ -423,7 +418,7 @@ select_sni() {
   if (( npass == 0 )); then
     warn "没有候选域名通过全部检测。"
     awk -F'|' '$1=="FAIL" && ++n <= 15 {printf "    %s: %s\n", $2, $3}' "$res"
-    (( OPT_AUTO )) && die "自动模式下无法确定 SNI，请用 --sni 指定（或 --force-sni）。"
+    (( OPT_AUTO )) && die "自动模式下无法确定 SNI，请用 --sni 指定域名。"
     manual_sni && return 0
     die "未选择 SNI。"
   fi
@@ -458,25 +453,38 @@ select_sni() {
 }
 
 manual_sni() {
-  local d r
+  local d=${1:-} r rtt ip cc city org pq choice
   while :; do
-    ask d "请输入目标域名（例如 www.example.edu，留空返回）" ""
-    [[ -z $d ]] && return 1
-    d=${d#https://}; d=${d%%/*}; d=${d,,}
+    [[ -n $d ]] || ask d "请输入 SNI 域名（留空进入自动优选）" ""
+    d=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<<"$d")
+    [[ -n $d ]] || return 1
+    d=${d,,}; d=${d#https://}; d=${d%%/*}; d=${d%.}
     info "正在检测 ${d} ..."
     load_cf_ranges
-    r=$( ( trap - ERR; set +e; sni_probe "$d" ) )
-    if [[ $r == PASS* ]]; then
-      local pq
+    r=$( ( trap - ERR; set +e; sni_probe "$d" ) ) || true
+    if [[ $r == PASS\|* ]]; then
       IFS='|' read -r _ _ _ rtt ip cc city org pq _ <<<"$r"
       ok "${d} 通过检测：TLS 握手 ${rtt}ms，IP ${ip} (${cc} ${city} ${org})，X25519MLKEM768: $(sni_pq_label "$pq")"
       [[ -n $GEO_CC && $cc != "$GEO_CC" ]] && warn "该网站 IP 与 VPS 不在同一国家，不推荐。"
       sni_pq_warn "$d" "$pq"
-      SNI=$d; return 0
+      break
     fi
-    warn "${d} 未通过检测：$(cut -d'|' -f3 <<<"$r")"
-    if confirm "仍然坚持使用 ${d} 吗？（不推荐）" n; then SNI=$d; return 0; fi
+    warn "${d} 未通过检测：$(cut -d'|' -f3 <<<"${r:-FAIL|$d|未得到检测结果}")"
+    if (( OPT_AUTO )); then
+      warn "仍使用此 SNI；节点可能无法连接，请留意安装后的自检结果。"
+      break
+    fi
+    while :; do
+      ask choice "1) 重新填写  2) 继续使用 ${d}" "2"
+      case $choice in
+        1) d=""; continue 2 ;;
+        2) break ;;
+        *) warn "请输入 1 或 2。" ;;
+      esac
+    done
+    break
   done
+  SNI=$d
 }
 
 # ============================================================

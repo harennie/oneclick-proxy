@@ -584,8 +584,7 @@ do_install() {
   fi
   save_state
 
-  local pqrc=0 redo=n
-  if (( IMPORT_MODE )) && [[ -n $SNI && -z $OPT_SNI ]]; then
+  if (( IMPORT_MODE && OPT_AUTO )) && [[ -n $SNI && -z $OPT_SNI ]]; then
     local sni_res=""
     sni_res=$(sni_probe "$SNI") || true
     if [[ $sni_res == FAIL* ]]; then
@@ -595,13 +594,7 @@ do_install() {
       info "导入的 SNI ${SNI} 仍然可用。"
     fi
   fi
-  [[ -n $SNI && -z $OPT_SNI ]] && { sni_pq_check "$SNI" || pqrc=$?; }
-  if (( pqrc == 1 )); then
-    # 不支持 MLKEM 只是偏好问题：给出警告，交互模式默认建议重新优选，自动模式保留原 SNI
-    warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），可继续使用，但建议优先选择支持 MLKEM 的目标。"
-    redo=y
-  fi
-  if [[ -z $SNI || -n $OPT_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新优选 SNI（当前: ${SNI}）？" "$redo"; }; then
+  if (( ! OPT_AUTO )) || [[ -z $SNI || -n $OPT_SNI ]]; then
     select_sni
   fi
   SNI_TARGET="${SNI}:443"
