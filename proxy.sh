@@ -173,7 +173,6 @@ readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 # ----------------------------- 默认值 / 运行参数 -----------------------------
 OPT_AUTO=0
 OPT_SNI=""
-OPT_FORCE_SNI=0
 OPT_PORT=""
 OPT_HY2=""          # 空=询问(交互)/默认启用(auto); 1/0
 OPT_HY2_PORT=""
@@ -382,7 +381,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;738:src/os.sh:1;1247:src/tune.sh:1;2047:src/xray.sh:1;4086:src/hy2.sh:1;4225:src/firewall.sh:1;5510:src/cert.sh:1;7542:src/cdn.sh:1;8527:src/link.sh:1;8920:src/singbox.sh:1;9504:src/nat.sh:1;10166:src/selftest.sh:1;10311:src/land.sh:1;12222:src/menu.sh:1;12819:src/route.sh:1;13334:src/export.sh:1;13550:src/doctor.sh:1;13949:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;737:src/os.sh:1;1246:src/tune.sh:1;2046:src/xray.sh:1;4085:src/hy2.sh:1;4224:src/firewall.sh:1;5509:src/cert.sh:1;7541:src/cdn.sh:1;8526:src/link.sh:1;8919:src/singbox.sh:1;9503:src/nat.sh:1;10165:src/selftest.sh:1;10310:src/land.sh:1;12221:src/menu.sh:1;12818:src/route.sh:1;13333:src/export.sh:1;13549:src/doctor.sh:1;13948:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -14489,7 +14488,7 @@ parse_args() {
         ;;
       --sni) [[ -n ${2-} ]] || die "--sni 需要参数"; OPT_SNI=$2; shift ;;
       --sni=*) OPT_SNI=${1#*=} ;;
-      --force-sni) OPT_FORCE_SNI=1 ;;
+      --force-sni) : ;;
       --scan) OPT_SCAN=1 ;;
       --port) is_port_opt "${2-}" || die "--port 参数无效"; OPT_PORT=$2; shift ;;
       --port=*) OPT_PORT=${1#*=}; is_port_opt "$OPT_PORT" || die "--port 参数无效" ;;
