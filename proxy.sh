@@ -382,7 +382,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;738:src/os.sh:1;1247:src/tune.sh:1;2047:src/xray.sh:1;4091:src/hy2.sh:1;4230:src/firewall.sh:1;5515:src/cert.sh:1;7547:src/cdn.sh:1;8532:src/link.sh:1;8925:src/singbox.sh:1;9509:src/nat.sh:1;10178:src/selftest.sh:1;10323:src/land.sh:1;12234:src/menu.sh:1;12831:src/route.sh:1;13346:src/export.sh:1;13562:src/doctor.sh:1;13961:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;738:src/os.sh:1;1247:src/tune.sh:1;2047:src/xray.sh:1;4086:src/hy2.sh:1;4225:src/firewall.sh:1;5510:src/cert.sh:1;7542:src/cdn.sh:1;8527:src/link.sh:1;8920:src/singbox.sh:1;9504:src/nat.sh:1;10166:src/selftest.sh:1;10311:src/land.sh:1;12222:src/menu.sh:1;12819:src/route.sh:1;13334:src/export.sh:1;13550:src/doctor.sh:1;13949:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -2408,23 +2408,18 @@ scanner_collect() { # $1 输出候选列表文件
   info "扫描得到 $(wc -l <"$out") 个候选域名，开始逐一验证 ..."
 }
 
-# 主流程：自动优选 SNI。结果写入全局 SNI
+# 手填优先，留空进入自动优选。结果写入全局 SNI。
 select_sni() {
   mktmp
   local keys main near cands="" k res="${TMP_DIR}/sni.res" sorted="${TMP_DIR}/sni.sorted"
-  # 1) 命令行指定
   if [[ -n $OPT_SNI ]]; then
-    info "验证指定的 SNI: ${OPT_SNI} ..."
-    load_cf_ranges
-    local r; r=$( ( trap - ERR; set +e; sni_probe "$OPT_SNI" ) )
-    if [[ $r == PASS* ]]; then
-      SNI=${OPT_SNI,,}; ok "SNI ${SNI} 通过检测（TLS 握手 $(cut -d'|' -f4 <<<"$r")ms，X25519MLKEM768: $(sni_pq_label "$(cut -d'|' -f9 <<<"$r")")）。"
-      sni_pq_warn "$SNI" "$(cut -d'|' -f9 <<<"$r")"
-      return 0
-    fi
-    warn "SNI ${OPT_SNI} 未通过检测：$(cut -d'|' -f3 <<<"$r")"
-    if (( OPT_FORCE_SNI )); then warn "已指定 --force-sni，仍然使用。"; SNI=${OPT_SNI,,}; return 0; fi
-    (( OPT_AUTO )) && die "指定的 SNI 不合格。如确认要使用，请追加 --force-sni。"
+    manual_sni "$OPT_SNI"
+    return 0
+  fi
+  if (( ! OPT_AUTO )); then
+    step "选择 REALITY 目标网站 (SNI)"
+    [[ -z $SNI ]] || info "当前 SNI: ${SNI}"
+    manual_sni && return 0
   fi
 
   keys=$(sni_region_keys)
@@ -2469,7 +2464,7 @@ select_sni() {
   if (( npass == 0 )); then
     warn "没有候选域名通过全部检测。"
     awk -F'|' '$1=="FAIL" && ++n <= 15 {printf "    %s: %s\n", $2, $3}' "$res"
-    (( OPT_AUTO )) && die "自动模式下无法确定 SNI，请用 --sni 指定（或 --force-sni）。"
+    (( OPT_AUTO )) && die "自动模式下无法确定 SNI，请用 --sni 指定域名。"
     manual_sni && return 0
     die "未选择 SNI。"
   fi
@@ -2504,25 +2499,25 @@ select_sni() {
 }
 
 manual_sni() {
-  local d r
-  while :; do
-    ask d "请输入目标域名（例如 www.example.edu，留空返回）" ""
-    [[ -z $d ]] && return 1
-    d=${d#https://}; d=${d%%/*}; d=${d,,}
-    info "正在检测 ${d} ..."
-    load_cf_ranges
-    r=$( ( trap - ERR; set +e; sni_probe "$d" ) )
-    if [[ $r == PASS* ]]; then
-      local pq
-      IFS='|' read -r _ _ _ rtt ip cc city org pq _ <<<"$r"
-      ok "${d} 通过检测：TLS 握手 ${rtt}ms，IP ${ip} (${cc} ${city} ${org})，X25519MLKEM768: $(sni_pq_label "$pq")"
-      [[ -n $GEO_CC && $cc != "$GEO_CC" ]] && warn "该网站 IP 与 VPS 不在同一国家，不推荐。"
-      sni_pq_warn "$d" "$pq"
-      SNI=$d; return 0
-    fi
-    warn "${d} 未通过检测：$(cut -d'|' -f3 <<<"$r")"
-    if confirm "仍然坚持使用 ${d} 吗？（不推荐）" n; then SNI=$d; return 0; fi
-  done
+  local d=${1:-} r rtt ip cc city org pq
+  [[ -n $d ]] || ask d "请输入 SNI 域名（留空进入自动优选）" ""
+  d=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<<"$d")
+  [[ -n $d ]] || return 1
+  d=${d,,}; d=${d#https://}; d=${d%%/*}; d=${d%.}
+  info "正在检测 ${d} ..."
+  load_cf_ranges
+  r=$( ( trap - ERR; set +e; sni_probe "$d" ) ) || true
+  if [[ $r == PASS\|* ]]; then
+    IFS='|' read -r _ _ _ rtt ip cc city org pq _ <<<"$r"
+    ok "${d} 通过检测：TLS 握手 ${rtt}ms，IP ${ip} (${cc} ${city} ${org})，X25519MLKEM768: $(sni_pq_label "$pq")"
+    [[ -n $GEO_CC && $cc != "$GEO_CC" ]] && warn "该网站 IP 与 VPS 不在同一国家，不推荐。"
+    sni_pq_warn "$d" "$pq"
+  else
+    warn "${d} 未通过检测：$(cut -d'|' -f3 <<<"${r:-FAIL|$d|未得到检测结果}")"
+    warn "仍使用此 SNI；节点可能无法连接，请留意安装后的自检结果。"
+  fi
+  SNI=$d
+  return 0
 }
 
 # ============================================================
@@ -10092,8 +10087,7 @@ do_install() {
   fi
   save_state
 
-  local pqrc=0 redo=n
-  if (( IMPORT_MODE )) && [[ -n $SNI && -z $OPT_SNI ]]; then
+  if (( IMPORT_MODE && OPT_AUTO )) && [[ -n $SNI && -z $OPT_SNI ]]; then
     local sni_res=""
     sni_res=$(sni_probe "$SNI") || true
     if [[ $sni_res == FAIL* ]]; then
@@ -10103,13 +10097,7 @@ do_install() {
       info "导入的 SNI ${SNI} 仍然可用。"
     fi
   fi
-  [[ -n $SNI && -z $OPT_SNI ]] && { sni_pq_check "$SNI" || pqrc=$?; }
-  if (( pqrc == 1 )); then
-    # 不支持 MLKEM 只是偏好问题：给出警告，交互模式默认建议重新优选，自动模式保留原 SNI
-    warn "当前 SNI ${SNI} 不支持 X25519MLKEM768（后量子密钥交换），可继续使用，但建议优先选择支持 MLKEM 的目标。"
-    redo=y
-  fi
-  if [[ -z $SNI || -n $OPT_SNI ]] || { (( ! OPT_AUTO )) && confirm "是否重新优选 SNI（当前: ${SNI}）？" "$redo"; }; then
+  if (( ! OPT_AUTO )) || [[ -z $SNI || -n $OPT_SNI ]]; then
     select_sni
   fi
   SNI_TARGET="${SNI}:443"
@@ -14140,7 +14128,7 @@ show_menu() {
   ui_columns "oneclick proxy" "退出" \
     "安装 / 重新安装" \
     "查看链接 / 二维码 / Clash 配置" \
-    "更换 SNI（重新优选目标网站）" \
+    "更换 SNI（手填 / 自动优选）" \
     "重新生成密钥 / UUID" \
     "修改端口 / 端口跳跃" \
     "用户管理（添加 / 删除）" \
@@ -14273,8 +14261,8 @@ usage() {
   --auto              使用全部默认值自动安装（非交互）
   --outbound <策略>   出站：46 IPv4优先 / 64 IPv6优先 / 4 仅IPv4 / 6 仅IPv6 / auto 按检测
                       内网 ULA（fc00::/7）若 NAT66 到公网 IPv6，按双栈，可选 IPv6优先
-  --sni <域名>        指定 REALITY 目标网站（会进行合规检测）
-  --force-sni         与 --sni 一起使用：检测不通过也强制使用
+  --sni <域名>        指定 REALITY 目标网站（照常检测，不合格只警告并继续使用）
+  --force-sni         保留兼容旧命令；手填 SNI 检测不通过也会继续使用
   --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
   --hy2 / --no-hy2    安装 / 不安装 Hysteria2（默认安装）
@@ -14438,7 +14426,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
                       Vision 和 XHTTP 都开着时，菜单里的 s 切换是否共用 TCP 端口
   proxy proto xhttp-443 on|off
                       XHTTP 与 Vision 共用 / 分开 TCP 端口（Xray fallbacks）
-  proxy sni           重新优选 / 更换 SNI
+  proxy sni           手填 SNI 并检测（不合格只警告）；留空进入自动优选
   proxy regen         重新生成全部密钥
   proxy port          修改端口。可带 --port、--hy2-port、--xhttp-port；同步开启时 ufw/firewalld 跟着改
   proxy user          用户管理
