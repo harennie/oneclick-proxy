@@ -172,7 +172,6 @@ readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 # ----------------------------- 默认值 / 运行参数 -----------------------------
 OPT_AUTO=0
 OPT_SNI=""
-OPT_FORCE_SNI=0
 OPT_PORT=""
 OPT_HY2=""          # 空=询问(交互)/默认启用(auto); 1/0
 OPT_HY2_PORT=""

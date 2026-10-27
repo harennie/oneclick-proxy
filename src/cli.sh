@@ -541,7 +541,7 @@ parse_args() {
         ;;
       --sni) [[ -n ${2-} ]] || die "--sni 需要参数"; OPT_SNI=$2; shift ;;
       --sni=*) OPT_SNI=${1#*=} ;;
-      --force-sni) OPT_FORCE_SNI=1 ;;
+      --force-sni) : ;;
       --scan) OPT_SCAN=1 ;;
       --port) is_port_opt "${2-}" || die "--port 参数无效"; OPT_PORT=$2; shift ;;
       --port=*) OPT_PORT=${1#*=}; is_port_opt "$OPT_PORT" || die "--port 参数无效" ;;

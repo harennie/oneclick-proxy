@@ -13,7 +13,7 @@ trap 'rm -rf "$work"' EXIT
 setup_case() {
   TMP_DIR="$work/$1"
   mkdir -p "$TMP_DIR"
-  OPT_AUTO=0 OPT_SNI="" OPT_FORCE_SNI=0 OPT_SCAN=0 NAT_MODE=0 SNI=""
+  OPT_AUTO=0 OPT_SNI="" OPT_SCAN=0 NAT_MODE=0 SNI=""
   GEO_CC=US GEO_REGION="" GEO_CITY="" GEO_ORG=""
   TEST_RESULT='PASS|manual.example.com|10|20|192.0.2.1|US|Test|AS1|Y|4000'
   TEST_RC=0
@@ -81,7 +81,7 @@ select_sni >"$TMP_DIR/log"
 printf 'ok unattended automatic selection is preserved\n'
 
 setup_case cli
-OPT_AUTO=1 OPT_SNI=manual.example.com
+parse_args --auto --sni manual.example.com --force-sni
 TEST_RESULT='FAIL|manual.example.com|无 IPv4 解析'
 select_sni >"$TMP_DIR/log" 2>&1
 [[ $SNI == manual.example.com && ! -f $TMP_DIR/prompts ]] || fail '--sni 应警告后继续且不要求 --force-sni'
