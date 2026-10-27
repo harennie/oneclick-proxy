@@ -453,25 +453,38 @@ select_sni() {
 }
 
 manual_sni() {
-  local d=${1:-} r rtt ip cc city org pq
-  [[ -n $d ]] || ask d "请输入 SNI 域名（留空进入自动优选）" ""
-  d=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<<"$d")
-  [[ -n $d ]] || return 1
-  d=${d,,}; d=${d#https://}; d=${d%%/*}; d=${d%.}
-  info "正在检测 ${d} ..."
-  load_cf_ranges
-  r=$( ( trap - ERR; set +e; sni_probe "$d" ) ) || true
-  if [[ $r == PASS\|* ]]; then
-    IFS='|' read -r _ _ _ rtt ip cc city org pq _ <<<"$r"
-    ok "${d} 通过检测：TLS 握手 ${rtt}ms，IP ${ip} (${cc} ${city} ${org})，X25519MLKEM768: $(sni_pq_label "$pq")"
-    [[ -n $GEO_CC && $cc != "$GEO_CC" ]] && warn "该网站 IP 与 VPS 不在同一国家，不推荐。"
-    sni_pq_warn "$d" "$pq"
-  else
+  local d=${1:-} r rtt ip cc city org pq choice
+  while :; do
+    [[ -n $d ]] || ask d "请输入 SNI 域名（留空进入自动优选）" ""
+    d=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<<"$d")
+    [[ -n $d ]] || return 1
+    d=${d,,}; d=${d#https://}; d=${d%%/*}; d=${d%.}
+    info "正在检测 ${d} ..."
+    load_cf_ranges
+    r=$( ( trap - ERR; set +e; sni_probe "$d" ) ) || true
+    if [[ $r == PASS\|* ]]; then
+      IFS='|' read -r _ _ _ rtt ip cc city org pq _ <<<"$r"
+      ok "${d} 通过检测：TLS 握手 ${rtt}ms，IP ${ip} (${cc} ${city} ${org})，X25519MLKEM768: $(sni_pq_label "$pq")"
+      [[ -n $GEO_CC && $cc != "$GEO_CC" ]] && warn "该网站 IP 与 VPS 不在同一国家，不推荐。"
+      sni_pq_warn "$d" "$pq"
+      break
+    fi
     warn "${d} 未通过检测：$(cut -d'|' -f3 <<<"${r:-FAIL|$d|未得到检测结果}")"
-    warn "仍使用此 SNI；节点可能无法连接，请留意安装后的自检结果。"
-  fi
+    if (( OPT_AUTO )); then
+      warn "仍使用此 SNI；节点可能无法连接，请留意安装后的自检结果。"
+      break
+    fi
+    while :; do
+      ask choice "1) 重新填写  2) 继续使用 ${d}" "2"
+      case $choice in
+        1) d=""; continue 2 ;;
+        2) break ;;
+        *) warn "请输入 1 或 2。" ;;
+      esac
+    done
+    break
+  done
   SNI=$d
-  return 0
 }
 
 # ============================================================

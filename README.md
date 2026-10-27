@@ -619,7 +619,7 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 5. **不在 CDN / WAF 后面**：解析 IP 对照 <https://www.cloudflare.com/ips-v4>、ips-v6，并按响应头识别 Cloudflare（`server: cloudflare`、`cf-ray`）、Imperva/Incapsula（`x-iinfo`、`x-cdn: Imperva`、`incap_ses` / `visid_incap` Cookie）、Fastly（`x-served-by: cache-…`、`x-fastly-*`、`via: … varnish`）、Akamai（`server: AkamaiGHost`、`x-akamai-*`）、CloudFront（`via: … cloudfront`、`x-amz-cf-*`）、Azure Front Door（`x-azure-ref`）以及 Sucuri、BunnyCDN。CDN 节点与你的 VPS 明显不属于同一网络，且这类站点被大量滥用做 REALITY 目标（只用 `tr` + `grep -iE`，Alpine / busybox 下同样可用）。
 6. **不是被墙网站或大厂默认域名**：google / yahoo / apple / microsoft / amazon / cloudflare / github / 各大社交平台等被列入黑名单（这些域名要么被墙，要么是所有人都在用的“默认值”，特征明显）；`.cn` 域名也会被排除。
 
-交互安装、重装和安装后的 `proxy sni` 都先询问 SNI 域名：可以自由填写，留空进入原有自动优选。手填域名与候选域名使用同一套检测；不合格时说明原因并警告，仍使用该域名，无需二次确认。自动优选只列出检测通过的候选（TCP 延迟、TLS 握手时间、IP 归属），默认选第一名，也可以输入 `m` 手填域名。`--auto` 沿用已有 SNI，没有时自动优选；`--sni` 显式指定时同样只警告不拒绝。
+交互安装、重装和安装后的 `proxy sni` 都先询问 SNI 域名：可以自由填写，留空进入原有自动优选。手填域名与候选域名使用同一套检测；不合格时显示原因，并让你选择重新填写或继续使用。自动优选只列出检测通过的候选（TCP 延迟、TLS 握手时间、IP 归属），默认选第一名，也可以输入 `m` 手填域名。`--auto` 沿用已有 SNI，没有时自动优选；`--sni` 显式指定时同样检测，失败后警告并继续，避免非交互命令卡住。
 
 填写域名不会自动部署网站或申请证书；目标网站是否支持 TLS 1.3 / HTTP/2 由检测结果说明，仍需以实际节点连接测试为准。高级选项 `--scan` 会下载官方 RealiTLScanner，对 VPS 附近 IP 做 60 秒低并发扫描，找出同机房的 TLS1.3 + h2 站点后再走同样的检测流程；扫描可能被少数服务商视为端口扫描，请自行权衡。
 
