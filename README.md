@@ -138,6 +138,8 @@ NAT 示例：`bash proxy.sh --nat --auto --nat-port 59221:443 --nat-addr 156.239
 
 节点同时做落地：`bash proxy.sh --with-land --auto --land-port 8388`。已经装好的节点用 `proxy land-enable`，不重装、不改现有链接。
 
+Alpine / NAT 节点开启菜单第 22 项时，需要一条没有被其它协议、Hysteria2 端口跳跃或排除列表占用的映射。SS2022 本机同时监听 TCP+UDP，因此内部两种端口都要空闲；服务商仅转发 TCP 时可使用 TCP 代理，需要 UDP 业务时还须映射 UDP。请先在服务商面板增加映射，再用 `proxy nat` 第 1 项登记，之后开启落地入站。`--land-port` 选择的是已登记的外部端口，不能代替服务商创建映射。第一次安装时，`--land-port 外部:内部` 会与其它端口参数一起加入映射列表。
+
 申请证书示例：`bash proxy.sh --auto --cert-domain example.com`（默认 Let's Encrypt 单域名，解析必须全部指向这台机器；见「申请证书」）
 
 通配符示例：`bash proxy.sh --cert-kind wildcard --cert-domain example.com --cf-dns-token <令牌>`
