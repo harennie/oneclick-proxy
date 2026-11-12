@@ -1415,8 +1415,8 @@ land_in_attach() { # $1 节点 Xray 配置。纯落地机不走这里。
         ] end)
   ' "$f" >"${f}.land" && mv -f "${f}.land" "$f"
 }
-land_reserved_port() { # $1 内部端口。与已开启的节点协议或 hy2-relay 冲突则返回 0
-  local p=$1
+land_reserved_port() { # $1 内部端口。与已开启的节点协议、跳跃范围或 hy2-relay 冲突则返回 0
+  local p=$1 seg a b
   (( ${REALITY_ENABLED:-0} )) && [[ $p == "$XRAY_PORT" ]] && return 0
   (( ${XHTTP_ENABLED:-0} )) && ! xhttp_shared && [[ $p == "$XHTTP_PORT" ]] && return 0
   (( ${TROJAN_ENABLED:-0} )) && [[ $p == "$TROJAN_PORT" ]] && return 0
@@ -1424,6 +1424,12 @@ land_reserved_port() { # $1 内部端口。与已开启的节点协议或 hy2-re
   (( ${XHTTP_TLS_ENABLED:-0} )) && [[ $p == "$XHTTP_TLS_PORT" ]] && return 0
   (( ${WS_ENABLED:-0} )) && [[ $p == "$WS_PORT" ]] && return 0
   (( ${HY2_ENABLED:-0} )) && [[ $p == "$HY2_PORT" ]] && return 0
+  if (( ${HY2_ENABLED:-0} )); then
+    for seg in ${HOP_RANGE//,/ }; do
+      a=${seg%-*} b=${seg#*-}
+      (( p >= a && p <= b )) && return 0
+    done
+  fi
   (( ${TUIC_ENABLED:-0} )) && [[ $p == "$TUIC_PORT" ]] && return 0
   cert_is_public && [[ -n ${SUB_PORT:-} && $p == "$SUB_PORT" ]] && return 0
   [[ -n ${RELAY_SOCKS:-} && $p == "$RELAY_SOCKS" ]] && return 0
@@ -1443,13 +1449,16 @@ land_pick_free_port() {
   printf '%s' 34567
 }
 land_nat_first_both() { # 额外跳过的外部端口。TCP 和 UDP 都还没被别的协议占用。
-  local p x skip
+  local p ip x skip
   while read -r p; do
+    nat_excluded "$p" && continue
     nat_used_hit tcp "$p" && continue
     nat_used_hit udp "$p" && continue
     skip=0
     for x in "$@"; do [[ -n $x && $p == "$x" ]] && skip=1; done
     (( skip )) && continue
+    ip=$(ext2int "$p") || continue
+    land_reserved_port "$ip" && continue
     printf '%s\n' "$p"; return 0
   done < <(nat_all_ext)
   return 1
@@ -1476,13 +1485,13 @@ land_seed_used_ports() {
 land_choose_node_port_nat() {
   local p def="" saved=${LAND_EXT_PORT:-}
   if [[ -n ${OPT_LAND_PORT:-} ]]; then def=$(opt_ext "$OPT_LAND_PORT")
-  elif [[ -n $saved ]] && nat_usable "$saved" && ! nat_used_hit tcp "$saved" && ! nat_used_hit udp "$saved"; then def=$saved
+  elif [[ -n $saved ]] && nat_usable "$saved" && ! nat_used_hit tcp "$saved" && ! nat_used_hit udp "$saved" && ! land_reserved_port "$(ext2int "$saved")"; then def=$saved
   else def=$(land_nat_first_both) || def=""; fi
-  [[ -n $def ]] || die "没有同时空闲的 TCP 和 UDP 映射端口给落地入站。请再映射一个 TCP+UDP 端口，或用 --land-port 指定。"
+  [[ -n $def ]] || die "没有可用的落地映射（本机 TCP 和 UDP 端口须同时空闲；当前映射：${NAT_PORTS:-未设置}）。请先在服务商面板新增 TCP 映射（需要 UDP 转发时一并映射 UDP），再用 proxy nat 的第 1 项登记，最后重新开启落地入站。--land-port 只能选择已登记的映射，不能创建服务商映射。"
   while :; do
     if [[ -n $OPT_LAND_PORT ]] || (( OPT_AUTO )); then p=$def
     else
-      ask p "落地入站使用的外部端口（TCP+UDP，须在映射中）" "$def"
+      ask p "落地入站使用的外部端口（至少映射 TCP，须已登记）" "$def"
       p=$(sanitize_port_input "$p"); p=${p// /}
     fi
     if nat_usable "$p" && ! nat_used_hit tcp "$p" && ! nat_used_hit udp "$p"; then
@@ -1492,7 +1501,7 @@ land_choose_node_port_nat() {
         LAND_PORT=$ip
         nat_mark_used tcp "$p"
         nat_mark_used udp "$p"
-        info "落地入站：外部 ${LAND_EXT_PORT} → 本机 ${LAND_PORT}（TCP+UDP）。该映射需同时包含 TCP 和 UDP。"
+        info "落地入站：外部 ${LAND_EXT_PORT} → 本机 ${LAND_PORT}（监听 TCP+UDP）。外部仅映射 TCP 时只能代理 TCP；需要 UDP 转发时请在面板同时映射 UDP。"
         return 0
       fi
     else
@@ -1547,6 +1556,8 @@ land_node_apply() { # 重写节点 Xray（含或不含 ss-in）、防火墙和�
   [[ -n $INIT_SYS ]] || detect_init
   [[ -n $PKG ]] || detect_os
   if land_in_on && land_raw_active; then land_fwd_check; fi
+  # 新落地端口可能低于 1024，需在重启前同步 systemd / OpenRC 的绑定权限。
+  if direct_mode; then write_xray_service; fi
   save_state
   local rc=0
   if land_in_on && land_raw_active; then

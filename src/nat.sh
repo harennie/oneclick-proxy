@@ -250,7 +250,7 @@ nat_ask_internal() {
 # 从 --port / --hy2-port（外部[:内部]）推导映射列表
 nat_ports_from_opts() {
   local l="" x
-  for x in "$OPT_PORT" "$OPT_HY2_PORT" "$OPT_XHTTP_PORT" "$OPT_TROJAN_PORT" "$OPT_TUIC_PORT" "$OPT_ANYTLS_PORT"; do
+  for x in "$OPT_PORT" "$OPT_HY2_PORT" "$OPT_XHTTP_PORT" "$OPT_TROJAN_PORT" "$OPT_TUIC_PORT" "$OPT_ANYTLS_PORT" "$OPT_LAND_PORT"; do
     [[ -n $x ]] || continue
     [[ ",$l," == *",$x,"* ]] && continue
     l+="${l:+,}$x"

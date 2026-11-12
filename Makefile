@@ -9,3 +9,6 @@ check:
 	./build.sh --check
 	shellcheck -s bash proxy.sh
 	bash -n proxy.sh
+	bash tests/land-routing.sh
+	bash tests/sni-selection.sh
+	bash tests/land-nat.sh
