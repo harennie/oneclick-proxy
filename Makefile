@@ -11,4 +11,6 @@ check:
 	bash -n proxy.sh
 	bash tests/land-routing.sh
 	bash tests/sni-selection.sh
+	bash tests/reality-target.sh
+	bash tests/outbound-selection.sh
 	bash tests/land-nat.sh

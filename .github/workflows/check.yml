@@ -21,5 +21,9 @@ jobs:
         run: bash tests/land-routing.sh
       - name: SNI selection
         run: bash tests/sni-selection.sh
+      - name: Local REALITY target safety
+        run: bash tests/reality-target.sh
+      - name: Reinstall outbound selection
+        run: bash tests/outbound-selection.sh
       - name: NAT landing inbound
         run: bash tests/land-nat.sh
