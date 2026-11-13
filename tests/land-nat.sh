@@ -46,6 +46,7 @@ OPT_PORT=20443:1443 OPT_LAND_PORT=20444:8388
 printf 'ok NAT mappings include --land-port\n'
 
 # 只屏蔽系统写入和网络探测，保留菜单、端口选择、JSON 注入及 OpenRC 服务分派。
+check_port_free() { return 0; }
 load_state() { :; }
 need_installed() { :; }
 detect_os() { OS_ID=alpine PKG=apk INIT_SYS=openrc; }

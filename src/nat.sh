@@ -552,6 +552,10 @@ do_install() {
     if (( OPT_TUNE == 1 )); then apply_tuning; fi
   fi
 
+  step "出站地址"
+  OUTBOUND_IP_DONE=0
+  ensure_outbound_ip install
+
   step "端口设置"
   if (( NAT_MODE )); then
     choose_nat_addr
@@ -584,6 +588,7 @@ do_install() {
   fi
   save_state
 
+  local selected_from_sni=$SNI selected_from_target=${SNI_TARGET:-}
   if (( IMPORT_MODE && OPT_AUTO )) && [[ -n $SNI && -z $OPT_SNI ]]; then
     local sni_res=""
     sni_res=$(sni_probe "$SNI") || true
@@ -597,7 +602,7 @@ do_install() {
   if (( ! OPT_AUTO )) || [[ -z $SNI || -n $OPT_SNI ]]; then
     select_sni
   fi
-  SNI_TARGET="${SNI}:443"
+  sni_assign_target "$selected_from_sni" "$selected_from_target"
   mldsa_decide
   save_state
 
