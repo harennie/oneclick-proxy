@@ -381,7 +381,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;737:src/os.sh:1;1246:src/tune.sh:1;2046:src/xray.sh:1;4098:src/hy2.sh:1;4237:src/firewall.sh:1;5522:src/cert.sh:1;7554:src/cdn.sh:1;8539:src/link.sh:1;8932:src/singbox.sh:1;9516:src/nat.sh:1;10178:src/selftest.sh:1;10323:src/land.sh:1;12245:src/menu.sh:1;12842:src/route.sh:1;13357:src/export.sh:1;13573:src/doctor.sh:1;13972:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;737:src/os.sh:1;1246:src/tune.sh:1;2046:src/xray.sh:1;4183:src/hy2.sh:1;4322:src/firewall.sh:1;5607:src/cert.sh:1;7639:src/cdn.sh:1;8624:src/link.sh:1;9017:src/singbox.sh:1;9601:src/nat.sh:1;10268:src/selftest.sh:1;10413:src/land.sh:1;12335:src/menu.sh:1;12934:src/route.sh:1;13449:src/export.sh:1;13665:src/doctor.sh:1;14064:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -2230,8 +2230,11 @@ SNI_CHAIN_LEN=""
 sni_pq_check() { # $1 域名 [$2 IP]
   SNI_CHAIN_LEN=""
   [[ -x $XRAY_BIN ]] || return 2
-  local out pq
-  out=$(timeout 12 "$XRAY_BIN" tls ping ${2:+-ip "$2"} "$1" 2>&1) || true
+  local out pq host=$1 ip=${2:-}
+  if [[ -z $ip && $1 == "${SNI:-}" && ${SNI_TARGET:-} =~ ^(127\.0\.0\.1|\[::1\]):([0-9]+)$ ]]; then
+    ip=${BASH_REMATCH[1]}; host="${1}:${BASH_REMATCH[2]}"; ip=${ip#[}; ip=${ip%]}
+  fi
+  out=$(timeout 12 "$XRAY_BIN" tls ping ${ip:+-ip "$ip"} "$host" 2>&1) || true
   SNI_CHAIN_LEN=$(awk '/Pinging with SNI/{f=1} f && /total length:/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/){print $i; exit}}' <<<"$out")
   pq=$(awk '/Pinging with SNI/{f=1} f && /Post-Quantum key exchange:/{print; exit}' <<<"$out")
   [[ -n $pq ]] || return 2
@@ -2254,6 +2257,74 @@ mldsa_decide() {
 }
 # 当前是否在链接 / 配置中使用 pqv
 pqv_active() { [[ -n $MLDSA_VERIFY && -n $MLDSA_SEED && ${MLDSA_ON:-1} != 0 ]]; }
+
+# 同机域名不能把 REALITY 流量送回本机 Xray 的入站端口。
+sni_target_is_loop() {
+  local target=$1 host port ip ours local_host=0
+  [[ $target == *:* ]] || return 1
+  host=${target%:*}; port=${target##*:}; host=${host#[}; host=${host%]}
+  [[ -n $host ]] || return 1
+  is_port "$port" || return 1
+  port=$((10#$port))
+  if [[ ${host,,} == localhost || $host == ::1 || $host =~ ^127\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then local_host=1; fi
+  if (( ! local_host )); then
+    ours=" $(cert_ip_ours) "
+    for ip in $(cert_resolved_ips "$host"); do
+      if [[ $ip == 127.* || $ip == ::1 || $ours == *" ${ip,,} "* ]]; then local_host=1; break; fi
+    done
+  fi
+  (( local_host )) || return 1
+  (( ${REALITY_ENABLED:-0} == 1 )) && [[ $port == "$XRAY_PORT" ]] && return 0
+  (( ${XHTTP_ENABLED:-0} == 1 )) && [[ $port == "$XHTTP_PORT" ]] && return 0
+  (( ${TROJAN_ENABLED:-0} == 1 )) && [[ $port == "$TROJAN_PORT" ]] && return 0
+  [[ $(port_owner tcp "$port") == xray ]]
+}
+
+sni_local_tls_ok() { # $1 回环 HTTPS 地址；校验证书域名、TLS1.3/X25519 和 h2。
+  local target=$1 host=$2 out
+  [[ $target =~ ^(127\.0\.0\.1|\[::1\]):[0-9]+$ ]] || return 1
+  sni_target_is_loop "$target" && return 1
+  out=$(timeout 5 openssl s_client -connect "$target" -servername "$host" -tls1_3 -groups X25519 -alpn h2 \
+    -verify_return_error -verify_hostname "$host" </dev/null 2>&1 | tr -d '\000') || true
+  [[ $out == *TLSv1.3* && $out == *'ALPN protocol: h2'* && $out == *'Verify return code: 0 (ok)'* ]]
+}
+
+sni_assign_target() { # $1 选择前的 SNI；$2 选择前的显式 target。
+  local old_sni=${1:-} old_target=${2:-} target="${SNI}:443" p TTY_EOF=0
+  [[ $SNI == "$old_sni" && -n $old_target ]] && target=$old_target
+  if ! sni_target_is_loop "$target"; then
+    if [[ $target =~ ^(127\.0\.0\.1|\[::1\]):[0-9]+$ ]] && ! sni_local_tls_ok "$target" "$SNI"; then
+      warn "已保存的本机 HTTPS 目标 ${target} 未通过校验，需要重新选择。"
+    else
+      SNI_TARGET=$target
+      return 0
+    fi
+  else
+    warn "${SNI} 指向本机，不能回落到 Xray 自己的入站 ${target}。"
+  fi
+  for target in "$old_target" 127.0.0.1:9443 '[::1]:9443'; do
+    [[ -n $target ]] || continue
+    if sni_local_tls_ok "$target" "$SNI"; then
+      SNI_TARGET=$target
+      ok "自有域名 ${SNI} 使用本机 HTTPS 目标 ${SNI_TARGET}。"
+      return 0
+    fi
+  done
+  if (( OPT_AUTO )) || ! outbound_can_ask; then
+    die "未找到 ${SNI} 的本机 HTTPS 后端。请先配置受信任证书及独立 HTTPS 端口（例如 127.0.0.1:9443），或交互安装填写端口；拒绝生成自回环配置。"
+  fi
+  while :; do
+    ask p "本机 HTTPS 站点端口（不能使用 Xray 入站端口；0 取消）" 9443
+    (( ! TTY_EOF )) || die "未读取到本机 HTTPS 端口，拒绝生成自回环配置；请交互安装或先准备好 HTTPS 后端。"
+    [[ $p != 0 ]] || die "已取消自有域名目标设置，未写入 Xray 配置。"
+    if is_port "$p"; then
+      for target in "127.0.0.1:$p" "[::1]:$p"; do
+        if sni_local_tls_ok "$target" "$SNI"; then SNI_TARGET=$target; return 0; fi
+      done
+    fi
+    warn "端口不可用或 HTTPS 校验失败；需要证书包含 ${SNI}、TLS1.3/X25519 和 ALPN h2。"
+  done
+}
 
 # 探测单个候选域名。输出一行:
 #   PASS|域名|TCP延迟ms|TLS握手完成ms|IP|国家|城市|ASN|PQ|证书链长度
@@ -2278,7 +2349,7 @@ sni_probe() {
   else first=$(head -n1 <<<"$ip4s"); conn="${first}:443"; fi
 
   out=$(timeout 12 openssl s_client -connect "$conn" -servername "$host" -tls1_3 -groups X25519 -alpn h2 \
-        -verify_return_error -verify_hostname "$host" </dev/null 2>&1) || true
+        -verify_return_error -verify_hostname "$host" </dev/null 2>&1 | tr -d '\000') || true
   grep -q 'TLSv1.3' <<<"$out" || { echo "FAIL|$host|不支持 TLS1.3 / X25519"; return; }
   grep -q 'ALPN protocol: h2' <<<"$out" || { echo "FAIL|$host|不支持 ALPN h2"; return; }
   grep -q 'Verify return code: 0 (ok)' <<<"$out" || { echo "FAIL|$host|证书链/域名校验失败"; return; }
@@ -2504,6 +2575,12 @@ manual_sni() {
     d=$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<<"$d")
     [[ -n $d ]] || return 1
     d=${d,,}; d=${d#https://}; d=${d%%/*}; d=${d%.}
+    if cert_domain_syntax "$d" && sni_target_is_loop "${d}:443"; then
+      local old_sni=$SNI old_target=${SNI_TARGET:-}
+      SNI=$d
+      sni_assign_target "$old_sni" "$old_target"
+      return 0
+    fi
     info "正在检测 ${d} ..."
     load_cf_ranges
     r=$( ( trap - ERR; set +e; sni_probe "$d" ) ) || true
@@ -3645,6 +3722,7 @@ outbound_label() {
 }
 outbound_ask() {
   local c def=1
+  case ${OUTBOUND_IP:-} in 64) def=2 ;; 4) def=3 ;; 6) def=4 ;; esac
   if (( OB_NAT66 )); then
     echo "   出站地址（IPv4 可用；IPv6 经 NAT66 到 ${OB_NAT66_PUB}。只影响代理出站，不会关闭系统 IPv6）："
   else
@@ -3665,7 +3743,11 @@ outbound_ask() {
     esac
   done
 }
-outbound_use_saved_or_default() { # 双栈或检测不到时：沿用已保存的选择；--auto 且未保存则 IPv4优先
+outbound_use_saved_or_default() { # 交互安装重选；其它重配沿用；--auto 且未保存则 IPv4优先。
+  if [[ ${1:-} == install && -z ${OPT_OUTBOUND:-} ]] && (( ! OPT_AUTO && OB_HAS_V4 && OB_HAS_V6 )) && outbound_can_ask; then
+    outbound_ask
+    return 0
+  fi
   if [[ $OUTBOUND_IP =~ ^(46|64|4|6)$ ]]; then
     OUTBOUND_EFFECTIVE=$OUTBOUND_IP
     return 0
@@ -3731,7 +3813,7 @@ ensure_outbound_ip() {
     OUTBOUND_EFFECTIVE=6
     info "本机只有 IPv6，出站使用仅IPv6。"
   else
-    outbound_use_saved_or_default
+    outbound_use_saved_or_default "${1:-}"
   fi
   if (( OUTBOUND_IP_CHANGED )); then save_state; fi
   return 0
@@ -3934,6 +4016,9 @@ Group=${grp}"
   return 0
 }
 write_xray_config() {
+  if (( ! LAND_MODE )) && sni_target_is_loop "${SNI_TARGET:-$SNI:443}"; then
+    die "REALITY target 指回本机 Xray 入站，拒绝覆盖可用配置。请为 ${SNI} 选择独立的本机 HTTPS 后端。"
+  fi
   local clients tmp seed="" cplain tclients
   clients=$(xray_clients_json)
   cplain=$(xray_clients_json "")
@@ -10067,6 +10152,10 @@ do_install() {
     if (( OPT_TUNE == 1 )); then apply_tuning; fi
   fi
 
+  step "出站地址"
+  OUTBOUND_IP_DONE=0
+  ensure_outbound_ip install
+
   step "端口设置"
   if (( NAT_MODE )); then
     choose_nat_addr
@@ -10099,6 +10188,7 @@ do_install() {
   fi
   save_state
 
+  local selected_from_sni=$SNI selected_from_target=${SNI_TARGET:-}
   if (( IMPORT_MODE && OPT_AUTO )) && [[ -n $SNI && -z $OPT_SNI ]]; then
     local sni_res=""
     sni_res=$(sni_probe "$SNI") || true
@@ -10112,7 +10202,7 @@ do_install() {
   if (( ! OPT_AUTO )) || [[ -z $SNI || -n $OPT_SNI ]]; then
     select_sni
   fi
-  SNI_TARGET="${SNI}:443"
+  sni_assign_target "$selected_from_sni" "$selected_from_target"
   mldsa_decide
   save_state
 
@@ -12262,14 +12352,16 @@ menu_change_sni() {
   need_node; mktmp
   detect_ip; detect_geo
   (( NAT_MODE )) || SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
-  local old=$SNI
+  local old=$SNI old_target=${SNI_TARGET:-}
   select_sni
-  [[ $SNI == "$old" ]] && { info "SNI 未变化。"; return 0; }
-  SNI_TARGET="${SNI}:443"
+  sni_assign_target "$old" "$old_target"
+  [[ $SNI == "$old" && $SNI_TARGET == "$old_target" ]] && { info "SNI 和目标未变化。"; return 0; }
   mldsa_decide
   apply_all
   ( trap - ERR; set +e; reality_selftest ) || true
-  if tls_present_real; then
+  if [[ $SNI == "$old" ]]; then
+    ok "SNI 未变，REALITY 目标已由 ${old_target:-未设置} 修正为 ${SNI_TARGET}；客户端参数不变。"
+  elif tls_present_real; then
     ok "SNI 已由 ${old} 更换为 ${SNI}。REALITY / XHTTP / Trojan 需要更新链接。Hysteria2 / TUIC / AnyTLS 仍使用 ${CERT_DOMAIN} 的证书。"
   else
     ok "SNI 已由 ${old} 更换为 ${SNI}。客户端需要更新链接（Hysteria2 证书指纹也已变化）。"

@@ -21,6 +21,8 @@ setup_case() {
 }
 mktmp() { :; }
 load_cf_ranges() { :; }
+cert_resolved_ips() { printf '%s' 192.0.2.1; }
+cert_ip_ours() { printf '%s' 192.0.2.3; }
 confirm() { fail 'SNI 检测不通过时不应要求确认'; }
 ask() {
   local reply

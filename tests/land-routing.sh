@@ -181,8 +181,8 @@ assert_order() { # $1 ss-in 出口 tag
     .routing.rules
     | (first(.protocol == ["bittorrent"])) as $bt
     | (first(.inboundTag == ["ss-in"] and .outboundTag == $exit)) as $allow
-    | (first(.network == "tcp,udp" and (.inboundTag | not))) as $catch
-    | ($bt != null and $allow != null and $catch != null and ($bt < $allow) and ($allow < $catch))
+    | (first(.network == "tcp,udp" and (.inboundTag | not))) as $fallback
+    | ($bt != null and $allow != null and $fallback != null and ($bt < $allow) and ($allow < $fallback))
   ' "$cfg" >/dev/null || fail "ss-in 规则没有排在私网/BT 之后、land-add 兜底之前"
 }
 

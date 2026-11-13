@@ -18,14 +18,16 @@ menu_change_sni() {
   need_node; mktmp
   detect_ip; detect_geo
   (( NAT_MODE )) || SERVER_ADDR=${PUBLIC_IP4:-$PUBLIC_IP6}
-  local old=$SNI
+  local old=$SNI old_target=${SNI_TARGET:-}
   select_sni
-  [[ $SNI == "$old" ]] && { info "SNI 未变化。"; return 0; }
-  SNI_TARGET="${SNI}:443"
+  sni_assign_target "$old" "$old_target"
+  [[ $SNI == "$old" && $SNI_TARGET == "$old_target" ]] && { info "SNI 和目标未变化。"; return 0; }
   mldsa_decide
   apply_all
   ( trap - ERR; set +e; reality_selftest ) || true
-  if tls_present_real; then
+  if [[ $SNI == "$old" ]]; then
+    ok "SNI 未变，REALITY 目标已由 ${old_target:-未设置} 修正为 ${SNI_TARGET}；客户端参数不变。"
+  elif tls_present_real; then
     ok "SNI 已由 ${old} 更换为 ${SNI}。REALITY / XHTTP / Trojan 需要更新链接。Hysteria2 / TUIC / AnyTLS 仍使用 ${CERT_DOMAIN} 的证书。"
   else
     ok "SNI 已由 ${old} 更换为 ${SNI}。客户端需要更新链接（Hysteria2 证书指纹也已变化）。"
