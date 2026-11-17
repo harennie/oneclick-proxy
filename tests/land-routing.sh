@@ -29,7 +29,7 @@ reset_opts() {
   LAND_MODE=0 LAND_IN=0
 }
 
-if [[ $SCRIPT_VERSION != 1.7.0 ]]; then fail "SCRIPT_VERSION=$SCRIPT_VERSION"; fi
+if [[ $SCRIPT_VERSION != 1.8.0 ]]; then fail "SCRIPT_VERSION=$SCRIPT_VERSION"; fi
 usage | grep -q -- '--with-land' || fail "help missing --with-land"
 usage | grep -q -- 'land-enable' || fail "help missing land-enable"
 usage | grep -q -- 'land-next' || fail "help missing land-next"

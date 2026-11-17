@@ -231,15 +231,19 @@ show_menu() {
   run_menu_act "$act"
 }
 run_menu_act() {
-  local act=$1
+  local act=$1 err_trap
   # 在子 shell 中执行：出错时返回菜单而不是直接退出
   local rc=0
+  err_trap=$(trap -p ERR)
+  trap - ERR
   set +e
-  ( set -e; "$act" )
+  # 真正的脚本错误由子 shell 打印；普通诊断 exit 1 不再被父 shell 当作脚本崩溃。
+  ( eval "$err_trap"; set -e; "$act" )
   rc=$?
   set -e
+  eval "$err_trap"
   OPT_LAND=""
-  (( rc == 0 )) || warn "操作未完成（退出码 ${rc}）。"
+  if (( rc != 0 )) && [[ $act != menu_doctor ]]; then warn "操作未完成（退出码 ${rc}）。"; fi
   [[ $act == do_uninstall && ! -x $BIN_PATH && ! -f $STATE_FILE ]] && exit 0
   return 0
 }

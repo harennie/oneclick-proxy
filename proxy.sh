@@ -54,7 +54,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.7.0"
+readonly SCRIPT_VERSION="1.8.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -127,6 +127,7 @@ readonly LAND_FWD_SYSCTL="/etc/sysctl.d/99-proxy-oneclick-fwd.conf"
 readonly RESOLV_BAK="${STATE_DIR}/resolv.conf.bak"
 # 可选的公开证书（Let's Encrypt）。不申请时下面的目录不会被创建，节点仍用自签证书。
 readonly CERT_NAME="proxy-oneclick"
+readonly CERT_RENEW_CONF="/etc/letsencrypt/renewal/${CERT_NAME}.conf"
 readonly CERT_BASE="/etc/proxy-oneclick"
 readonly CERT_DIR="${CERT_BASE}/certs"
 readonly CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
@@ -381,7 +382,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;737:src/os.sh:1;1246:src/tune.sh:1;2046:src/xray.sh:1;4183:src/hy2.sh:1;4322:src/firewall.sh:1;5607:src/cert.sh:1;7639:src/cdn.sh:1;8624:src/link.sh:1;9017:src/singbox.sh:1;9601:src/nat.sh:1;10268:src/selftest.sh:1;10413:src/land.sh:1;12335:src/menu.sh:1;12934:src/route.sh:1;13449:src/export.sh:1;13665:src/doctor.sh:1;14064:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;738:src/os.sh:1;1247:src/tune.sh:1;2047:src/xray.sh:1;4184:src/hy2.sh:1;4323:src/firewall.sh:1;5608:src/cert.sh:1;7640:src/cdn.sh:1;8625:src/link.sh:1;9018:src/singbox.sh:1;9602:src/nat.sh:1;10269:src/selftest.sh:1;10410:src/land.sh:1;12332:src/menu.sh:1;12931:src/route.sh:1;13446:src/export.sh:1;13662:src/doctor.sh:1;14225:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -10266,149 +10267,145 @@ do_install() {
 
 # @module src/selftest.sh
 # ============================================================
-#               REALITY 自检（安装 / 更换 SNI 后）
+#        本机代理自检：临时客户端完成握手后，再经节点访问外网
 # ============================================================
-# 用已安装的 xray 在 127.0.0.1 的随机端口起一个临时 socks 客户端，按生成的链接参数
-# （VLESS + Vision + REALITY + pqv）连接本机 127.0.0.1:XRAY_PORT，再经它访问外网。
-# 只打印结果，不影响安装；客户端限制 GOMEMLIMIT，128MB 小鸡也可运行。
-reality_selftest() {
-  REALITY_SELFTEST=skip
-  (( ${REALITY_ENABLED:-1} )) || return 0
-  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XRAY_PORT ]] || { warn "跳过 REALITY 自检（缺少 xray 或参数）。"; return 0; }
-  mktmp
-  local dir port="" i pid code="" url ok_url="" rc=1
-  dir=$(mktemp -d "${TMP_DIR}/selftest.XXXXXX") || { warn "跳过 REALITY 自检（无法创建临时目录）。"; return 0; }
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+selftest_urls() {
+  printf '%s\n' https://www.gstatic.com/generate_204 https://cp.cloudflare.com/generate_204 https://www.apple.com/library/test/success.html
+}
+selftest_socks_port() {
+  local i port reserved=" ${1:-} ${XRAY_PORT:-} ${XHTTP_PORT:-} ${HY2_PORT:-} ${TUIC_PORT:-} ${ANYTLS_PORT:-} ${LAND_PORT:-} "
+  for (( i=0; i<10; i++ )); do
     port=$(( 20000 + RANDOM % 40000 ))
-    [[ $port == "$XRAY_PORT" || $port == "${HY2_PORT:-}" || $port == "${LAND_PORT:-}" ]] && continue
-    port_in_use tcp "$port" || break
+    [[ $reserved == *" $port "* ]] && continue
+    if ! port_in_use tcp "$port"; then printf '%s' "$port"; return 0; fi
   done
-  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$XRAY_PORT" --arg sni "$SNI" \
-      --arg pbk "$PUB_KEY" --arg sid "$SHORT_ID" --arg pqv "$(pqv_active && printf '%s' "$MLDSA_VERIFY")" '
-    {
+  return 1
+}
+selftest_client_config() { # $1 协议 $2 socks 端口 $3 目标端口 $4 文件
+  local kind=$1 sport=$2 dest=$3 file=$4 sni=${SNI:-} ca="" pin="" pass="" pqv=""
+  case $kind in
+    reality|xhttp) if pqv_active; then pqv=$MLDSA_VERIFY; fi ;;
+    hy2|tuic|anytls)
+      sni=$(tls_link_sni)
+      if ! tls_present_real; then
+        if [[ $kind == hy2 ]]; then ca=$HY_CRT; pin=${HY2_PIN:-}; else ca=$SB_CRT; fi
+      fi
+      case $kind in hy2) pass=$HY2_PASS ;; tuic) pass=$TUIC_PASS ;; anytls) pass=$ANYTLS_PASS ;; esac
+      ;;
+  esac
+  jq -n --arg kind "$kind" --argjson sport "$sport" --argjson port "$dest" \
+    --arg id "${UUID:-}" --arg sni "$sni" --arg pbk "${PUB_KEY:-}" --arg sid "${SHORT_ID:-}" \
+    --arg pqv "$pqv" --arg path "${XHTTP_PATH:-}" --arg ca "$ca" --arg pin "$pin" --arg pass "$pass" '
+    if $kind == "hy2" then {
+      server: ("127.0.0.1:" + ($port|tostring)), auth: $pass,
+      tls: ({sni: $sni, insecure: false} + (if $ca != "" then {ca: $ca} else {} end)
+        + (if $pin != "" then {pinSHA256: $pin} else {} end)),
+      socks5: {listen: ("127.0.0.1:" + ($sport|tostring)), disableUDP: true}
+    } elif $kind == "reality" or $kind == "xhttp" then {
       log: {loglevel: "warning"},
       inbounds: [{listen: "127.0.0.1", port: $sport, protocol: "socks", settings: {udp: false}}],
-      outbounds: [{
-        protocol: "vless",
-        settings: {vnext: [{address: "127.0.0.1", port: $port, users: [{id: $id, encryption: "none", flow: "xtls-rprx-vision"}]}]},
-        streamSettings: {network: "raw", security: "reality",
+      outbounds: [{protocol: "vless", settings: {vnext: [{address: "127.0.0.1", port: $port,
+        users: [{id: $id, encryption: "none", flow: (if $kind == "reality" then "xtls-rprx-vision" else "" end)}]}]},
+        streamSettings: ({network: (if $kind == "reality" then "raw" else "xhttp" end), security: "reality",
           realitySettings: ({serverName: $sni, fingerprint: "chrome", publicKey: $pbk, shortId: $sid}
             + (if $pqv != "" then {mldsa65Verify: $pqv} else {} end))}
-      }]
-    }' >"${dir}/client.json" 2>/dev/null; then
-    rm -rf "$dir"; warn "跳过 REALITY 自检（生成临时配置失败）。"; return 0
-  fi
-  chmod 600 "${dir}/client.json"
-  info "REALITY 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${XRAY_PORT}（SNI ${SNI}）..."
-  env GOMEMLIMIT=24MiB GOGC=50 "$XRAY_BIN" run -config "${dir}/client.json" >"${dir}/client.log" 2>&1 &
+          + (if $kind == "xhttp" then {xhttpSettings: {path: $path, mode: "stream-one"}} else {} end))}]
+    } else {
+      log: {level: "warn"},
+      inbounds: [{type: "socks", listen: "127.0.0.1", listen_port: $sport}],
+      outbounds: [({type: $kind, server: "127.0.0.1", server_port: $port, password: $pass,
+        tls: ({enabled: true, server_name: $sni} + (if $ca != "" then {certificate_path: $ca} else {} end))}
+        + (if $kind == "tuic" then {uuid: $id, congestion_control: "bbr", tls:
+            ({enabled: true, server_name: $sni, alpn: ["h3"]} + (if $ca != "" then {certificate_path: $ca} else {} end))} else {} end))]
+    } end' >"$file" || return 1
+  chmod 600 "$file"
+}
+selftest_probe() ( # $1 目录 $2 socks 端口 $3 协议；其余为客户端命令。
+  local dir=$1 port=$2 kind=$3 pid="" i url code eip
+  shift 3
+  trap - ERR
+  trap 'if [[ -n $pid ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi; rm -rf "$dir"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  env GOMEMLIMIT=24MiB GOGC=50 "$@" >"${dir}/client.log" 2>&1 &
   pid=$!
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  for (( i=0; i<10; i++ )); do
     sleep 0.5
     kill -0 "$pid" 2>/dev/null || break
     port_in_use tcp "$port" && break
   done
-  if kill -0 "$pid" 2>/dev/null; then
-    for url in "https://www.gstatic.com/generate_204" "https://cp.cloudflare.com/generate_204" "https://www.apple.com/library/test/success.html"; do
-      code=$(curl -s -o /dev/null --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" -w '%{http_code}' "$url" 2>/dev/null) || true
-      if [[ $code =~ ^[23][0-9][0-9]$ ]]; then rc=0 ok_url=$url; break; fi
-    done
+  if ! kill -0 "$pid" 2>/dev/null || ! port_in_use tcp "$port"; then
+    warn "临时客户端未能启动，请核对内核版本、证书和参数。"
+    exit 1
   fi
-  local eip=""
-  if (( rc == 0 )) && relay_active; then
-    eip=$(curl -s --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" https://api64.ipify.org 2>/dev/null | tr -d '[:space:]') || eip=""
-  fi
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  if (( rc == 0 )); then
-    REALITY_SELFTEST=ok
-    local h=${ok_url#https://}; h=${h%%/*}
-    ok "REALITY 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
-    if relay_active; then
-      if [[ -n $eip ]]; then ok "落地转发生效：客户端 → 本机 Reality → $(relay_tag) → 出口 IP ${eip}"
-      else warn "经落地转发查询出口 IP 失败。"; fi
+  while IFS= read -r url; do
+    code=$(curl --noproxy '' -s -o /dev/null --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" -w '%{http_code}' "$url" 2>/dev/null) || code=""
+    if [[ $code == 204 || $code == 200 ]]; then
+      ok "本机节点请求 ${url#https://} 返回 HTTP ${code}。"
+      if [[ $kind == reality ]] && relay_active; then
+        eip=$(curl --noproxy '' -s --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" https://api64.ipify.org 2>/dev/null | tr -d '[:space:]') || eip=""
+        if [[ -n $eip ]]; then ok "已配置落地 $(relay_tag)，经节点查询的出口 IP：${eip}。"
+        else warn "经落地转发查询出口 IP 失败。"; fi
+      fi
+      exit 0
     fi
-  else
-    REALITY_SELFTEST=fail
-    local direct=""
-    direct=$(curl -s -o /dev/null --connect-timeout 8 -m 12 -w '%{http_code}' "https://www.gstatic.com/generate_204" 2>/dev/null) || true
-    if [[ ! $direct =~ ^[23][0-9][0-9]$ ]]; then
-      warn "REALITY 自检无法判断：服务器本身访问外网失败（直连也不通），请稍后检查网络。"
-    else
-      warn "REALITY 自检未通过（本机直连外网正常，经节点失败）。可能原因：目标网站 ${SNI} 暂时不可达 / 握手不兼容，或 Xray 未正常运行。"
-      warn "  可查看: proxy status（Xray 日志），或更换 SNI: proxy sni"
-      grep -vi 'privatekey\|seed' "${dir}/client.log" 2>/dev/null | tail -n 3 | sed 's/^/    /' || true
+  done < <(selftest_urls)
+  # 测试站本身不可达时，不把外网故障误报为握手失败。
+  while IFS= read -r url; do
+    code=$(curl --noproxy '*' -s -o /dev/null --connect-timeout 3 -m 5 -w '%{http_code}' "$url" 2>/dev/null) || code=""
+    if [[ $code == 204 || $code == 200 ]]; then
+      warn "本机直连外网正常，经节点失败；请核对认证、TLS 和服务日志（proxy status）。"
+      exit 1
     fi
-  fi
-  rm -rf "$dir"
-  return 0
-}
-
-xhttp_selftest() {
-  XHTTP_SELFTEST=skip
-  (( ${XHTTP_ENABLED:-0} )) || return 0
-  [[ -x $XRAY_BIN && -n $UUID && -n $PUB_KEY && -n $SNI && -n $XHTTP_PATH ]] || { warn "跳过 XHTTP 自检（缺少参数）。"; return 0; }
-  local dest=${XHTTP_PORT:-}
-  xhttp_shared && dest=$XRAY_PORT
-  [[ -n $dest ]] || { warn "跳过 XHTTP 自检（缺少端口）。"; return 0; }
+  done < <(selftest_urls)
+  warn "本机直连测试站也失败，无法确定协议握手状态；请先检查外网连通性。"
+  exit 2
+)
+protocol_selftest() { # 在原有各协议入口中共用临时客户端流程，不修改正式配置。
+  local kind=$1 label result binary dest rc dir port
+  case $kind in
+    reality) label=REALITY; result=REALITY_SELFTEST; binary=$XRAY_BIN; dest=${XRAY_PORT:-}; [[ ${REALITY_ENABLED:-1} == 1 ]] || return 0 ;;
+    xhttp) label=XHTTP; result=XHTTP_SELFTEST; binary=$XRAY_BIN; dest=${XHTTP_PORT:-}; xhttp_shared && dest=$XRAY_PORT; [[ ${XHTTP_ENABLED:-0} == 1 ]] || return 0 ;;
+    hy2) label=Hysteria2; result=HY2_SELFTEST; binary=$HY_BIN; dest=${HY2_PORT:-}; [[ ${HY2_ENABLED:-0} == 1 ]] || return 0 ;;
+    tuic) label=TUIC; result=TUIC_SELFTEST; binary=$SB_BIN; dest=${TUIC_PORT:-}; [[ ${TUIC_ENABLED:-0} == 1 ]] || return 0 ;;
+    anytls) label=AnyTLS; result=ANYTLS_SELFTEST; binary=$SB_BIN; dest=${ANYTLS_PORT:-}; [[ ${ANYTLS_ENABLED:-0} == 1 ]] || return 0 ;;
+    *) return 1 ;;
+  esac
+  printf -v "$result" skip
+  if [[ ! -x $binary ]] || ! is_port "$dest"; then warn "跳过 ${label} 自检（缺少内核或有效端口）。"; return 0; fi
+  case $kind in
+    reality|xhttp) [[ -n ${UUID:-} && -n ${PUB_KEY:-} && -n ${SNI:-} && -n ${SHORT_ID:-} ]] || return 0 ;;
+    hy2) [[ -n ${HY2_PASS:-} ]] || return 0 ;;
+    tuic) [[ -n ${UUID:-} && -n ${TUIC_PASS:-} ]] || return 0 ;;
+    anytls) [[ -n ${ANYTLS_PASS:-} ]] || return 0 ;;
+  esac
   mktmp
-  local dir port="" i pid code="" url ok_url="" rc=1
-  dir=$(mktemp -d "${TMP_DIR}/xhttp-self.XXXXXX") || { warn "跳过 XHTTP 自检（无法创建临时目录）。"; return 0; }
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    port=$(( 20000 + RANDOM % 40000 ))
-    [[ $port == "$XRAY_PORT" || $port == "$XHTTP_PORT" || $port == "$dest" || $port == "${HY2_PORT:-}" || $port == "${LAND_PORT:-}" ]] && continue
-    port_in_use tcp "$port" || break
-  done
-  if ! jq -n --arg id "$UUID" --argjson sport "$port" --argjson port "$dest" --arg sni "$SNI" \
-      --arg pbk "$PUB_KEY" --arg sid "$SHORT_ID" --arg path "$XHTTP_PATH" \
-      --arg pqv "$(pqv_active && printf '%s' "$MLDSA_VERIFY")" '
-    {
-      log: {loglevel: "warning"},
-      inbounds: [{listen: "127.0.0.1", port: $sport, protocol: "socks", settings: {udp: false}}],
-      outbounds: [{
-        protocol: "vless",
-        settings: {vnext: [{address: "127.0.0.1", port: $port, users: [{id: $id, encryption: "none", flow: ""}]}]},
-        streamSettings: {network: "xhttp", security: "reality",
-          xhttpSettings: {path: $path, mode: "stream-one"},
-          realitySettings: ({serverName: $sni, fingerprint: "chrome", publicKey: $pbk, shortId: $sid}
-            + (if $pqv != "" then {mldsa65Verify: $pqv} else {} end))}
-      }]
-    }' >"${dir}/client.json" 2>/dev/null; then
-    rm -rf "$dir"; warn "跳过 XHTTP 自检（生成临时配置失败）。"; return 0
-  fi
-  chmod 600 "${dir}/client.json"
-  if xhttp_shared; then
-    info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${dest}（与 Vision 共用，mode stream-one，SNI ${SNI}）..."
+  dir=$(mktemp -d "${TMP_DIR}/${kind}-self.XXXXXX") || return 0
+  if ! port=$(selftest_socks_port "$dest"); then rm -rf "$dir"; warn "跳过 ${label} 自检（没有空闲的临时端口）。"; return 0; fi
+  if ! selftest_client_config "$kind" "$port" "$dest" "${dir}/client.json"; then rm -rf "$dir"; warn "跳过 ${label} 自检（生成临时配置失败）。"; return 0; fi
+  info "${label} 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${dest} ..."
+  local -a args
+  case $kind in
+    reality|xhttp) args=("$binary" run -config "${dir}/client.json") ;;
+    hy2) args=("$binary" client -c "${dir}/client.json") ;;
+    *) args=("$binary" run -c "${dir}/client.json") ;;
+  esac
+  if selftest_probe "$dir" "$port" "$kind" "${args[@]}"; then printf -v "$result" ok
   else
-    info "XHTTP 自检：临时客户端 127.0.0.1:${port} → 本机 127.0.0.1:${dest}（mode stream-one，SNI ${SNI}）..."
+    rc=$?
+    if (( rc == 1 )); then
+      printf -v "$result" fail
+      [[ $kind != xhttp ]] || warn "XHTTP 客户端 mode 应为 stream-one，path 必须与服务端一致。"
+    elif (( rc == 130 || rc == 143 )); then return "$rc"
+    fi
   fi
-  env GOMEMLIMIT=24MiB GOGC=50 "$XRAY_BIN" run -config "${dir}/client.json" >"${dir}/client.log" 2>&1 &
-  pid=$!
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 0.5
-    kill -0 "$pid" 2>/dev/null || break
-    port_in_use tcp "$port" && break
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    for url in "https://www.gstatic.com/generate_204" "https://cp.cloudflare.com/generate_204" "https://www.apple.com/library/test/success.html"; do
-      code=$(curl -s -o /dev/null --connect-timeout 8 -m 12 --socks5-hostname "127.0.0.1:${port}" -w '%{http_code}' "$url" 2>/dev/null) || true
-      if [[ $code =~ ^[23][0-9][0-9]$ ]]; then rc=0 ok_url=$url; break; fi
-    done
-  fi
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  if (( rc == 0 )); then
-    XHTTP_SELFTEST=ok
-    local h=${ok_url#https://}; h=${h%%/*}
-    ok "XHTTP 自检通过：经本机节点访问 ${h} 返回 HTTP ${code}。"
-  else
-    XHTTP_SELFTEST=fail
-    warn "XHTTP 自检未通过。可查看 proxy status；客户端链接里的 mode 必须是 stream-one，path 必须与服务端一致。"
-    grep -vi 'privatekey\|seed' "${dir}/client.log" 2>/dev/null | tail -n 3 | sed 's/^/    /' || true
-  fi
-  rm -rf "$dir"
   return 0
 }
-
+reality_selftest() { REALITY_SELFTEST=skip; protocol_selftest reality; }
+xhttp_selftest() { XHTTP_SELFTEST=skip; protocol_selftest xhttp; }
+hy2_selftest() { HY2_SELFTEST=skip; protocol_selftest hy2; }
+tuic_selftest() { TUIC_SELFTEST=skip; protocol_selftest tuic; }
+anytls_selftest() { ANYTLS_SELFTEST=skip; protocol_selftest anytls; }
 # @module src/land.sh
 # ============================================================
 #       落地机（Shadowsocks 2022 出口）/ 中转机的落地转发
@@ -13669,10 +13666,11 @@ menu_import() {
 # 按清单重写 ufw/firewalld、把 state.env 改为 600。
 DOCTOR_FIX=0
 DOCTOR_FAIL=0
+DOCTOR_WARN=0
 DOCTOR_FIXED=""
 doc_line() { printf '  %-6s %s\n' "$1" "$2"; }
 doc_ok() { doc_line OK "$*"; }
-doc_warn() { doc_line WARN "$*"; }
+doc_warn() { DOCTOR_WARN=$(( DOCTOR_WARN + 1 )); doc_line WARN "$*"; }
 doc_fail() { doc_line FAIL "$*"; DOCTOR_FAIL=1; }
 doc_info() { doc_line INFO "$*"; }
 doc_fixed() { DOCTOR_FIXED+="${DOCTOR_FIXED:+$'\n'}$*"; }
@@ -13756,8 +13754,50 @@ doctor_one_svc() { # $1 服务名 $2 是否必须（1/0）
 doctor_port() { # $1 tcp|udp $2 port $3 名称
   local proto=$1 port=$2 name=$3
   [[ -n $port && $port != 0 ]] || return 0
-  if port_in_use "$proto" "$port"; then doc_ok "${name} 正在监听 ${proto^^}/${port}。"
+  if port_in_use "$proto" "$port"; then
+    doc_ok "${name} 正在监听 ${proto^^}/${port}（$(doctor_listen_families "$proto" "$port")）。"
   else doc_fail "${name} 没有监听 ${proto^^}/${port}。可查看: proxy status"; fi
+}
+doctor_listen_families() {
+  local flag=t v4 v6 detail address four=未确认 six=未确认
+  [[ $1 == udp ]] && flag=u
+  if ! have ss; then printf '地址族未确认'; return 0; fi
+  if v4=$(ss -4 -H -ln"$flag" "sport = :$2" 2>/dev/null); then
+    four=未监听; [[ -n $v4 ]] && four=已监听
+  fi
+  if v6=$(ss -6 -H -ln"$flag" "sport = :$2" 2>/dev/null); then
+    six=未监听; [[ -n $v6 ]] && six=已监听
+    if [[ -z $v4 && -n $v6 ]]; then
+      detail=$(ss -6 -H -lne"$flag" "sport = :$2" 2>/dev/null || true)
+      address=$(awk 'NR==1{print $4}' <<<"$v6")
+      if [[ $detail == *v6only:0* && ( $address == "*:$2" || $address == "[::]:$2" || $address == ":::$2" ) ]]; then four=双栈监听
+      elif [[ $detail != *v6only:1* ]]; then four=未确认
+      fi
+    fi
+  fi
+  printf 'IPv4 %s / IPv6 %s' "$four" "$six"
+}
+doctor_configs() {
+  if xray_inbound_needed && [[ -x $XRAY_BIN && -f $XRAY_CONF ]]; then
+    if XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$XRAY_CONF" >/dev/null 2>&1; then doc_ok "Xray 当前配置校验通过。"
+    else doc_fail "Xray 当前配置校验失败；请运行 xray run -test -config ${XRAY_CONF} 查看错误。"; fi
+  fi
+  if sb_needed && [[ -x $SB_BIN && -f $SB_CONF ]]; then
+    if "$SB_BIN" check -c "$SB_CONF" >/dev/null 2>&1; then doc_ok "sing-box 当前配置校验通过。"
+    else doc_fail "sing-box 当前配置校验失败；请运行 sing-box check -c ${SB_CONF} 查看错误。"; fi
+  fi
+}
+doctor_network() {
+  local family ip
+  for family in 4 6; do
+    ip=$(curl --noproxy '*' -"$family" -fsS --connect-timeout 3 -m 5 https://api64.ipify.org 2>/dev/null) || ip=""
+    if [[ ( $family == 4 && $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ) || ( $family == 6 && $ip == *:* ) ]]; then
+      doc_ok "本机 IPv${family} 出站探测成功：${ip}。"
+    else
+      doc_warn "本机 IPv${family} 出站探测未成功（可能未开通该地址族或测试站不可达）。"
+    fi
+  done
+  doc_info "这是 VPS 到外网的探测，不代表客户端到 VPS 的入口线路可用。"
 }
 doctor_land_listen() {
   local port=$1
@@ -13818,7 +13858,7 @@ doctor_services() {
   fi
 }
 doctor_fw_ports_present() {
-  local text=$1 miss=0 p
+  local text=$1 miss=0
   if (( REALITY_ENABLED )); then
     grep -Eq "dport .*${XRAY_PORT}([^0-9]|$)" <<<"$text" || miss=1
   fi
@@ -13936,6 +13976,12 @@ doctor_land_whitelist() {
 doctor_sni() {
   (( REALITY_ENABLED || XHTTP_ENABLED )) || return 0
   [[ -n $SNI ]] || { doc_fail "没有 SNI。可执行: proxy sni"; return 0; }
+  if [[ ${SNI_TARGET:-} =~ ^(127\.0\.0\.1|\[::1\]):[0-9]+$ ]]; then
+    if sni_local_tls_ok "$SNI_TARGET" "$SNI"; then doc_ok "本机 SNI HTTPS 后端 ${SNI_TARGET} 校验通过。"
+    else doc_warn "本机 SNI HTTPS 后端未通过校验，请检查网站证书、TLS1.3/X25519 和 h2。"; fi
+    doc_info "此网站的证书与续期由站点服务维护；下面的证书续期检查仅针对本脚本申请的证书。"
+    return 0
+  fi
   local res
   res=$(sni_probe "$SNI") || true
   if [[ $res == PASS* ]]; then doc_ok "SNI ${SNI} 仍然可用。"
@@ -13962,9 +14008,22 @@ doctor_selftests() {
       *) doc_warn "跳过了 XHTTP 回环自检。" ;;
     esac
   fi
-  if (( HY2_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED )); then
-    doc_ok "Hysteria2 / TUIC / AnyTLS 只核对了本机是否在监听，没有单独的回环握手。"
-  fi
+  local protocol result label enabled
+  for protocol in hy2 tuic anytls; do
+    case $protocol in
+      hy2) enabled=$HY2_ENABLED; label=Hysteria2; result=HY2_SELFTEST ;;
+      tuic) enabled=$TUIC_ENABLED; label=TUIC; result=TUIC_SELFTEST ;;
+      anytls) enabled=$ANYTLS_ENABLED; label=AnyTLS; result=ANYTLS_SELFTEST ;;
+    esac
+    (( enabled )) || continue
+    "${protocol}_selftest" || true
+    case $protocol in hy2) result=${HY2_SELFTEST:-skip} ;; tuic) result=${TUIC_SELFTEST:-skip} ;; anytls) result=${ANYTLS_SELFTEST:-skip} ;; esac
+    case $result in
+      ok) doc_ok "${label} 回环握手及代理请求通过。" ;;
+      fail) doc_fail "${label} 回环自检未通过；请核对认证、TLS 和 proxy status 日志。" ;;
+      *) doc_warn "${label} 回环自检未完成，不能仅凭监听判定节点可用。" ;;
+    esac
+  done
   if land_ss_on && ! land_raw_active; then
     land_selftest || true
     case ${LAND_SELFTEST:-skip} in
@@ -13978,39 +14037,138 @@ doctor_reach() {
   local addr
   addr=$(server_addr 2>/dev/null || true)
   [[ -n $addr ]] || addr="<服务器地址>"
-  doc_ok "外部是否通，需要在自己的电脑上检查。云安全组要放行同一批端口。"
+  doc_info "外部入口尚未验证；需从客户端检查，云安全组也要放行同一批端口。"
+  [[ $addr != *:* ]] || doc_info "此入口是 IPv6：客户端必须有可用的公网 IPv6 和默认路由，只有 fe80 地址不够。"
   if (( REALITY_ENABLED )); then
     echo "        nc -vz ${addr} $(pub_xray_port)"
-    echo "        curl -v --connect-timeout 5 telnet://${addr}:$(pub_xray_port)"
+    echo "        curl -v --connect-timeout 5 telnet://$(host_fmt "$addr"):$(pub_xray_port)"
   fi
   if (( XHTTP_ENABLED )) && ! xhttp_shared; then
     echo "        nc -vz ${addr} $(pub_xhttp_port)"
   fi
   if (( HY2_ENABLED )); then
-    echo "        nc -uvz ${addr} $(pub_hy2_port)"
+    echo "        UDP ${addr}:$(pub_hy2_port)：需用真实 Hysteria2 客户端测试，nc -u 不能证明握手成功。"
   fi
   if land_ss_on && ! land_raw_active; then
     echo "        nc -vz ${addr} $(pub_land_port)"
-    echo "        nc -uvz ${addr} $(pub_land_port)"
+    echo "        UDP ${addr}:$(pub_land_port)：需用真实 Shadowsocks 客户端测试。"
+  fi
+}
+doctor_service_user() {
+  local user dynamic
+  if is_openrc; then
+    user=$(sed -n 's/^command_user=//p' "/etc/init.d/$1" 2>/dev/null | head -n1 | tr -d "\"'")
+    user=${user%%:*}
+  else
+    user=$(systemctl show "$1" -p User --value 2>/dev/null) || return 2
+    if [[ -z $user ]]; then
+      dynamic=$(systemctl show "$1" -p DynamicUser --value 2>/dev/null) || return 2
+      [[ $dynamic != yes ]] || return 2
+    fi
+  fi
+  printf '%s' "${user:-root}"
+}
+doctor_files_readable() { # 返回 2 表示本机没有可用的切换用户工具。
+  local user=$1 cert=$2 key=$3
+  id "$user" >/dev/null 2>&1 || return 2
+  if [[ $user == root ]]; then test -r "$cert" && test -r "$key"
+  elif have runuser; then
+    # shellcheck disable=SC2016
+    runuser -u "$user" -- sh -c 'test -r "$1" && test -r "$2"' sh "$cert" "$key" >/dev/null 2>&1
+  elif have su; then su -s /bin/sh -c "test -r $(printf '%q' "$cert") && test -r $(printf '%q' "$key")" "$user" >/dev/null 2>&1
+  else return 2
+  fi
+}
+doctor_cert_reader() { # 服务名、实际读取的证书和私钥。
+  local service=$1 cert=$2 key=$3 user rc=0
+  svc_exists "$service" || return 0
+  if ! user=$(doctor_service_user "$service"); then doc_warn "无法确认 ${service} 的服务账号，证书权限未验证。"; return 0; fi
+  doctor_files_readable "$user" "$cert" "$key" || rc=$?
+  case $rc in
+    0) doc_ok "${service} 账号 ${user} 可读取证书和私钥。" ;;
+    2) doc_warn "无法按 ${service} 账号检查证书读取权限。" ;;
+    *) doc_fail "${service} 账号 ${user} 无法读取证书或私钥（含父目录权限）。" ;;
+  esac
+}
+doctor_cert_fingerprint() { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+doctor_renew_value() {
+  awk -v key="$1" '$0 ~ "^[[:space:]]*" key "[[:space:]]*=" {sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*$/, ""); print; exit}' "$CERT_RENEW_CONF"
+}
+doctor_cert_renewal() {
+  local hook live authenticator rules unattended=1
+  cert_renew_unattended || unattended=0
+  if ! have certbot; then doc_warn "缺少 certbot，证书无法通过现有任务自动续期。"; fi
+  if (( ! unattended )); then
+    doc_info "当前证书需要手工 DNS 验证，不要求无人值守续期任务。"
+  elif is_openrc; then
+    if [[ -x $CERT_CRON ]] && { svc_active crond || svc_active cron; }; then doc_ok "每日续期脚本和 cron 服务已就绪。"
+    else doc_warn "每日续期脚本或 cron 服务未就绪。"; fi
+  elif systemctl is-enabled --quiet proxy-oneclick-cert.timer 2>/dev/null && systemctl is-active --quiet proxy-oneclick-cert.timer 2>/dev/null; then
+    doc_ok "证书续期 timer 已启用并运行。"
+  else doc_warn "脚本的证书续期 timer 未启用或未运行，其他续期任务尚未核实。"
+  fi
+  if [[ ! -s $CERT_RENEW_CONF ]]; then doc_warn "没有找到此证书的 Certbot 续期配置。"; return 0; fi
+  hook=$(doctor_renew_value deploy_hook)
+  [[ -n $hook ]] || hook=$(doctor_renew_value renew_hook)
+  if [[ $hook != "$CERT_HOOK" ]]; then doc_warn "续期配置没有登记脚本的部署钩子，服务证书可能不会随续期更新。"; fi
+  if [[ -x $CERT_HOOK ]] && sh -n "$CERT_HOOK" >/dev/null 2>&1; then doc_ok "证书部署钩子存在且语法正确（未实际执行）。"
+  else doc_warn "证书部署钩子不存在、不可执行或有语法错误。"; fi
+  live=$(doctor_renew_value fullchain)
+  if [[ -s $live ]] && [[ $(doctor_cert_fingerprint "$live") != "$(doctor_cert_fingerprint "$CERT_FULLCHAIN")" ]]; then
+    doc_warn "Certbot 原证书和当前部署副本不一致，请检查部署钩子是否同步成功。"
+  fi
+  authenticator=$(doctor_renew_value authenticator)
+  if [[ ${CERT_CHALLENGE:-http} == http ]]; then
+    if [[ $authenticator == standalone ]] && port_in_use tcp 80; then
+      doc_warn "HTTP-01 使用 standalone，但 TCP 80 已被占用，续期时可能无法绑定。"
+    fi
+    if [[ ${FW_MODE:-off} == strict ]] && rules=$(nft list table inet "$NFT_TABLE" 2>/dev/null); then
+      if ! grep -Eq 'tcp dport (80([^0-9]|$)|.*[^0-9]80([^0-9]|$)).*accept' <<<"$rules"; then doc_warn "严格防火墙里未看到 TCP 80 放行，HTTP-01 续期可能失败。"; fi
+    fi
+    doc_info "HTTP-01 还需要公网可访问 TCP 80；未发起 CA 验证，也未检测云安全组。"
+  elif [[ ${CERT_CHALLENGE:-} == dns ]]; then
+    if [[ ! -s $CERT_DNS_TOKEN ]]; then doc_warn "DNS-01 没有保存 DNS 令牌，需要手工验证，不能无人值守续期。"
+    elif [[ ! -x $CERT_DNS_AUTH || ! -x $CERT_DNS_CLEAN || $(doctor_renew_value manual_auth_hook) != "$CERT_DNS_AUTH" || $(doctor_renew_value manual_cleanup_hook) != "$CERT_DNS_CLEAN" ]]; then
+      doc_warn "DNS-01 验证或清理钩子不可执行，或未登记在续期配置中，自动续期可能失败。"
+    else doc_info "DNS-01 令牌文件和钩子存在；API 权限及令牌有效性尚未联网验证。"
+    fi
   fi
 }
 doctor_cert() {
-  cert_is_public || return 0
-  [[ -s $CERT_FULLCHAIN ]] || { doc_fail "状态里开了公开证书，但文件不在。"; return 0; }
+  [[ ${CERT_ON:-0} == 1 ]] || return 0
+  [[ -s $CERT_FULLCHAIN ]] || { doc_fail "状态里启用了证书，但证书文件不在。"; return 0; }
+  if ! openssl x509 -in "$CERT_FULLCHAIN" -noout >/dev/null 2>&1; then doc_fail "证书文件无法解析。"; return 0; fi
   if ! openssl x509 -checkend 0 -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
-    doc_fail "公开证书已经过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。"
-    return 0
+    doc_fail "证书已经过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。"
+  elif ! openssl x509 -checkend $(( 7 * 86400 )) -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
+    doc_warn "证书不到 7 天就要过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。可执行: proxy cert"
+  else doc_ok "证书未过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。"
   fi
-  if ! openssl x509 -checkend $(( 7 * 86400 )) -noout -in "$CERT_FULLCHAIN" >/dev/null 2>&1; then
-    doc_warn "公开证书不到 7 天就要过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。可执行: proxy cert"
-    return 0
+  if ! cert_san_ok "$CERT_FULLCHAIN"; then doc_fail "证书未覆盖已配置的节点域名（主域名 ${CERT_DOMAIN}）。"; fi
+  local cert_key private_key
+  cert_key=$(openssl x509 -in "$CERT_FULLCHAIN" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum) || cert_key=""
+  private_key=$(openssl pkey -in "$CERT_PRIVKEY" -passin pass: -pubout -outform DER 2>/dev/null | sha256sum) || private_key=""
+  if [[ -n $cert_key && $cert_key == "$private_key" ]]; then doc_ok "证书与私钥匹配。"
+  else doc_fail "证书私钥缺失、无法解析或与证书不匹配。"; fi
+  if cert_is_public; then
+    (( HY2_ENABLED )) && doctor_cert_reader hysteria-server "$CERT_FULLCHAIN" "$CERT_PRIVKEY"
+    sb_needed && doctor_cert_reader sing-box "$CERT_FULLCHAIN" "$CERT_PRIVKEY"
+    doctor_cert_reader proxy-oneclick-sub "$CERT_FULLCHAIN" "$CERT_PRIVKEY"
+    doctor_cert_renewal
+  else doc_info "源站证书不使用 ACME 自动续期，不能直接用于 Hysteria2 / TUIC / AnyTLS。"
   fi
-  doc_ok "公开证书未过期（$(cert_expiry_text 2>/dev/null || echo 未知)）。"
+  if cdn_wanted; then
+    doctor_cert_reader xray "$XRAY_CERT_FULL" "$XRAY_CERT_KEY"
+    if [[ $(doctor_cert_fingerprint "$CERT_FULLCHAIN") != "$(doctor_cert_fingerprint "$XRAY_CERT_FULL")" ]]; then doc_warn "Xray 的 CDN 证书副本与当前证书不一致。"; fi
+  fi
+  return 0
 }
 doctor_run_checks() {
   doctor_clock
   doctor_services
+  doctor_configs
   doctor_firewall
+  doctor_network
   doctor_sni
   doctor_selftests
   doctor_reach
@@ -14022,6 +14180,7 @@ do_doctor() {
   [[ -n $INIT_SYS ]] || detect_init
   [[ -n $OS_ID ]] || detect_os
   DOCTOR_FAIL=0
+  DOCTOR_WARN=0
   DOCTOR_FIXED=""
   [[ ${OPT_DOCTOR_FIX:-0} == 1 ]] && DOCTOR_FIX=1 || DOCTOR_FIX=0
   echo
@@ -14033,6 +14192,7 @@ do_doctor() {
     echo
     info "正在复查刚才的修复 ..."
     DOCTOR_FAIL=0
+    DOCTOR_WARN=0
     DOCTOR_FIX=0
     doctor_run_checks
   fi
@@ -14048,7 +14208,8 @@ do_doctor() {
     warn "有检查未通过。"
     exit 1
   fi
-  if [[ -n $DOCTOR_FIXED ]]; then ok "检查完成。列出的项目已经修好。"
+  if (( DOCTOR_WARN )); then warn "检查完成，没有失败项，但有 ${DOCTOR_WARN} 项提醒，请查看上方 WARN。"
+  elif [[ -n $DOCTOR_FIXED ]]; then ok "检查完成。列出的项目已经修好。"
   else ok "检查完成，没有失败项。"; fi
 }
 menu_doctor() {
@@ -14294,15 +14455,19 @@ show_menu() {
   run_menu_act "$act"
 }
 run_menu_act() {
-  local act=$1
+  local act=$1 err_trap
   # 在子 shell 中执行：出错时返回菜单而不是直接退出
   local rc=0
+  err_trap=$(trap -p ERR)
+  trap - ERR
   set +e
-  ( set -e; "$act" )
+  # 真正的脚本错误由子 shell 打印；普通诊断 exit 1 不再被父 shell 当作脚本崩溃。
+  ( eval "$err_trap"; set -e; "$act" )
   rc=$?
   set -e
+  eval "$err_trap"
   OPT_LAND=""
-  (( rc == 0 )) || warn "操作未完成（退出码 ${rc}）。"
+  if (( rc != 0 )) && [[ $act != menu_doctor ]]; then warn "操作未完成（退出码 ${rc}）。"; fi
   [[ $act == do_uninstall && ! -x $BIN_PATH && ! -f $STATE_FILE ]] && exit 0
   return 0
 }
