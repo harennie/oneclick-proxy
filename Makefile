@@ -14,3 +14,4 @@ check:
 	bash tests/reality-target.sh
 	bash tests/outbound-selection.sh
 	bash tests/land-nat.sh
+	bash tests/doctor.sh

@@ -53,7 +53,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.7.0"
+readonly SCRIPT_VERSION="1.8.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -126,6 +126,7 @@ readonly LAND_FWD_SYSCTL="/etc/sysctl.d/99-proxy-oneclick-fwd.conf"
 readonly RESOLV_BAK="${STATE_DIR}/resolv.conf.bak"
 # 可选的公开证书（Let's Encrypt）。不申请时下面的目录不会被创建，节点仍用自签证书。
 readonly CERT_NAME="proxy-oneclick"
+readonly CERT_RENEW_CONF="/etc/letsencrypt/renewal/${CERT_NAME}.conf"
 readonly CERT_BASE="/etc/proxy-oneclick"
 readonly CERT_DIR="${CERT_BASE}/certs"
 readonly CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
