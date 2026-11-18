@@ -29,7 +29,7 @@
 #   bash proxy.sh route           # 回程线路检测（不改配置）
 #   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
 #   bash proxy.sh proto           # 协议开关（菜单第 16 项「协议开关」）
-#                                 # 默认 Vision、XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC / AnyTLS
+#                                 # 默认 Vision、XHTTP+REALITY；HY2 / Trojan / TUIC / AnyTLS 按需开启
 #   proxy proto xhttp-443 on|off  # Vision 与 XHTTP 共用 / 分开 TCP 端口
 #   proxy export [文件]           # 导出密钥和证书。--password 或 PROXY_EXPORT_PASS 可选加密
 #   proxy import <文件>           # 导入后重新检测 IP、NAT、SNI 和防火墙
@@ -53,7 +53,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.8.0"
+readonly SCRIPT_VERSION="1.9.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -174,7 +174,7 @@ readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 OPT_AUTO=0
 OPT_SNI=""
 OPT_PORT=""
-OPT_HY2=""          # 空=询问(交互)/默认启用(auto); 1/0
+OPT_HY2=""          # 空=沿用已保存值，首次交互默认不启用；1/0
 OPT_HY2_PORT=""
 OPT_REALITY=""      # 空=沿用（默认开）; 1/0
 OPT_XHTTP=""        # 空=安装时默认开（状态里已有则沿用）; 1/0
@@ -657,9 +657,12 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
             CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
-HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" FW_HOST_SYNC=0 SSH_PORTS=""
-# 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
-# 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。
+HY2_ENABLED=0 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" FW_HOST_SYNC=0 SSH_PORTS=""
+CN_DATA_REFRESH=0
+readonly CN_IP_FILE="proxy-cn-geoip.dat"
+readonly CN_SITE_FILE="proxy-cn-geosite.dat"
+# 默认一键：Reality + XHTTP。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
+# 首次安装再按默认打开，重装沿用原值。可选协议初始关闭。
 REALITY_ENABLED=1
 XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT="" XHTTP_ON_443=0
 TROJAN_ENABLED=0 TROJAN_PORT=8444 TROJAN_PASS="" TROJAN_EXT_PORT=""

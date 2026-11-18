@@ -335,10 +335,7 @@ choose_nat_ports() {
   fi
 
   # 4) Hysteria2（UDP）：可与 Reality 共用同一个端口号（服务商同时映射 TCP+UDP 时，节省映射名额）
-  if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
-  elif (( ! OPT_AUTO )); then
-    if confirm "是否同时安装 Hysteria2（UDP；需要服务商映射 UDP）？" "$([[ $HY2_ENABLED == 1 ]] && echo y || echo n)"; then HY2_ENABLED=1; else HY2_ENABLED=0; fi
-  fi
+  confirm_hy2
   if (( ! HY2_ENABLED )); then HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT="" HOP_BACKEND=""; else
   local other share
   other=$(nat_first_usable "$XRAY_EXT_PORT") || other=""
@@ -522,7 +519,7 @@ do_install() {
     fi
     if is_openrc; then rc-service xray stop >/dev/null 2>&1 9>&- || true   # 避免旧的 SS 端口被当作「其它已监听端口」放行
     else systemctl stop xray >/dev/null 2>&1 || true; fi
-    HY2_ENABLED=1
+    HY2_ENABLED=0
     REALITY_ENABLED=1
     [[ -n $OPT_XHTTP ]] || XHTTP_ENABLED=1
     if (( ! NAT_MODE )); then XRAY_PORT=443 HY2_PORT=443 HOP_RANGE="20000-50000"; fi

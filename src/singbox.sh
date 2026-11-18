@@ -26,16 +26,17 @@ default_node_name() {
 }
 
 # ============================================================
-#     协议：默认 Reality + XHTTP + Hy2；可选 Trojan / TUIC / AnyTLS
+#     协议：默认 Reality + XHTTP；Hy2 / Trojan / TUIC / AnyTLS 按需启用
 # ============================================================
 # XHTTP 采用 Xray 官方「VLESS + XHTTP + REALITY」：与 Vision 共用同一把 Reality 密钥和 SNI，
 # 单独 TCP 端口，不需要自己的域名。mode 固定 stream-one（REALITY 直连；避免客户端 auto 握手失败）。
 # TUIC v5 / AnyTLS 由 sing-box 提供。默认自签证书（CN = 所选 SNI），不要求自有域名。
 # 申请了公开证书时，这两个协议和 Hysteria2 改用那张证书，链接里的地址和 SNI 换成自有域名。
 # Trojan 走 Xray + REALITY。Shadowsocks 2022 在纯落地机里，或在节点上作为额外入站（LAND_IN）。
+local_policy_needed() { (( ! ${LAND_MODE:-0} && (${HY2_ENABLED:-0} || ${TUIC_ENABLED:-0} || ${ANYTLS_ENABLED:-0}) )); }
 xray_inbound_needed() {
   (( ${REALITY_ENABLED:-0} || ${XHTTP_ENABLED:-0} || ${TROJAN_ENABLED:-0} || ${XHTTP_TLS_ENABLED:-0} || ${WS_ENABLED:-0} )) && return 0
-  relay_active && (( ${HY2_ENABLED:-0} )) && return 0
+  local_policy_needed && return 0
   # 原样转发时落地端口不由 Xray 听；节点上还有别的入站时上面已经返回了。
   land_in_on && ! land_raw_active && return 0
   return 1
@@ -48,6 +49,7 @@ proto_xray_brief() {
   (( WS_ENABLED )) && s+="${s:+ / }WS+TLS TCP ${WS_PORT}"
   (( TROJAN_ENABLED )) && s+="${s:+ / }Trojan TCP ${TROJAN_PORT}"
   if land_in_on && ! land_raw_active; then s+="${s:+ / }SS2022 TCP+UDP $(land_listen_port)"; fi
+  if local_policy_needed; then s+="${s:+ / }本机策略 SOCKS ${RELAY_SOCKS:-待分配}"; fi
   [[ -n $s ]] || s="无入站"
   printf '%s' "$s"
 }
@@ -59,9 +61,10 @@ ensure_proto_secrets() {
   cdn_ensure_paths
 }
 resolve_install_protos() {
+  [[ -z $OPT_HY2 ]] || HY2_ENABLED=$OPT_HY2
   if [[ -n $OPT_REALITY ]]; then REALITY_ENABLED=$OPT_REALITY; fi
   if [[ -n $OPT_XHTTP ]]; then XHTTP_ENABLED=$OPT_XHTTP
-  elif (( ! STATE_HAS_XHTTP )); then XHTTP_ENABLED=1
+  elif (( ! INSTALLED && ! STATE_HAS_XHTTP )); then XHTTP_ENABLED=1
   fi
   if [[ -n $OPT_TROJAN ]]; then TROJAN_ENABLED=$OPT_TROJAN; fi
   if [[ -n $OPT_TUIC ]]; then TUIC_ENABLED=$OPT_TUIC; fi
@@ -82,6 +85,13 @@ confirm_xhttp() {
   else
     XHTTP_ENABLED=0
   fi
+}
+confirm_hy2() {
+  if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
+  elif (( ! OPT_AUTO )); then
+    if confirm "是否安装 Hysteria2（额外 UDP 协议，需放行或映射 UDP）？" "$([[ $HY2_ENABLED == 1 ]] && echo y || echo n)"; then HY2_ENABLED=1; else HY2_ENABLED=0; fi
+  fi
+  return 0
 }
 proto_any_enabled() { (( REALITY_ENABLED || XHTTP_ENABLED || HY2_ENABLED || TROJAN_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED || XHTTP_TLS_ENABLED || WS_ENABLED )); }
 
@@ -413,6 +423,7 @@ sb_copy_cert() {
 write_singbox_config() {
   sb_needed || return 0
   [[ -x $SB_BIN ]] || die "未找到 sing-box，无法写入 TUIC / AnyTLS 配置。"
+  ensure_policy_gateway
   ensure_proto_secrets
   sb_copy_cert
   local tmp="${SB_CONF}.tmp" crt=$SB_CRT key=$SB_KEY
@@ -422,7 +433,7 @@ write_singbox_config() {
     --argjson tuic "${TUIC_ENABLED:-0}" --argjson any "${ANYTLS_ENABLED:-0}" \
     --argjson tport "${TUIC_PORT:-0}" --argjson aport "${ANYTLS_PORT:-0}" \
     --arg uuid "$UUID" --arg tpw "$TUIC_PASS" --arg apw "$ANYTLS_PASS" \
-    --arg crt "$crt" --arg key "$key" --argjson nets "$PRIV_NETS_JSON" '
+    --arg crt "$crt" --arg key "$key" --argjson nets "$PRIV_NETS_JSON" --argjson policy "$RELAY_SOCKS" '
     {
       log: {level: "warn"},
       inbounds: (
@@ -440,7 +451,7 @@ write_singbox_config() {
           }] else [] end)
       ),
       outbounds: [
-        {type: "direct", tag: "direct"}
+        {type: "socks", tag: "policy", server: "127.0.0.1", server_port: $policy, version: "5"}
       ],
       route: {
         rules: [
@@ -448,11 +459,11 @@ write_singbox_config() {
           {ip_cidr: $nets, action: "reject"},
           {protocol: "bittorrent", action: "reject"}
         ],
-        final: "direct"
+        final: "policy"
       }
     }' >"$tmp" || die "生成 sing-box 配置失败。"
   ensure_outbound_ip
-  singbox_apply_ip_strategy "$tmp" || die "写入 sing-box 出站地址族失败。"
+  # 目的地 DNS、地址族选择和落地转发由本机 Xray 统一执行。
   if ! "$SB_BIN" check -c "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2; rm -f "$tmp" "${tmp}.log"
     die "sing-box 配置校验失败，未应用新配置。"
@@ -551,10 +562,7 @@ choose_ports() {
   fi
   (( ! LAND_MODE )) || { HY2_ENABLED=0; return 0; }
   # Hysteria2
-  if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
-  elif (( ! OPT_AUTO )); then
-    if confirm "是否同时安装 Hysteria2（UDP，弱网/高丢包下表现更好）？" "$([[ $HY2_ENABLED == 1 ]] && echo y || echo n)"; then HY2_ENABLED=1; else HY2_ENABLED=0; fi
-  fi
+  confirm_hy2
   if (( ! HY2_ENABLED )); then HOP_RANGE=""; else
   p=${OPT_HY2_PORT:-$HY2_PORT}
   while :; do

@@ -29,3 +29,5 @@ jobs:
         run: bash tests/land-nat.sh
       - name: Doctor and renewal diagnostics
         run: bash tests/doctor.sh
+      - name: Protocol defaults and mainland destination policy
+        run: bash tests/cn-policy.sh

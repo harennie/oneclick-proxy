@@ -1123,6 +1123,7 @@ install_xray_pinned() {
   xray_ensure_service
 }
 install_xray() {
+  CN_DATA_REFRESH=1
   if [[ -n ${OPT_XRAY_VER:-} ]]; then install_xray_pinned; return; fi
   if direct_mode; then install_xray_direct; return; fi
   BIN_UPDATED_XRAY=0
@@ -1623,39 +1624,6 @@ xray_domain_strategy() {
     *) printf '%s' "" ;;
   esac
 }
-hy2_direct_mode() {
-  case ${OUTBOUND_EFFECTIVE:-} in
-    46|64|4|6) printf '%s' "$OUTBOUND_EFFECTIVE" ;;
-    *) printf '%s' "" ;;
-  esac
-}
-hy2_outbound_name() {
-  case $1 in
-    46) printf '%s' ipv4-first ;;
-    64) printf '%s' ipv6-first ;;
-    4) printf '%s' ipv4-only ;;
-    6) printf '%s' ipv6-only ;;
-    *) printf '%s' direct ;;
-  esac
-}
-sb_ip_strategy() {
-  case ${OUTBOUND_EFFECTIVE:-} in
-    46) printf '%s' prefer_ipv4 ;;
-    64) printf '%s' prefer_ipv6 ;;
-    4) printf '%s' ipv4_only ;;
-    6) printf '%s' ipv6_only ;;
-    *) printf '%s' "" ;;
-  esac
-}
-# sing-box 1.12 起 domain_strategy 废弃，1.14 移除；新版本用 domain_resolver.strategy
-sb_resolver_is_new() {
-  local v
-  [[ -x $SB_BIN ]] || return 0
-  v=$("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}') || v=""
-  v=${v#v}
-  [[ $v =~ ^[0-9] ]] || return 0
-  ver_ge "$v" "1.12.0"
-}
 outbound_can_ask() { [[ -t 0 || -r /dev/tty ]]; }
 outbound_apply_code() { # 与已保存的值相同则不标记改动，避免每次重配都写 state.env
   local code=$1
@@ -1858,49 +1826,23 @@ xray_apply_ip_strategy() { # $1 临时配置。未选择时不改（freedom 无 
   ds=$(xray_domain_strategy)
   [[ -n $ds ]] || return 0
   jq --arg ds "$ds" '
-    .routing.domainStrategy = $ds
-    | .outbounds |= map(
+    .outbounds |= map(
         if .tag == "direct" and .protocol == "freedom"
         then .settings.domainStrategy = $ds
         else . end)
   ' "$f" >"${f}.ip" && mv -f "${f}.ip" "$f"
 }
-hy2_outbound_yaml() { # 无落地转发时追加。Hy2 是静态 Go 程序，只用 direct.mode，不改系统解析
-  local mode name
-  mode=$(hy2_direct_mode)
-  [[ -n $mode ]] || return 0
-  name=$(hy2_outbound_name "$mode")
+hy2_outbound_yaml() { # 本机 Xray 统一执行目的地过滤、地址族选择和落地转发。
+  is_port "${RELAY_SOCKS:-}" || die "缺少本机策略端口，拒绝生成绕过禁回国规则的 Hysteria2 配置。"
   cat <<HY
 
 outbounds:
-  - name: ${name}
-    type: direct
-    direct:
-      mode: ${mode}
+  - name: policy
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:${RELAY_SOCKS}
 HY
 }
-singbox_apply_ip_strategy() { # $1 临时配置。TUIC / AnyTLS 走 sing-box 的同一选择
-  local st f=$1
-  st=$(sb_ip_strategy)
-  [[ -n $st ]] || return 0
-  if sb_resolver_is_new; then
-    jq --arg st "$st" '
-      .dns = {servers: [{type: "local", tag: "local"}]}
-      | .outbounds |= map(
-          if .tag == "direct" and .type == "direct"
-          then .domain_resolver = {server: "local", strategy: $st}
-          else . end)
-    ' "$f" >"${f}.ip" && mv -f "${f}.ip" "$f"
-  else
-    jq --arg st "$st" '
-      .outbounds |= map(
-          if .tag == "direct" and .type == "direct"
-          then .domain_strategy = $st
-          else . end)
-    ' "$f" >"${f}.ip" && mv -f "${f}.ip" "$f"
-  fi
-}
-
 # NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
 PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
 
@@ -1969,6 +1911,83 @@ Group=${grp}"
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
   return 0
+}
+cn_policy_inject() { # 始终在白名单、直连和落地兜底之前检查真实代理目的地。
+  ensure_cn_geodata
+  jq --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" '
+    .routing.domainStrategy = "IPOnDemand"
+    | .routing.rules = [
+        {type:"field", domain:[$site], outboundTag:"block", ruleTag:"block-cn-domain"},
+        {type:"field", ip:[$ip], outboundTag:"block", ruleTag:"block-cn-ip"}
+      ] + [.routing.rules[] | select(.ruleTag != "block-cn-domain" and .ruleTag != "block-cn-ip")]
+  ' "$1" >"${1}.cn" && mv -f "${1}.cn" "$1"
+}
+ensure_cn_geodata() {
+  if [[ ${CN_DATA_REFRESH:-0} == 0 && -s ${XRAY_ASSET_DIR}/${CN_IP_FILE} && -s ${XRAY_ASSET_DIR}/${CN_SITE_FILE} ]]; then return 0; fi
+  mktmp
+  local dir repo asset file tag want sum
+  dir=$(mktemp -d "${TMP_DIR}/cn-data.XXXXXX") || die "无法创建禁回国规则临时目录。"
+  for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
+    if [[ $file == "$CN_IP_FILE" ]]; then repo=Loyalsoldier/geoip; asset=geoip-only-cn-private.dat
+    else repo=v2fly/domain-list-community; asset=dlc.dat; fi
+    tag=$(gh_latest_tag "$repo")
+    [[ -n $tag ]] || die "无法获取 ${repo} 规则版本，未生成不受保护的配置。"
+    info "下载禁回国规则 ${asset} (${tag}) ..."
+    fetch -o "$dir/$file" "https://github.com/${repo}/releases/download/${tag}/${asset}" || die "禁回国规则下载失败。"
+    fetch -o "$dir/$file.sha256" "https://github.com/${repo}/releases/download/${tag}/${asset}.sha256sum" || die "禁回国规则校验文件下载失败。"
+    want=$(awk 'NR==1{print tolower($1)}' "$dir/$file.sha256")
+    sum=$(sha256sum "$dir/$file" | awk '{print $1}')
+    [[ $want =~ ^[0-9a-f]{64}$ && $want == "$sum" ]] || die "禁回国规则 SHA256 校验失败。"
+  done
+  jq -n --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" \
+    '{outbounds:[{tag:"block",protocol:"blackhole"}],routing:{rules:[{type:"field",ip:[$ip],outboundTag:"block"},{type:"field",domain:[$site],outboundTag:"block"}]}}' >"$dir/check.json"
+  if ! XRAY_LOCATION_ASSET="$dir" "$XRAY_BIN" run -test -config "$dir/check.json" >"$dir/check.log" 2>&1; then die "禁回国数据缺少可用的 CN 分类或与当前内核不兼容。"; fi
+  mkdir -p "$XRAY_ASSET_DIR" || die "无法创建禁回国数据目录。"
+  chmod 755 "$XRAY_ASSET_DIR" || die "无法设置禁回国数据目录权限。"
+  for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
+    install -m 644 "$dir/$file" "${XRAY_ASSET_DIR}/${file}.new" || die "无法写入禁回国规则文件。"
+    mv -f "${XRAY_ASSET_DIR}/${file}.new" "${XRAY_ASSET_DIR}/${file}" || die "无法替换禁回国规则文件。"
+  done
+  CN_DATA_REFRESH=0
+  rm -rf "$dir"
+}
+cn_policy_config_valid() {
+  jq -e --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" '
+    .routing.domainStrategy == "IPOnDemand"
+    and .routing.rules[0].domain == [$site] and .routing.rules[0].outboundTag == "block"
+    and .routing.rules[1].ip == [$ip] and .routing.rules[1].outboundTag == "block"
+    and any(.outbounds[]; .tag == "block" and .protocol == "blackhole")
+  ' "$1" >/dev/null 2>&1
+}
+local_policy_attach() {
+  local_policy_needed || return 0
+  local i ready=0
+  for (( i=0; i<10; i++ )); do
+    if is_port "${RELAY_SOCKS:-}" \
+      && ! jq -e --argjson port "$RELAY_SOCKS" 'any(.inbounds[]; .tag != "hy2-relay" and .port == $port)' "$1" >/dev/null \
+      && check_port_free tcp "$RELAY_SOCKS" xray && check_port_free udp "$RELAY_SOCKS" xray; then ready=1; break; fi
+    RELAY_SOCKS=$(land_pick_default_port)
+  done
+  (( ready )) || die "没有空闲的本机策略端口，未修改配置。"
+  jq --argjson port "$RELAY_SOCKS" '
+    .inbounds = [.inbounds[] | select(.tag != "hy2-relay")]
+      + [{tag:"hy2-relay",listen:"127.0.0.1",port:$port,protocol:"socks",settings:{auth:"noauth",udp:true,ip:"127.0.0.1"},
+          sniffing:{enabled:true,destOverride:["http","tls","quic"],routeOnly:true}}]
+  ' "$1" >"${1}.policy" && mv -f "${1}.policy" "$1"
+}
+ensure_policy_gateway() { # 单独更新 HY2/sing-box 时，也不能绕开策略入站。
+  local_policy_needed || return 0
+  if is_port "${RELAY_SOCKS:-}" && [[ -s ${XRAY_ASSET_DIR}/${CN_IP_FILE} && -s ${XRAY_ASSET_DIR}/${CN_SITE_FILE} && -f $XRAY_CONF ]] \
+    && cn_policy_config_valid "$XRAY_CONF" \
+    && jq -e --argjson port "$RELAY_SOCKS" '
+      any(.inbounds[]; .tag == "hy2-relay" and .listen == "127.0.0.1" and .port == $port and .settings.udp == true and .sniffing.enabled == true and .sniffing.routeOnly == true)
+    ' "$XRAY_CONF" >/dev/null 2>&1; then
+    svc_active xray || restart_xray
+    return 0
+  fi
+  write_xray_config
+  restart_xray
+  save_state
 }
 write_xray_config() {
   if (( ! LAND_MODE )) && sni_target_is_loop "${SNI_TARGET:-$SNI:443}"; then
@@ -2074,6 +2093,7 @@ write_xray_config() {
   fi
   if (( ! LAND_MODE )); then ensure_outbound_ip; fi
   xray_apply_ip_strategy "$tmp" || die "写入 Xray 出站地址族失败。"
+  cn_policy_inject "$tmp" || die "写入禁回国规则失败，未应用新配置。"
   if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2
     if cdn_wanted; then
