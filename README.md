@@ -220,7 +220,10 @@ proxy --no-hy2 --auto
 ## 功能
 
 - **禁回国（固定开启）**：所有解密后的代理请求先检查 CN 域名和 CN IPv4 / IPv6，再执行来源白名单、直连与落地转发。Xray 使用 `IPOnDemand`，域名未命中时也解析 IP 检查；不是拦截国内客户端连接，也不添加系统全局 OUTPUT 封禁。Hysteria2 / TUIC / AnyTLS 的代理出站只走 `127.0.0.1` 上的 Xray SOCKS 策略入口（支持 TCP / UDP），无直连兜底，不新增公网端口。因此只开启这些协议时 Xray 也需运行。
-  - 独立规则文件 `proxy-cn-geoip.dat`（Loyalsoldier/geoip 的 CN 数据，含 IPv6）和 `proxy-cn-geosite.dat`（v2fly/domain-list-community）放在 `/usr/local/share/xray/`，不覆盖原有 `geoip.dat` / `geosite.dat`。安装、重装和更新 Xray 时刷新，普通配置修改复用缓存；下载先核对发布的 SHA256，再用内核校验 CN 分类，失败不生成缺少过滤的新配置。
+  - 独立规则文件 `proxy-cn-geoip.dat`（Loyalsoldier/geoip 的 CN 数据，含 IPv6）和 `proxy-cn-geosite.dat`（v2fly/domain-list-community）放在 `/usr/local/share/xray/`，不覆盖原有 `geoip.dat` / `geosite.dat`。安装、重装和更新 Xray 时刷新；安装完成后默认每日自动检查，普通配置修改复用缓存。下载先核对发布的 SHA256，再用内核校验 CN 分类。
+  - 每日任务使用 systemd 的 `proxy-oneclick-rules.timer`（服务器时区 03:35，随机延后最多 30 分钟，关机错过后补执行）；Alpine/OpenRC 使用每日 cron。数据内容没变化时不写文件、不重启。发生变化时先校验当前完整配置，保留旧数据，原子替换每个文件后重启 Xray；重启失败或收到终止信号会回退旧数据。下载或校验失败保留现有数据；手动停止的 Xray 不会被任务启动。重启会使已有连接短暂中断。
+  - 手动立即检查：`proxy update-rules`，或 `proxy update` 第 6 项。检查任务时间：`systemctl list-timers proxy-oneclick-rules.timer`；查看执行日志：`journalctl -u proxy-oneclick-rules.service`。OpenRC 的最近一次日志在 `/root/.proxy-oneclick/rule-update.log`。卸载脚本会删除定时任务。
+  - 旧安装升级管理脚本后，首次打开新版 `proxy` 菜单或执行 `proxy update-rules` 会自动补建任务；当前配置须已经采用上述 CN 数据文件。`proxy doctor` 只读检查任务状态及最近一次 systemd 任务失败，不会自动修改配置。
   - 旧版仅更新管理脚本不会改正在运行的配置；通过 `proxy update` 选择全部更新或重装来应用。`proxy doctor` 会检查规则及其他内核的策略接入。
   - IP / 域名归属取决于规则数据的准确性；原样 DNAT 转发不解密流量，必须在最终落地机执行此策略。
 

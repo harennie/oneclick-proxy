@@ -1925,8 +1925,15 @@ cn_policy_inject() { # 始终在白名单、直连和落地兜底之前检查真
 ensure_cn_geodata() {
   if [[ ${CN_DATA_REFRESH:-0} == 0 && -s ${XRAY_ASSET_DIR}/${CN_IP_FILE} && -s ${XRAY_ASSET_DIR}/${CN_SITE_FILE} ]]; then return 0; fi
   mktmp
-  local dir repo asset file tag want sum
+  local dir
   dir=$(mktemp -d "${TMP_DIR}/cn-data.XXXXXX") || die "无法创建禁回国规则临时目录。"
+  cn_geodata_download "$dir"
+  cn_geodata_install "$dir"
+  CN_DATA_REFRESH=0
+  rm -rf "$dir"
+}
+cn_geodata_download() {
+  local dir=$1 repo asset file tag want sum
   for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
     if [[ $file == "$CN_IP_FILE" ]]; then repo=Loyalsoldier/geoip; asset=geoip-only-cn-private.dat
     else repo=v2fly/domain-list-community; asset=dlc.dat; fi
@@ -1942,15 +1949,146 @@ ensure_cn_geodata() {
   jq -n --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" \
     '{outbounds:[{tag:"block",protocol:"blackhole"}],routing:{rules:[{type:"field",ip:[$ip],outboundTag:"block"},{type:"field",domain:[$site],outboundTag:"block"}]}}' >"$dir/check.json"
   if ! XRAY_LOCATION_ASSET="$dir" "$XRAY_BIN" run -test -config "$dir/check.json" >"$dir/check.log" 2>&1; then die "禁回国数据缺少可用的 CN 分类或与当前内核不兼容。"; fi
+}
+cn_geodata_install() {
+  local dir=$1 file
   mkdir -p "$XRAY_ASSET_DIR" || die "无法创建禁回国数据目录。"
   chmod 755 "$XRAY_ASSET_DIR" || die "无法设置禁回国数据目录权限。"
   for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
     install -m 644 "$dir/$file" "${XRAY_ASSET_DIR}/${file}.new" || die "无法写入禁回国规则文件。"
     mv -f "${XRAY_ASSET_DIR}/${file}.new" "${XRAY_ASSET_DIR}/${file}" || die "无法替换禁回国规则文件。"
   done
-  CN_DATA_REFRESH=0
-  rm -rf "$dir"
 }
+cn_rules_install_job() {
+  (( ${INSTALLED:-0} )) && [[ -x $BIN_PATH ]] && cn_policy_config_valid "$XRAY_CONF" || return 0
+  grep -q '^do_update_rules()' "$BIN_PATH" || return 0
+  if land_only && land_raw_active; then return 0; fi
+  if ! have flock; then
+    if is_openrc; then apk add --no-cache flock || die "无法安装规则更新所需的 flock。"
+    else die "缺少 flock，请先安装 util-linux。"; fi
+  fi
+  if is_openrc; then
+    local daemon=crond
+    svc_exists crond || daemon=cron
+    if ! svc_exists "$daemon"; then
+      apk add --no-cache busybox-openrc || die "无法安装每日规则任务所需的 crond。"
+      daemon=crond
+    fi
+    if [[ -x $RULE_UPDATE_CRON ]] && svc_active "$daemon"; then return 0; fi
+    mkdir -p "$(dirname "$RULE_UPDATE_CRON")"
+    cat >"$RULE_UPDATE_CRON" <<EOF
+#!/bin/sh
+umask 077
+exec ${BIN_PATH} update-rules --auto >${STATE_DIR}/rule-update.log 2>&1
+EOF
+    chmod 755 "$RULE_UPDATE_CRON"
+    rc-update add "$daemon" default >/dev/null || die "无法启用每日规则任务的 cron 服务。"
+    rc-service "$daemon" start >/dev/null 2>&1 9>&- || die "无法启动每日规则任务的 cron 服务。"
+  else
+    if [[ -f $RULE_UPDATE_UNIT && -f $RULE_UPDATE_TIMER ]] \
+      && systemctl is-enabled --quiet proxy-oneclick-rules.timer && systemctl is-active --quiet proxy-oneclick-rules.timer; then return 0; fi
+    cat >"$RULE_UPDATE_UNIT" <<EOF
+[Unit]
+Description=Update proxy-oneclick routing data
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${STATE_FILE}
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_PATH} update-rules --auto
+TimeoutStartSec=15min
+EOF
+    cat >"$RULE_UPDATE_TIMER" <<'EOF'
+[Unit]
+Description=Daily proxy-oneclick routing data check
+
+[Timer]
+OnCalendar=*-*-* 03:35:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    sd_reload
+    systemctl enable --now proxy-oneclick-rules.timer >/dev/null || die "无法启用每日规则更新定时器。"
+  fi
+  ok "规则数据每日自动检查已启用；仅有变化且校验通过时重启 Xray。"
+}
+cn_rules_remove_job() {
+  if ! is_openrc; then
+    systemctl disable --now proxy-oneclick-rules.timer >/dev/null 2>&1 || true
+    systemctl stop proxy-oneclick-rules.service >/dev/null 2>&1 || true
+  fi
+  rm -f "$RULE_UPDATE_UNIT" "$RULE_UPDATE_TIMER" "$RULE_UPDATE_CRON" "${STATE_DIR}/rule-update.log"
+  sd_reload
+}
+do_update_rules() ( # 事务放在子 shell 中，失败或收到终止信号都恢复旧数据。
+  load_state
+  (( INSTALLED )) || die "尚未安装。"
+  take_lock
+  if land_only && land_raw_active; then info "原样转发的规则由最终落地机维护。"; return 0; fi
+  cn_policy_config_valid "$XRAY_CONF" || die "当前配置尚未使用 CN 策略数据，请先重装或全部更新以应用禁回国规则。"
+  cn_rules_install_job
+  take_lock
+  mktmp
+  local dir file backup="" replacing=0 was_active=0
+  dir=$(mktemp -d "${TMP_DIR}/rules-update.XXXXXX") || die "无法创建规则更新临时目录。"
+  trap '
+    rc=$?
+    trap - ERR
+    set +e
+    restore_failed=0
+    if (( replacing )); then
+      for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
+        if [[ -f $backup/$file ]]; then
+          cp -a "$backup/$file" "${XRAY_ASSET_DIR}/${file}.new" && mv -f "${XRAY_ASSET_DIR}/${file}.new" "${XRAY_ASSET_DIR}/${file}" || restore_failed=1
+        else rm -f "${XRAY_ASSET_DIR}/${file}" || restore_failed=1; fi
+        rm -f "${XRAY_ASSET_DIR}/${file}.new"
+      done
+      if (( restore_failed )); then
+        warn "规则恢复不完整，请立即检查磁盘和权限；备份保留在 ${backup}。"
+      else warn "规则更新未完成，已恢复旧数据。"; fi
+      if (( was_active )); then svc_restart xray && svc_active xray || warn "恢复后 Xray 仍未运行，请检查服务日志。"; fi
+    fi
+    if (( ! restore_failed )) && [[ -n $backup ]]; then rm -rf "$backup"; fi
+    rm -rf "$dir"
+    exit "$rc"
+  ' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cn_geodata_download "$dir"
+  if cmp -s "$dir/$CN_IP_FILE" "$XRAY_ASSET_DIR/$CN_IP_FILE" && cmp -s "$dir/$CN_SITE_FILE" "$XRAY_ASSET_DIR/$CN_SITE_FILE"; then
+    ok "规则数据没有变化，未重启 Xray。"
+    return 0
+  fi
+  # 校验当前完整配置时，其它已有地理数据也必须可见。
+  for file in "$XRAY_ASSET_DIR"/*; do
+    [[ -f $file && ! -e $dir/${file##*/} ]] || continue
+    ln -s "$file" "$dir/${file##*/}" || die "无法准备完整配置所需的地理数据。"
+  done
+  if ! XRAY_LOCATION_ASSET="$dir" "$XRAY_BIN" run -test -config "$XRAY_CONF" >"$dir/config-check.log" 2>&1; then
+    die "新规则未通过当前 Xray 配置校验，旧数据和服务保持不变。"
+  fi
+  mkdir -p "$BACKUP_DIR" || die "无法创建规则备份目录。"
+  backup=$(mktemp -d "${BACKUP_DIR}/rules.XXXXXX") || die "无法创建规则备份。"
+  for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
+    if [[ -e $XRAY_ASSET_DIR/$file ]]; then cp -a "$XRAY_ASSET_DIR/$file" "$backup/$file" || die "规则备份失败，未应用更新。"; fi
+  done
+  svc_active xray && was_active=1
+  replacing=1
+  cn_geodata_install "$dir"
+  if (( was_active )); then
+    svc_restart xray || die "Xray 未能重启，将恢复旧规则。"
+    sleep 1
+    svc_active xray || die "Xray 加载新规则后退出，将恢复旧规则。"
+  fi
+  # shellcheck disable=SC2034 # EXIT trap reads the committed replacement state.
+  replacing=0
+  if (( was_active )); then ok "规则数据已更新，Xray 已重新加载。"
+  else ok "规则数据已更新；Xray 原先未运行，未将其启动。"; fi
+)
 cn_policy_config_valid() {
   jq -e --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" '
     .routing.domainStrategy == "IPOnDemand"
@@ -1993,6 +2131,7 @@ write_xray_config() {
   if (( ! LAND_MODE )) && sni_target_is_loop "${SNI_TARGET:-$SNI:443}"; then
     die "REALITY target 指回本机 Xray 入站，拒绝覆盖可用配置。请为 ${SNI} 选择独立的本机 HTTPS 后端。"
   fi
+  take_lock
   local clients tmp seed="" cplain tclients
   clients=$(xray_clients_json)
   cplain=$(xray_clients_json "")

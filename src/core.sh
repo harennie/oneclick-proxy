@@ -53,7 +53,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.9.0"
+readonly SCRIPT_VERSION="1.10.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -102,6 +102,9 @@ readonly SCANNER_VER="v0.2.3"
 readonly NFT_TABLE="proxy_oneclick"
 # NAT 模式
 readonly XRAY_ASSET_DIR="/usr/local/share/xray"
+readonly RULE_UPDATE_UNIT="/etc/systemd/system/proxy-oneclick-rules.service"
+readonly RULE_UPDATE_TIMER="/etc/systemd/system/proxy-oneclick-rules.timer"
+readonly RULE_UPDATE_CRON="/etc/periodic/daily/proxy-oneclick-rules"
 readonly XRAY_UNIT="/etc/systemd/system/xray.service"
 readonly HY_UNIT="/etc/systemd/system/hysteria-server.service"
 readonly XRAY_RC="/etc/init.d/xray"
@@ -632,9 +635,11 @@ svc_follow() {
 require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 用户运行本脚本（例如: sudo -i 后再执行）。"; }
 
 take_lock() {
+  [[ ${LOCK_TAKEN:-0} == 1 ]] && return 0
   have flock || return 0
   exec 9>/run/proxy-oneclick.lock
   flock -n 9 || die "另一个 proxy 脚本实例正在运行，请稍后再试。"
+  LOCK_TAKEN=1
 }
 
 # ----------------------------- 状态持久化 -----------------------------
