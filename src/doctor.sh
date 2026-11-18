@@ -138,6 +138,27 @@ doctor_network() {
   done
   doc_info "这是 VPS 到外网的探测，不代表客户端到 VPS 的入口线路可用。"
 }
+doctor_cn_policy() {
+  if land_raw_active; then
+    doc_info "原样转发不解密代理目的地，禁回国必须由最终落地机执行。"
+    land_only && return 0
+  fi
+  if ! land_only && ! xray_inbound_needed; then return 0; fi
+  if cn_policy_config_valid "$XRAY_CONF"; then doc_ok "大陆域名 / IPv4 / IPv6 目的地拦截规则位于兜底规则之前。"
+  else doc_fail "当前 Xray 配置缺少完整禁回国规则，请通过 proxy update 全部更新或重装以应用新策略。"; fi
+  if [[ ! -s ${XRAY_ASSET_DIR}/${CN_IP_FILE} || ! -s ${XRAY_ASSET_DIR}/${CN_SITE_FILE} ]]; then doc_fail "禁回国地理数据文件缺失。"; fi
+  if local_policy_needed && ! jq -e --argjson port "$RELAY_SOCKS" '
+    any(.inbounds[]; .tag == "hy2-relay" and .listen == "127.0.0.1" and .port == $port and .settings.udp == true and .sniffing.enabled == true and .sniffing.routeOnly == true)
+  ' "$XRAY_CONF" >/dev/null 2>&1; then doc_fail "本机策略入口缺失或不是仅回环的 TCP / UDP SOCKS 入站。"; fi
+  if (( HY2_ENABLED )) && ! grep -Eq "addr: 127\\.0\\.0\\.1:${RELAY_SOCKS}[[:space:]]*$" "$HY_CONF"; then
+    doc_fail "Hysteria2 尚未接入本机策略入口，需重新生成其配置。"
+  fi
+  if sb_needed && ! jq -e --argjson port "$RELAY_SOCKS" '
+    (.outbounds|length) == 1 and .outbounds[0].type == "socks"
+    and .outbounds[0].server == "127.0.0.1" and .outbounds[0].server_port == $port and .route.final == .outbounds[0].tag
+  ' "$SB_CONF" >/dev/null 2>&1; then doc_fail "sing-box 尚未接入本机策略入口，需重新生成其配置。"; fi
+  return 0
+}
 doctor_land_listen() {
   local port=$1
   if land_raw_active; then
@@ -168,8 +189,8 @@ doctor_services() {
   fi
   if land_only; then doctor_land_listen "$XRAY_PORT"
   elif (( need_x && REALITY_ENABLED )); then doctor_port tcp "$XRAY_PORT" "Xray"
-  elif (( need_x )) && ! land_in_on; then doctor_port tcp "$XRAY_PORT" "Xray"
   fi
+  if local_policy_needed; then doctor_port tcp "$RELAY_SOCKS" "本机策略入口（仅回环）"; fi
   if land_in_on; then doctor_land_listen "$LAND_PORT"; fi
   if (( HY2_ENABLED )); then
     doctor_one_svc hysteria-server 1
@@ -506,6 +527,7 @@ doctor_run_checks() {
   doctor_clock
   doctor_services
   doctor_configs
+  doctor_cn_policy
   doctor_firewall
   doctor_network
   doctor_sni

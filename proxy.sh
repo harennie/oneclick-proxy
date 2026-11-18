@@ -30,7 +30,7 @@
 #   bash proxy.sh route           # 回程线路检测（不改配置）
 #   bash proxy.sh outbound        # 出站地址族；内网 ULA 会探测 NAT66。--outbound 46|64|4|6|auto
 #   bash proxy.sh proto           # 协议开关（菜单第 16 项「协议开关」）
-#                                 # 默认 Vision、XHTTP+REALITY、Hysteria2；可选 Trojan / TUIC / AnyTLS
+#                                 # 默认 Vision、XHTTP+REALITY；HY2 / Trojan / TUIC / AnyTLS 按需开启
 #   proxy proto xhttp-443 on|off  # Vision 与 XHTTP 共用 / 分开 TCP 端口
 #   proxy export [文件]           # 导出密钥和证书。--password 或 PROXY_EXPORT_PASS 可选加密
 #   proxy import <文件>           # 导入后重新检测 IP、NAT、SNI 和防火墙
@@ -54,7 +54,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.8.0"
+readonly SCRIPT_VERSION="1.9.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -175,7 +175,7 @@ readonly UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 OPT_AUTO=0
 OPT_SNI=""
 OPT_PORT=""
-OPT_HY2=""          # 空=询问(交互)/默认启用(auto); 1/0
+OPT_HY2=""          # 空=沿用已保存值，首次交互默认不启用；1/0
 OPT_HY2_PORT=""
 OPT_REALITY=""      # 空=沿用（默认开）; 1/0
 OPT_XHTTP=""        # 空=安装时默认开（状态里已有则沿用）; 1/0
@@ -382,7 +382,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;738:src/os.sh:1;1247:src/tune.sh:1;2047:src/xray.sh:1;4184:src/hy2.sh:1;4323:src/firewall.sh:1;5608:src/cert.sh:1;7640:src/cdn.sh:1;8625:src/link.sh:1;9018:src/singbox.sh:1;9602:src/nat.sh:1;10269:src/selftest.sh:1;10410:src/land.sh:1;12332:src/menu.sh:1;12931:src/route.sh:1;13446:src/export.sh:1;13662:src/doctor.sh:1;14225:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;741:src/os.sh:1;1250:src/tune.sh:1;2050:src/xray.sh:1;4207:src/hy2.sh:1;4342:src/firewall.sh:1;5627:src/cert.sh:1;7659:src/cdn.sh:1;8644:src/link.sh:1;9037:src/singbox.sh:1;9629:src/nat.sh:1;10293:src/selftest.sh:1;10434:src/land.sh:1;12340:src/menu.sh:1;12939:src/route.sh:1;13454:src/export.sh:1;13670:src/doctor.sh:1;14255:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -658,9 +658,12 @@ STATE_KEYS=(INSTALLED XRAY_PORT UUID PRIV_KEY PUB_KEY SHORT_ID MLDSA_SEED MLDSA_
             CERT_ON CERT_DOMAIN CERT_EMAIL SUB_PORT SUB_TOKEN
             CERT_CA CERT_SCOPE CERT_NAMES CERT_PUBLIC CERT_CHALLENGE)
 INSTALLED=0 XRAY_PORT=443 UUID="" PRIV_KEY="" PUB_KEY="" SHORT_ID="" MLDSA_SEED="" MLDSA_VERIFY="" MLDSA_ON=1 SNI="" SNI_TARGET=""
-HY2_ENABLED=1 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" FW_HOST_SYNC=0 SSH_PORTS=""
-# 默认一键：Reality + XHTTP + Hy2。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
-# 安装流程里若状态没有这一项，再按默认打开。可选协议初始关闭。
+HY2_ENABLED=0 HY2_PORT=443 HY2_PASS="" HY2_PIN="" HOP_RANGE="20000-50000" NODE_NAME="" FW_ENABLED=1 FW_MODE="" FW_HOST_SYNC=0 SSH_PORTS=""
+CN_DATA_REFRESH=0
+readonly CN_IP_FILE="proxy-cn-geoip.dat"
+readonly CN_SITE_FILE="proxy-cn-geosite.dat"
+# 默认一键：Reality + XHTTP。XHTTP_ENABLED 初始为 0，避免旧状态文件在「改 SNI」时被意外打开；
+# 首次安装再按默认打开，重装沿用原值。可选协议初始关闭。
 REALITY_ENABLED=1
 XHTTP_ENABLED=0 XHTTP_PORT=8443 XHTTP_PATH="" XHTTP_EXT_PORT="" XHTTP_ON_443=0
 TROJAN_ENABLED=0 TROJAN_PORT=8444 TROJAN_PASS="" TROJAN_EXT_PORT=""
@@ -3169,6 +3172,7 @@ install_xray_pinned() {
   xray_ensure_service
 }
 install_xray() {
+  CN_DATA_REFRESH=1
   if [[ -n ${OPT_XRAY_VER:-} ]]; then install_xray_pinned; return; fi
   if direct_mode; then install_xray_direct; return; fi
   BIN_UPDATED_XRAY=0
@@ -3669,39 +3673,6 @@ xray_domain_strategy() {
     *) printf '%s' "" ;;
   esac
 }
-hy2_direct_mode() {
-  case ${OUTBOUND_EFFECTIVE:-} in
-    46|64|4|6) printf '%s' "$OUTBOUND_EFFECTIVE" ;;
-    *) printf '%s' "" ;;
-  esac
-}
-hy2_outbound_name() {
-  case $1 in
-    46) printf '%s' ipv4-first ;;
-    64) printf '%s' ipv6-first ;;
-    4) printf '%s' ipv4-only ;;
-    6) printf '%s' ipv6-only ;;
-    *) printf '%s' direct ;;
-  esac
-}
-sb_ip_strategy() {
-  case ${OUTBOUND_EFFECTIVE:-} in
-    46) printf '%s' prefer_ipv4 ;;
-    64) printf '%s' prefer_ipv6 ;;
-    4) printf '%s' ipv4_only ;;
-    6) printf '%s' ipv6_only ;;
-    *) printf '%s' "" ;;
-  esac
-}
-# sing-box 1.12 起 domain_strategy 废弃，1.14 移除；新版本用 domain_resolver.strategy
-sb_resolver_is_new() {
-  local v
-  [[ -x $SB_BIN ]] || return 0
-  v=$("$SB_BIN" version 2>/dev/null | awk 'NR==1{print $NF}') || v=""
-  v=${v#v}
-  [[ $v =~ ^[0-9] ]] || return 0
-  ver_ge "$v" "1.12.0"
-}
 outbound_can_ask() { [[ -t 0 || -r /dev/tty ]]; }
 outbound_apply_code() { # 与已保存的值相同则不标记改动，避免每次重配都写 state.env
   local code=$1
@@ -3904,49 +3875,23 @@ xray_apply_ip_strategy() { # $1 临时配置。未选择时不改（freedom 无 
   ds=$(xray_domain_strategy)
   [[ -n $ds ]] || return 0
   jq --arg ds "$ds" '
-    .routing.domainStrategy = $ds
-    | .outbounds |= map(
+    .outbounds |= map(
         if .tag == "direct" and .protocol == "freedom"
         then .settings.domainStrategy = $ds
         else . end)
   ' "$f" >"${f}.ip" && mv -f "${f}.ip" "$f"
 }
-hy2_outbound_yaml() { # 无落地转发时追加。Hy2 是静态 Go 程序，只用 direct.mode，不改系统解析
-  local mode name
-  mode=$(hy2_direct_mode)
-  [[ -n $mode ]] || return 0
-  name=$(hy2_outbound_name "$mode")
+hy2_outbound_yaml() { # 本机 Xray 统一执行目的地过滤、地址族选择和落地转发。
+  is_port "${RELAY_SOCKS:-}" || die "缺少本机策略端口，拒绝生成绕过禁回国规则的 Hysteria2 配置。"
   cat <<HY
 
 outbounds:
-  - name: ${name}
-    type: direct
-    direct:
-      mode: ${mode}
+  - name: policy
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:${RELAY_SOCKS}
 HY
 }
-singbox_apply_ip_strategy() { # $1 临时配置。TUIC / AnyTLS 走 sing-box 的同一选择
-  local st f=$1
-  st=$(sb_ip_strategy)
-  [[ -n $st ]] || return 0
-  if sb_resolver_is_new; then
-    jq --arg st "$st" '
-      .dns = {servers: [{type: "local", tag: "local"}]}
-      | .outbounds |= map(
-          if .tag == "direct" and .type == "direct"
-          then .domain_resolver = {server: "local", strategy: $st}
-          else . end)
-    ' "$f" >"${f}.ip" && mv -f "${f}.ip" "$f"
-  else
-    jq --arg st "$st" '
-      .outbounds |= map(
-          if .tag == "direct" and .type == "direct"
-          then .domain_strategy = $st
-          else . end)
-    ' "$f" >"${f}.ip" && mv -f "${f}.ip" "$f"
-  fi
-}
-
 # NAT 模式不下载 geoip.dat：直接列出内网 / 保留地址段
 PRIV_NETS_JSON='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.168.0.0/16","198.18.0.0/15","224.0.0.0/3","::/127","fc00::/7","fe80::/10","ff00::/8"]'
 
@@ -4015,6 +3960,83 @@ Group=${grp}"
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
   return 0
+}
+cn_policy_inject() { # 始终在白名单、直连和落地兜底之前检查真实代理目的地。
+  ensure_cn_geodata
+  jq --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" '
+    .routing.domainStrategy = "IPOnDemand"
+    | .routing.rules = [
+        {type:"field", domain:[$site], outboundTag:"block", ruleTag:"block-cn-domain"},
+        {type:"field", ip:[$ip], outboundTag:"block", ruleTag:"block-cn-ip"}
+      ] + [.routing.rules[] | select(.ruleTag != "block-cn-domain" and .ruleTag != "block-cn-ip")]
+  ' "$1" >"${1}.cn" && mv -f "${1}.cn" "$1"
+}
+ensure_cn_geodata() {
+  if [[ ${CN_DATA_REFRESH:-0} == 0 && -s ${XRAY_ASSET_DIR}/${CN_IP_FILE} && -s ${XRAY_ASSET_DIR}/${CN_SITE_FILE} ]]; then return 0; fi
+  mktmp
+  local dir repo asset file tag want sum
+  dir=$(mktemp -d "${TMP_DIR}/cn-data.XXXXXX") || die "无法创建禁回国规则临时目录。"
+  for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
+    if [[ $file == "$CN_IP_FILE" ]]; then repo=Loyalsoldier/geoip; asset=geoip-only-cn-private.dat
+    else repo=v2fly/domain-list-community; asset=dlc.dat; fi
+    tag=$(gh_latest_tag "$repo")
+    [[ -n $tag ]] || die "无法获取 ${repo} 规则版本，未生成不受保护的配置。"
+    info "下载禁回国规则 ${asset} (${tag}) ..."
+    fetch -o "$dir/$file" "https://github.com/${repo}/releases/download/${tag}/${asset}" || die "禁回国规则下载失败。"
+    fetch -o "$dir/$file.sha256" "https://github.com/${repo}/releases/download/${tag}/${asset}.sha256sum" || die "禁回国规则校验文件下载失败。"
+    want=$(awk 'NR==1{print tolower($1)}' "$dir/$file.sha256")
+    sum=$(sha256sum "$dir/$file" | awk '{print $1}')
+    [[ $want =~ ^[0-9a-f]{64}$ && $want == "$sum" ]] || die "禁回国规则 SHA256 校验失败。"
+  done
+  jq -n --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" \
+    '{outbounds:[{tag:"block",protocol:"blackhole"}],routing:{rules:[{type:"field",ip:[$ip],outboundTag:"block"},{type:"field",domain:[$site],outboundTag:"block"}]}}' >"$dir/check.json"
+  if ! XRAY_LOCATION_ASSET="$dir" "$XRAY_BIN" run -test -config "$dir/check.json" >"$dir/check.log" 2>&1; then die "禁回国数据缺少可用的 CN 分类或与当前内核不兼容。"; fi
+  mkdir -p "$XRAY_ASSET_DIR" || die "无法创建禁回国数据目录。"
+  chmod 755 "$XRAY_ASSET_DIR" || die "无法设置禁回国数据目录权限。"
+  for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
+    install -m 644 "$dir/$file" "${XRAY_ASSET_DIR}/${file}.new" || die "无法写入禁回国规则文件。"
+    mv -f "${XRAY_ASSET_DIR}/${file}.new" "${XRAY_ASSET_DIR}/${file}" || die "无法替换禁回国规则文件。"
+  done
+  CN_DATA_REFRESH=0
+  rm -rf "$dir"
+}
+cn_policy_config_valid() {
+  jq -e --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" '
+    .routing.domainStrategy == "IPOnDemand"
+    and .routing.rules[0].domain == [$site] and .routing.rules[0].outboundTag == "block"
+    and .routing.rules[1].ip == [$ip] and .routing.rules[1].outboundTag == "block"
+    and any(.outbounds[]; .tag == "block" and .protocol == "blackhole")
+  ' "$1" >/dev/null 2>&1
+}
+local_policy_attach() {
+  local_policy_needed || return 0
+  local i ready=0
+  for (( i=0; i<10; i++ )); do
+    if is_port "${RELAY_SOCKS:-}" \
+      && ! jq -e --argjson port "$RELAY_SOCKS" 'any(.inbounds[]; .tag != "hy2-relay" and .port == $port)' "$1" >/dev/null \
+      && check_port_free tcp "$RELAY_SOCKS" xray && check_port_free udp "$RELAY_SOCKS" xray; then ready=1; break; fi
+    RELAY_SOCKS=$(land_pick_default_port)
+  done
+  (( ready )) || die "没有空闲的本机策略端口，未修改配置。"
+  jq --argjson port "$RELAY_SOCKS" '
+    .inbounds = [.inbounds[] | select(.tag != "hy2-relay")]
+      + [{tag:"hy2-relay",listen:"127.0.0.1",port:$port,protocol:"socks",settings:{auth:"noauth",udp:true,ip:"127.0.0.1"},
+          sniffing:{enabled:true,destOverride:["http","tls","quic"],routeOnly:true}}]
+  ' "$1" >"${1}.policy" && mv -f "${1}.policy" "$1"
+}
+ensure_policy_gateway() { # 单独更新 HY2/sing-box 时，也不能绕开策略入站。
+  local_policy_needed || return 0
+  if is_port "${RELAY_SOCKS:-}" && [[ -s ${XRAY_ASSET_DIR}/${CN_IP_FILE} && -s ${XRAY_ASSET_DIR}/${CN_SITE_FILE} && -f $XRAY_CONF ]] \
+    && cn_policy_config_valid "$XRAY_CONF" \
+    && jq -e --argjson port "$RELAY_SOCKS" '
+      any(.inbounds[]; .tag == "hy2-relay" and .listen == "127.0.0.1" and .port == $port and .settings.udp == true and .sniffing.enabled == true and .sniffing.routeOnly == true)
+    ' "$XRAY_CONF" >/dev/null 2>&1; then
+    svc_active xray || restart_xray
+    return 0
+  fi
+  write_xray_config
+  restart_xray
+  save_state
 }
 write_xray_config() {
   if (( ! LAND_MODE )) && sni_target_is_loop "${SNI_TARGET:-$SNI:443}"; then
@@ -4120,6 +4142,7 @@ write_xray_config() {
   fi
   if (( ! LAND_MODE )); then ensure_outbound_ip; fi
   xray_apply_ip_strategy "$tmp" || die "写入 Xray 出站地址族失败。"
+  cn_policy_inject "$tmp" || die "写入禁回国规则失败，未应用新配置。"
   if ! XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2
     if cdn_wanted; then
@@ -4232,6 +4255,7 @@ gen_hy2_cert() {
 }
 
 write_hy2_config() {
+  ensure_policy_gateway
   ensure_outbound_ip
   [[ -n $HY2_PASS ]] || HY2_PASS=$(rand_pass)
   local crt=$HY_CRT key=$HY_KEY
@@ -4264,12 +4288,7 @@ masquerade:
     url: https://${SNI}/
     rewriteHost: true
 HY
-  # 落地转发时第一条 outbound 必须是 socks5（否则 Hy2 会改走直连）。直连时用 direct.mode。
-  if relay_active; then
-    relay_hy2_yaml >>"${HY_CONF}.tmp"
-  else
-    hy2_outbound_yaml >>"${HY_CONF}.tmp"
-  fi
+  hy2_outbound_yaml >>"${HY_CONF}.tmp"
   local grp="root"; id hysteria >/dev/null 2>&1 && grp=hysteria
   if tls_present_real; then
     chown "root:${grp}" "${HY_CONF}.tmp"
@@ -9043,16 +9062,17 @@ default_node_name() {
 }
 
 # ============================================================
-#     协议：默认 Reality + XHTTP + Hy2；可选 Trojan / TUIC / AnyTLS
+#     协议：默认 Reality + XHTTP；Hy2 / Trojan / TUIC / AnyTLS 按需启用
 # ============================================================
 # XHTTP 采用 Xray 官方「VLESS + XHTTP + REALITY」：与 Vision 共用同一把 Reality 密钥和 SNI，
 # 单独 TCP 端口，不需要自己的域名。mode 固定 stream-one（REALITY 直连；避免客户端 auto 握手失败）。
 # TUIC v5 / AnyTLS 由 sing-box 提供。默认自签证书（CN = 所选 SNI），不要求自有域名。
 # 申请了公开证书时，这两个协议和 Hysteria2 改用那张证书，链接里的地址和 SNI 换成自有域名。
 # Trojan 走 Xray + REALITY。Shadowsocks 2022 在纯落地机里，或在节点上作为额外入站（LAND_IN）。
+local_policy_needed() { (( ! ${LAND_MODE:-0} && (${HY2_ENABLED:-0} || ${TUIC_ENABLED:-0} || ${ANYTLS_ENABLED:-0}) )); }
 xray_inbound_needed() {
   (( ${REALITY_ENABLED:-0} || ${XHTTP_ENABLED:-0} || ${TROJAN_ENABLED:-0} || ${XHTTP_TLS_ENABLED:-0} || ${WS_ENABLED:-0} )) && return 0
-  relay_active && (( ${HY2_ENABLED:-0} )) && return 0
+  local_policy_needed && return 0
   # 原样转发时落地端口不由 Xray 听；节点上还有别的入站时上面已经返回了。
   land_in_on && ! land_raw_active && return 0
   return 1
@@ -9065,6 +9085,7 @@ proto_xray_brief() {
   (( WS_ENABLED )) && s+="${s:+ / }WS+TLS TCP ${WS_PORT}"
   (( TROJAN_ENABLED )) && s+="${s:+ / }Trojan TCP ${TROJAN_PORT}"
   if land_in_on && ! land_raw_active; then s+="${s:+ / }SS2022 TCP+UDP $(land_listen_port)"; fi
+  if local_policy_needed; then s+="${s:+ / }本机策略 SOCKS ${RELAY_SOCKS:-待分配}"; fi
   [[ -n $s ]] || s="无入站"
   printf '%s' "$s"
 }
@@ -9076,9 +9097,10 @@ ensure_proto_secrets() {
   cdn_ensure_paths
 }
 resolve_install_protos() {
+  [[ -z $OPT_HY2 ]] || HY2_ENABLED=$OPT_HY2
   if [[ -n $OPT_REALITY ]]; then REALITY_ENABLED=$OPT_REALITY; fi
   if [[ -n $OPT_XHTTP ]]; then XHTTP_ENABLED=$OPT_XHTTP
-  elif (( ! STATE_HAS_XHTTP )); then XHTTP_ENABLED=1
+  elif (( ! INSTALLED && ! STATE_HAS_XHTTP )); then XHTTP_ENABLED=1
   fi
   if [[ -n $OPT_TROJAN ]]; then TROJAN_ENABLED=$OPT_TROJAN; fi
   if [[ -n $OPT_TUIC ]]; then TUIC_ENABLED=$OPT_TUIC; fi
@@ -9099,6 +9121,13 @@ confirm_xhttp() {
   else
     XHTTP_ENABLED=0
   fi
+}
+confirm_hy2() {
+  if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
+  elif (( ! OPT_AUTO )); then
+    if confirm "是否安装 Hysteria2（额外 UDP 协议，需放行或映射 UDP）？" "$([[ $HY2_ENABLED == 1 ]] && echo y || echo n)"; then HY2_ENABLED=1; else HY2_ENABLED=0; fi
+  fi
+  return 0
 }
 proto_any_enabled() { (( REALITY_ENABLED || XHTTP_ENABLED || HY2_ENABLED || TROJAN_ENABLED || TUIC_ENABLED || ANYTLS_ENABLED || XHTTP_TLS_ENABLED || WS_ENABLED )); }
 
@@ -9430,6 +9459,7 @@ sb_copy_cert() {
 write_singbox_config() {
   sb_needed || return 0
   [[ -x $SB_BIN ]] || die "未找到 sing-box，无法写入 TUIC / AnyTLS 配置。"
+  ensure_policy_gateway
   ensure_proto_secrets
   sb_copy_cert
   local tmp="${SB_CONF}.tmp" crt=$SB_CRT key=$SB_KEY
@@ -9439,7 +9469,7 @@ write_singbox_config() {
     --argjson tuic "${TUIC_ENABLED:-0}" --argjson any "${ANYTLS_ENABLED:-0}" \
     --argjson tport "${TUIC_PORT:-0}" --argjson aport "${ANYTLS_PORT:-0}" \
     --arg uuid "$UUID" --arg tpw "$TUIC_PASS" --arg apw "$ANYTLS_PASS" \
-    --arg crt "$crt" --arg key "$key" --argjson nets "$PRIV_NETS_JSON" '
+    --arg crt "$crt" --arg key "$key" --argjson nets "$PRIV_NETS_JSON" --argjson policy "$RELAY_SOCKS" '
     {
       log: {level: "warn"},
       inbounds: (
@@ -9457,7 +9487,7 @@ write_singbox_config() {
           }] else [] end)
       ),
       outbounds: [
-        {type: "direct", tag: "direct"}
+        {type: "socks", tag: "policy", server: "127.0.0.1", server_port: $policy, version: "5"}
       ],
       route: {
         rules: [
@@ -9465,11 +9495,11 @@ write_singbox_config() {
           {ip_cidr: $nets, action: "reject"},
           {protocol: "bittorrent", action: "reject"}
         ],
-        final: "direct"
+        final: "policy"
       }
     }' >"$tmp" || die "生成 sing-box 配置失败。"
   ensure_outbound_ip
-  singbox_apply_ip_strategy "$tmp" || die "写入 sing-box 出站地址族失败。"
+  # 目的地 DNS、地址族选择和落地转发由本机 Xray 统一执行。
   if ! "$SB_BIN" check -c "$tmp" >"${tmp}.log" 2>&1; then
     cat "${tmp}.log" >&2; rm -f "$tmp" "${tmp}.log"
     die "sing-box 配置校验失败，未应用新配置。"
@@ -9568,10 +9598,7 @@ choose_ports() {
   fi
   (( ! LAND_MODE )) || { HY2_ENABLED=0; return 0; }
   # Hysteria2
-  if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
-  elif (( ! OPT_AUTO )); then
-    if confirm "是否同时安装 Hysteria2（UDP，弱网/高丢包下表现更好）？" "$([[ $HY2_ENABLED == 1 ]] && echo y || echo n)"; then HY2_ENABLED=1; else HY2_ENABLED=0; fi
-  fi
+  confirm_hy2
   if (( ! HY2_ENABLED )); then HOP_RANGE=""; else
   p=${OPT_HY2_PORT:-$HY2_PORT}
   while :; do
@@ -9936,10 +9963,7 @@ choose_nat_ports() {
   fi
 
   # 4) Hysteria2（UDP）：可与 Reality 共用同一个端口号（服务商同时映射 TCP+UDP 时，节省映射名额）
-  if [[ -n $OPT_HY2 ]]; then HY2_ENABLED=$OPT_HY2
-  elif (( ! OPT_AUTO )); then
-    if confirm "是否同时安装 Hysteria2（UDP；需要服务商映射 UDP）？" "$([[ $HY2_ENABLED == 1 ]] && echo y || echo n)"; then HY2_ENABLED=1; else HY2_ENABLED=0; fi
-  fi
+  confirm_hy2
   if (( ! HY2_ENABLED )); then HOP_RANGE="" HOP_EXT_RANGE="" HY2_EXT_PORT="" HOP_BACKEND=""; else
   local other share
   other=$(nat_first_usable "$XRAY_EXT_PORT") || other=""
@@ -10123,7 +10147,7 @@ do_install() {
     fi
     if is_openrc; then rc-service xray stop >/dev/null 2>&1 9>&- || true   # 避免旧的 SS 端口被当作「其它已监听端口」放行
     else systemctl stop xray >/dev/null 2>&1 || true; fi
-    HY2_ENABLED=1
+    HY2_ENABLED=0
     REALITY_ENABLED=1
     [[ -n $OPT_XHTTP ]] || XHTTP_ENABLED=1
     if (( ! NAT_MODE )); then XRAY_PORT=443 HY2_PORT=443 HOP_RANGE="20000-50000"; fi
@@ -12158,31 +12182,15 @@ relay_tag() { land_tag_of "$RELAY_N" "$RELAY_H"; }
 relay_inject() { # $1 Xray 配置文件（节点模式）：落地出站放在最前 + 路由最后一条兜底到落地
   # 兜底不带 inboundTag，会匹配所有还没被前面规则接走的 TCP/UDP。
   # 落地入站的 ss-in 规则由 land_in_attach 先写好，所以不会进这条出站。
+  local_policy_attach "$1" || return 1
   relay_active || { [[ $RELAY_ON == 1 && -n $RELAY_LINK ]] && warn "保存的落地链接无法解析，已按直连生成配置。"; return 0; }
   local ob tag; tag=$(relay_tag)
   ob=$(land_outbound_json "$RELAY_M" "$RELAY_K" "$RELAY_H" "$RELAY_P" "$tag")
-  if [[ -z $RELAY_SOCKS ]] || ! is_port "$RELAY_SOCKS"; then RELAY_SOCKS=$(land_pick_default_port); fi
-  jq --argjson ob "$ob" --argjson sp "$RELAY_SOCKS" --argjson hy "${HY2_ENABLED:-0}" '
+  jq --argjson ob "$ob" '
     .outbounds = [$ob] + .outbounds
-    | (if $hy == 1 then .inbounds += [{tag: "hy2-relay", listen: "127.0.0.1", port: $sp, protocol: "socks",
-          settings: {auth: "noauth", udp: true, ip: "127.0.0.1"}}] else . end)
     | .routing.rules += [{type: "field", network: "tcp,udp", outboundTag: $ob.tag}]' "$1" >"${1}.relay" &&
     mv -f "${1}.relay" "$1"
 }
-relay_hy2_yaml() { # 追加到 Hysteria2 配置：经本机 Xray socks 入站走落地
-  relay_active || return 0
-  (( HY2_ENABLED )) && is_port "${RELAY_SOCKS:-}" || return 0
-  cat <<HY
-
-# 落地转发：Hysteria2 流量经本机 Xray（127.0.0.1:${RELAY_SOCKS}）→ 落地机 ${RELAY_H}
-outbounds:
-  - name: land
-    type: socks5
-    socks5:
-      addr: 127.0.0.1:${RELAY_SOCKS}
-HY
-}
-
 relay_test() { # 使用 RELAY_M/K/H/P：TCP 连接 → 经落地的真实请求（检查出口 IP）
   local hip
   info "测试 TCP 连接 ${RELAY_H}:${RELAY_P} ..."
@@ -13799,6 +13807,27 @@ doctor_network() {
   done
   doc_info "这是 VPS 到外网的探测，不代表客户端到 VPS 的入口线路可用。"
 }
+doctor_cn_policy() {
+  if land_raw_active; then
+    doc_info "原样转发不解密代理目的地，禁回国必须由最终落地机执行。"
+    land_only && return 0
+  fi
+  if ! land_only && ! xray_inbound_needed; then return 0; fi
+  if cn_policy_config_valid "$XRAY_CONF"; then doc_ok "大陆域名 / IPv4 / IPv6 目的地拦截规则位于兜底规则之前。"
+  else doc_fail "当前 Xray 配置缺少完整禁回国规则，请通过 proxy update 全部更新或重装以应用新策略。"; fi
+  if [[ ! -s ${XRAY_ASSET_DIR}/${CN_IP_FILE} || ! -s ${XRAY_ASSET_DIR}/${CN_SITE_FILE} ]]; then doc_fail "禁回国地理数据文件缺失。"; fi
+  if local_policy_needed && ! jq -e --argjson port "$RELAY_SOCKS" '
+    any(.inbounds[]; .tag == "hy2-relay" and .listen == "127.0.0.1" and .port == $port and .settings.udp == true and .sniffing.enabled == true and .sniffing.routeOnly == true)
+  ' "$XRAY_CONF" >/dev/null 2>&1; then doc_fail "本机策略入口缺失或不是仅回环的 TCP / UDP SOCKS 入站。"; fi
+  if (( HY2_ENABLED )) && ! grep -Eq "addr: 127\\.0\\.0\\.1:${RELAY_SOCKS}[[:space:]]*$" "$HY_CONF"; then
+    doc_fail "Hysteria2 尚未接入本机策略入口，需重新生成其配置。"
+  fi
+  if sb_needed && ! jq -e --argjson port "$RELAY_SOCKS" '
+    (.outbounds|length) == 1 and .outbounds[0].type == "socks"
+    and .outbounds[0].server == "127.0.0.1" and .outbounds[0].server_port == $port and .route.final == .outbounds[0].tag
+  ' "$SB_CONF" >/dev/null 2>&1; then doc_fail "sing-box 尚未接入本机策略入口，需重新生成其配置。"; fi
+  return 0
+}
 doctor_land_listen() {
   local port=$1
   if land_raw_active; then
@@ -13829,8 +13858,8 @@ doctor_services() {
   fi
   if land_only; then doctor_land_listen "$XRAY_PORT"
   elif (( need_x && REALITY_ENABLED )); then doctor_port tcp "$XRAY_PORT" "Xray"
-  elif (( need_x )) && ! land_in_on; then doctor_port tcp "$XRAY_PORT" "Xray"
   fi
+  if local_policy_needed; then doctor_port tcp "$RELAY_SOCKS" "本机策略入口（仅回环）"; fi
   if land_in_on; then doctor_land_listen "$LAND_PORT"; fi
   if (( HY2_ENABLED )); then
     doctor_one_svc hysteria-server 1
@@ -14167,6 +14196,7 @@ doctor_run_checks() {
   doctor_clock
   doctor_services
   doctor_configs
+  doctor_cn_policy
   doctor_firewall
   doctor_network
   doctor_sni
@@ -14545,7 +14575,7 @@ usage() {
   --force-sni         保留兼容旧命令；手填 SNI 检测不通过也会继续使用
   --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
-  --hy2 / --no-hy2    安装 / 不安装 Hysteria2（默认安装）
+  --hy2 / --no-hy2    安装 / 不安装 Hysteria2（首次默认不装）
   --hy2-port <端口>   Hysteria2 UDP 端口（默认 443）
   --reality / --no-reality
                       开启 / 关闭 VLESS + REALITY + Vision（默认开启）
@@ -14699,7 +14729,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy vless-enc     查看 CDN 线路的 VLESS Encryption。on / off 开关，rotate 换新钥匙
                       只重写 Xray 并刷新链接和订阅，不重装；REALITY 等不变
   proxy proto         协议开关（菜单第 16 项）。逐个开/关，不删除已有密钥
-                      默认开：Vision、XHTTP+REALITY、Hysteria2
+                      默认开：Vision、XHTTP+REALITY；Hysteria2 需明确开启
                       默认关：Trojan、TUIC、AnyTLS，以及 CDN 的 XHTTP+TLS / WebSocket+TLS
                       关闭只停止监听。这里关掉 Hysteria2 不删除程序；
                       重新安装时 --no-hy2 会移除它（密码仍留在 state.env）

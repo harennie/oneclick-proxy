@@ -15,3 +15,4 @@ check:
 	bash tests/outbound-selection.sh
 	bash tests/land-nat.sh
 	bash tests/doctor.sh
+	bash tests/cn-policy.sh
