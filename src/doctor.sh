@@ -157,6 +157,16 @@ doctor_cn_policy() {
     (.outbounds|length) == 1 and .outbounds[0].type == "socks"
     and .outbounds[0].server == "127.0.0.1" and .outbounds[0].server_port == $port and .route.final == .outbounds[0].tag
   ' "$SB_CONF" >/dev/null 2>&1; then doc_fail "sing-box 尚未接入本机策略入口，需重新生成其配置。"; fi
+  if is_openrc; then
+    if [[ -x $RULE_UPDATE_CRON ]] && { svc_active crond || svc_active cron; }; then doc_ok "每日规则更新任务和 cron 服务已就绪。"
+    else doc_warn "每日规则更新任务尚未就绪，可执行 proxy update-rules 自动建立。"; fi
+  else
+    if systemctl is-enabled --quiet proxy-oneclick-rules.timer 2>/dev/null && systemctl is-active --quiet proxy-oneclick-rules.timer 2>/dev/null; then doc_ok "每日规则更新定时器已启用并运行。"
+    else doc_warn "每日规则更新定时器尚未就绪，可执行 proxy update-rules 自动建立。"; fi
+    local result
+    result=$(systemctl show -p Result --value proxy-oneclick-rules.service 2>/dev/null) || result=""
+    if [[ -n $result && $result != success ]]; then doc_warn "最近一次规则更新未成功（${result}）；可查看 journalctl -u proxy-oneclick-rules.service。"; fi
+  fi
   return 0
 }
 doctor_land_listen() {

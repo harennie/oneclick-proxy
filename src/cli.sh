@@ -160,6 +160,7 @@ show_menu() {
   load_state
   clear 2>/dev/null || true
   [[ -n $INIT_SYS ]] || detect_init
+  cn_rules_install_job
   if (( LAND_MODE )); then show_land_menu; return; fi
   local menu10="防火墙管理"; (( NAT_MODE )) && menu10="NAT 信息 / 端口跳跃"
   local mode_lbl; mode_lbl=$(nat_mode_label)
@@ -494,6 +495,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
                       不写目标时回滚这三个，没有 .bak 的跳过。点名某一个却没有 .bak 时失败退出
                       systemd 和 OpenRC 都用同一套重启
   proxy update-script 只更新本脚本
+  proxy update-rules  立即检查 CN 规则数据；没有每日任务时自动建立，有变化才重启 Xray
   proxy export [文件]  导出密钥和证书（权限 600）。--password 加密；没有终端时请设置 PROXY_EXPORT_PASS
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
   bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
@@ -817,6 +819,7 @@ parse_args() {
           *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
         esac ;;
       update|upgrade) OPT_ACTION=update ;;
+      update-rules) OPT_ACTION=update-rules ;;
       export)
         OPT_ACTION="export"
         if [[ ${2-} == --password ]]; then OPT_EXPORT_ENC=1; shift; fi
@@ -926,6 +929,7 @@ main() {
     user) menu_users ;;
     update) menu_update ;;
     update-script) update_script ;;
+    update-rules) do_update_rules ;;
     status) menu_status ;;
     doctor) do_doctor ;;
     speed) menu_speed ;;

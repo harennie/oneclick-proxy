@@ -16,3 +16,4 @@ check:
 	bash tests/land-nat.sh
 	bash tests/doctor.sh
 	bash tests/cn-policy.sh
+	bash tests/rule-update.sh

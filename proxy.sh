@@ -54,7 +54,7 @@ export LC_ALL=C.UTF-8 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-readonly SCRIPT_VERSION="1.9.0"
+readonly SCRIPT_VERSION="1.10.0"
 # 发布后请把这里改成你仓库的 raw 地址（用于 `proxy update-script` 及 bash <(curl ...) 安装时自我安装）
 # 可用环境变量 PROXY_SCRIPT_URL 覆盖（镜像 / 测试用）
 readonly SCRIPT_URL="${PROXY_SCRIPT_URL:-https://raw.githubusercontent.com/harennie/oneclick-proxy/main/proxy.sh}"
@@ -103,6 +103,9 @@ readonly SCANNER_VER="v0.2.3"
 readonly NFT_TABLE="proxy_oneclick"
 # NAT 模式
 readonly XRAY_ASSET_DIR="/usr/local/share/xray"
+readonly RULE_UPDATE_UNIT="/etc/systemd/system/proxy-oneclick-rules.service"
+readonly RULE_UPDATE_TIMER="/etc/systemd/system/proxy-oneclick-rules.timer"
+readonly RULE_UPDATE_CRON="/etc/periodic/daily/proxy-oneclick-rules"
 readonly XRAY_UNIT="/etc/systemd/system/xray.service"
 readonly HY_UNIT="/etc/systemd/system/hysteria-server.service"
 readonly XRAY_RC="/etc/init.d/xray"
@@ -382,7 +385,7 @@ ui_proto_line() { # $1=1 已开启 $2 名称 $3 说明
 
 # build.sh 把这一行换成「生成文件行号:源文件:源文件行号」，前后行号不变。
 # 占位符还在时表示没构建，映射直接跳过。
-readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;741:src/os.sh:1;1250:src/tune.sh:1;2050:src/xray.sh:1;4207:src/hy2.sh:1;4342:src/firewall.sh:1;5627:src/cert.sh:1;7659:src/cdn.sh:1;8644:src/link.sh:1;9037:src/singbox.sh:1;9629:src/nat.sh:1;10293:src/selftest.sh:1;10434:src/land.sh:1;12340:src/menu.sh:1;12939:src/route.sh:1;13454:src/export.sh:1;13670:src/doctor.sh:1;14255:src/cli.sh:1"
+readonly __MODULE_MAP="1:src/core.sh:1;3:src/core.sh:2;746:src/os.sh:1;1255:src/tune.sh:1;2055:src/xray.sh:1;4351:src/hy2.sh:1;4486:src/firewall.sh:1;5771:src/cert.sh:1;7803:src/cdn.sh:1;8788:src/link.sh:1;9181:src/singbox.sh:1;9774:src/nat.sh:1;10438:src/selftest.sh:1;10579:src/land.sh:1;12485:src/menu.sh:1;13090:src/route.sh:1;13605:src/export.sh:1;13821:src/doctor.sh:1;14416:src/cli.sh:1"
 err_from_map() { # $1 合并后的行号；成功时打印 src/file.sh:行
   local line=$1 ent p f s best_p=0 best_f="" best_s=0
   [[ $line =~ ^[0-9]+$ ]] || return 1
@@ -633,9 +636,11 @@ svc_follow() {
 require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 用户运行本脚本（例如: sudo -i 后再执行）。"; }
 
 take_lock() {
+  [[ ${LOCK_TAKEN:-0} == 1 ]] && return 0
   have flock || return 0
   exec 9>/run/proxy-oneclick.lock
   flock -n 9 || die "另一个 proxy 脚本实例正在运行，请稍后再试。"
+  LOCK_TAKEN=1
 }
 
 # ----------------------------- 状态持久化 -----------------------------
@@ -1163,7 +1168,7 @@ install_deps_nat() {
   if [[ $PKG == apk ]]; then
     # bash/curl 必须事先安装；coreutils/grep/gawk 替换 busybox 中功能不全的同名命令
     # 磁盘很小：只装必需包（busybox 已提供其余命令）；gawk/grep 替换功能不全的 busybox 版本
-    pkg_install bash ca-certificates curl openssl jq unzip iproute2 grep gawk musl-utils
+    pkg_install bash ca-certificates curl openssl jq unzip iproute2 grep gawk musl-utils flock
     pkg_try libqrencode-tools
   elif [[ $PKG == apt ]]; then
     pkg_install ca-certificates curl openssl jq unzip iproute2 procps gawk netbase
@@ -3974,8 +3979,15 @@ cn_policy_inject() { # 始终在白名单、直连和落地兜底之前检查真
 ensure_cn_geodata() {
   if [[ ${CN_DATA_REFRESH:-0} == 0 && -s ${XRAY_ASSET_DIR}/${CN_IP_FILE} && -s ${XRAY_ASSET_DIR}/${CN_SITE_FILE} ]]; then return 0; fi
   mktmp
-  local dir repo asset file tag want sum
+  local dir
   dir=$(mktemp -d "${TMP_DIR}/cn-data.XXXXXX") || die "无法创建禁回国规则临时目录。"
+  cn_geodata_download "$dir"
+  cn_geodata_install "$dir"
+  CN_DATA_REFRESH=0
+  rm -rf "$dir"
+}
+cn_geodata_download() {
+  local dir=$1 repo asset file tag want sum
   for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
     if [[ $file == "$CN_IP_FILE" ]]; then repo=Loyalsoldier/geoip; asset=geoip-only-cn-private.dat
     else repo=v2fly/domain-list-community; asset=dlc.dat; fi
@@ -3991,15 +4003,146 @@ ensure_cn_geodata() {
   jq -n --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" \
     '{outbounds:[{tag:"block",protocol:"blackhole"}],routing:{rules:[{type:"field",ip:[$ip],outboundTag:"block"},{type:"field",domain:[$site],outboundTag:"block"}]}}' >"$dir/check.json"
   if ! XRAY_LOCATION_ASSET="$dir" "$XRAY_BIN" run -test -config "$dir/check.json" >"$dir/check.log" 2>&1; then die "禁回国数据缺少可用的 CN 分类或与当前内核不兼容。"; fi
+}
+cn_geodata_install() {
+  local dir=$1 file
   mkdir -p "$XRAY_ASSET_DIR" || die "无法创建禁回国数据目录。"
   chmod 755 "$XRAY_ASSET_DIR" || die "无法设置禁回国数据目录权限。"
   for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
     install -m 644 "$dir/$file" "${XRAY_ASSET_DIR}/${file}.new" || die "无法写入禁回国规则文件。"
     mv -f "${XRAY_ASSET_DIR}/${file}.new" "${XRAY_ASSET_DIR}/${file}" || die "无法替换禁回国规则文件。"
   done
-  CN_DATA_REFRESH=0
-  rm -rf "$dir"
 }
+cn_rules_install_job() {
+  (( ${INSTALLED:-0} )) && [[ -x $BIN_PATH ]] && cn_policy_config_valid "$XRAY_CONF" || return 0
+  grep -q '^do_update_rules()' "$BIN_PATH" || return 0
+  if land_only && land_raw_active; then return 0; fi
+  if ! have flock; then
+    if is_openrc; then apk add --no-cache flock || die "无法安装规则更新所需的 flock。"
+    else die "缺少 flock，请先安装 util-linux。"; fi
+  fi
+  if is_openrc; then
+    local daemon=crond
+    svc_exists crond || daemon=cron
+    if ! svc_exists "$daemon"; then
+      apk add --no-cache busybox-openrc || die "无法安装每日规则任务所需的 crond。"
+      daemon=crond
+    fi
+    if [[ -x $RULE_UPDATE_CRON ]] && svc_active "$daemon"; then return 0; fi
+    mkdir -p "$(dirname "$RULE_UPDATE_CRON")"
+    cat >"$RULE_UPDATE_CRON" <<EOF
+#!/bin/sh
+umask 077
+exec ${BIN_PATH} update-rules --auto >${STATE_DIR}/rule-update.log 2>&1
+EOF
+    chmod 755 "$RULE_UPDATE_CRON"
+    rc-update add "$daemon" default >/dev/null || die "无法启用每日规则任务的 cron 服务。"
+    rc-service "$daemon" start >/dev/null 2>&1 9>&- || die "无法启动每日规则任务的 cron 服务。"
+  else
+    if [[ -f $RULE_UPDATE_UNIT && -f $RULE_UPDATE_TIMER ]] \
+      && systemctl is-enabled --quiet proxy-oneclick-rules.timer && systemctl is-active --quiet proxy-oneclick-rules.timer; then return 0; fi
+    cat >"$RULE_UPDATE_UNIT" <<EOF
+[Unit]
+Description=Update proxy-oneclick routing data
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${STATE_FILE}
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_PATH} update-rules --auto
+TimeoutStartSec=15min
+EOF
+    cat >"$RULE_UPDATE_TIMER" <<'EOF'
+[Unit]
+Description=Daily proxy-oneclick routing data check
+
+[Timer]
+OnCalendar=*-*-* 03:35:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    sd_reload
+    systemctl enable --now proxy-oneclick-rules.timer >/dev/null || die "无法启用每日规则更新定时器。"
+  fi
+  ok "规则数据每日自动检查已启用；仅有变化且校验通过时重启 Xray。"
+}
+cn_rules_remove_job() {
+  if ! is_openrc; then
+    systemctl disable --now proxy-oneclick-rules.timer >/dev/null 2>&1 || true
+    systemctl stop proxy-oneclick-rules.service >/dev/null 2>&1 || true
+  fi
+  rm -f "$RULE_UPDATE_UNIT" "$RULE_UPDATE_TIMER" "$RULE_UPDATE_CRON" "${STATE_DIR}/rule-update.log"
+  sd_reload
+}
+do_update_rules() ( # 事务放在子 shell 中，失败或收到终止信号都恢复旧数据。
+  load_state
+  (( INSTALLED )) || die "尚未安装。"
+  take_lock
+  if land_only && land_raw_active; then info "原样转发的规则由最终落地机维护。"; return 0; fi
+  cn_policy_config_valid "$XRAY_CONF" || die "当前配置尚未使用 CN 策略数据，请先重装或全部更新以应用禁回国规则。"
+  cn_rules_install_job
+  take_lock
+  mktmp
+  local dir file backup="" replacing=0 was_active=0
+  dir=$(mktemp -d "${TMP_DIR}/rules-update.XXXXXX") || die "无法创建规则更新临时目录。"
+  trap '
+    rc=$?
+    trap - ERR
+    set +e
+    restore_failed=0
+    if (( replacing )); then
+      for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
+        if [[ -f $backup/$file ]]; then
+          cp -a "$backup/$file" "${XRAY_ASSET_DIR}/${file}.new" && mv -f "${XRAY_ASSET_DIR}/${file}.new" "${XRAY_ASSET_DIR}/${file}" || restore_failed=1
+        else rm -f "${XRAY_ASSET_DIR}/${file}" || restore_failed=1; fi
+        rm -f "${XRAY_ASSET_DIR}/${file}.new"
+      done
+      if (( restore_failed )); then
+        warn "规则恢复不完整，请立即检查磁盘和权限；备份保留在 ${backup}。"
+      else warn "规则更新未完成，已恢复旧数据。"; fi
+      if (( was_active )); then svc_restart xray && svc_active xray || warn "恢复后 Xray 仍未运行，请检查服务日志。"; fi
+    fi
+    if (( ! restore_failed )) && [[ -n $backup ]]; then rm -rf "$backup"; fi
+    rm -rf "$dir"
+    exit "$rc"
+  ' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cn_geodata_download "$dir"
+  if cmp -s "$dir/$CN_IP_FILE" "$XRAY_ASSET_DIR/$CN_IP_FILE" && cmp -s "$dir/$CN_SITE_FILE" "$XRAY_ASSET_DIR/$CN_SITE_FILE"; then
+    ok "规则数据没有变化，未重启 Xray。"
+    return 0
+  fi
+  # 校验当前完整配置时，其它已有地理数据也必须可见。
+  for file in "$XRAY_ASSET_DIR"/*; do
+    [[ -f $file && ! -e $dir/${file##*/} ]] || continue
+    ln -s "$file" "$dir/${file##*/}" || die "无法准备完整配置所需的地理数据。"
+  done
+  if ! XRAY_LOCATION_ASSET="$dir" "$XRAY_BIN" run -test -config "$XRAY_CONF" >"$dir/config-check.log" 2>&1; then
+    die "新规则未通过当前 Xray 配置校验，旧数据和服务保持不变。"
+  fi
+  mkdir -p "$BACKUP_DIR" || die "无法创建规则备份目录。"
+  backup=$(mktemp -d "${BACKUP_DIR}/rules.XXXXXX") || die "无法创建规则备份。"
+  for file in "$CN_IP_FILE" "$CN_SITE_FILE"; do
+    if [[ -e $XRAY_ASSET_DIR/$file ]]; then cp -a "$XRAY_ASSET_DIR/$file" "$backup/$file" || die "规则备份失败，未应用更新。"; fi
+  done
+  svc_active xray && was_active=1
+  replacing=1
+  cn_geodata_install "$dir"
+  if (( was_active )); then
+    svc_restart xray || die "Xray 未能重启，将恢复旧规则。"
+    sleep 1
+    svc_active xray || die "Xray 加载新规则后退出，将恢复旧规则。"
+  fi
+  # shellcheck disable=SC2034 # EXIT trap reads the committed replacement state.
+  replacing=0
+  if (( was_active )); then ok "规则数据已更新，Xray 已重新加载。"
+  else ok "规则数据已更新；Xray 原先未运行，未将其启动。"; fi
+)
 cn_policy_config_valid() {
   jq -e --arg ip "ext:${CN_IP_FILE}:cn" --arg site "ext:${CN_SITE_FILE}:cn" '
     .routing.domainStrategy == "IPOnDemand"
@@ -4042,6 +4185,7 @@ write_xray_config() {
   if (( ! LAND_MODE )) && sni_target_is_loop "${SNI_TARGET:-$SNI:443}"; then
     die "REALITY target 指回本机 Xray 入站，拒绝覆盖可用配置。请为 ${SNI} 选择独立的本机 HTTPS 后端。"
   fi
+  take_lock
   local clients tmp seed="" cplain tclients
   clients=$(xray_clients_json)
   cplain=$(xray_clients_json "")
@@ -9052,6 +9196,7 @@ self_install() {
     rm -f "${BIN_PATH}.tmp"
   fi
   [[ -x $BIN_PATH ]] && ok "管理命令已安装：${BIN_PATH}（直接输入 proxy 即可打开菜单）"
+  cn_rules_install_job
   return 0
 }
 
@@ -12516,6 +12661,7 @@ menu_users() {
 }
 
 menu_update() {
+  take_lock
   if [[ -n ${OPT_ROLLBACK:-} ]]; then
     [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]] && die "回滚和指定版本不能一起用。"
     do_rollback "$OPT_ROLLBACK"
@@ -12529,6 +12675,7 @@ menu_update() {
   preflight
   echo "  1) 更新 Xray-core    2) 更新 Hysteria2    3) 更新本脚本"
   echo "  4) 全部更新（含 sing-box）    5) 回滚到备份    0) 返回"
+  echo "  6) 检查规则数据更新（默认每日自动检查）"
   echo "  指定版本: proxy update --xray-ver <版本>  --hy2-ver <版本>  --singbox-ver <版本>"
   local c; ask c "请选择" "4"
   case $c in
@@ -12549,6 +12696,7 @@ menu_update() {
          4) do_rollback all ;;
          *) return 0 ;;
        esac ;;
+    6) do_update_rules ;;
     *) return 0 ;;
   esac
 }
@@ -12601,6 +12749,7 @@ update_script() {
     fi
     install -m 755 "${TMP_DIR}/proxy.sh" "$BIN_PATH"
     ok "脚本已更新为 $(grep -m1 '^readonly SCRIPT_VERSION=' "$BIN_PATH" | cut -d'"' -f2)"
+    cn_rules_install_job
   else
     warn "脚本更新失败。"
   fi
@@ -12892,6 +13041,8 @@ do_uninstall() {
     warn "将卸载 Xray、Hysteria2、本脚本防火墙规则、调优配置、fail2ban 规则及管理命令。"
   fi
   (( OPT_AUTO )) || confirm "确认卸载？" n || return 0
+  cn_rules_remove_job
+  take_lock
   step "卸载"
   svc_disable_stop xray
   if have systemctl; then systemctl disable --now 'xray@*' >/dev/null 2>&1 || true; fi
@@ -13826,6 +13977,16 @@ doctor_cn_policy() {
     (.outbounds|length) == 1 and .outbounds[0].type == "socks"
     and .outbounds[0].server == "127.0.0.1" and .outbounds[0].server_port == $port and .route.final == .outbounds[0].tag
   ' "$SB_CONF" >/dev/null 2>&1; then doc_fail "sing-box 尚未接入本机策略入口，需重新生成其配置。"; fi
+  if is_openrc; then
+    if [[ -x $RULE_UPDATE_CRON ]] && { svc_active crond || svc_active cron; }; then doc_ok "每日规则更新任务和 cron 服务已就绪。"
+    else doc_warn "每日规则更新任务尚未就绪，可执行 proxy update-rules 自动建立。"; fi
+  else
+    if systemctl is-enabled --quiet proxy-oneclick-rules.timer 2>/dev/null && systemctl is-active --quiet proxy-oneclick-rules.timer 2>/dev/null; then doc_ok "每日规则更新定时器已启用并运行。"
+    else doc_warn "每日规则更新定时器尚未就绪，可执行 proxy update-rules 自动建立。"; fi
+    local result
+    result=$(systemctl show -p Result --value proxy-oneclick-rules.service 2>/dev/null) || result=""
+    if [[ -n $result && $result != success ]]; then doc_warn "最近一次规则更新未成功（${result}）；可查看 journalctl -u proxy-oneclick-rules.service。"; fi
+  fi
   return 0
 }
 doctor_land_listen() {
@@ -14414,6 +14575,7 @@ show_menu() {
   load_state
   clear 2>/dev/null || true
   [[ -n $INIT_SYS ]] || detect_init
+  cn_rules_install_job
   if (( LAND_MODE )); then show_land_menu; return; fi
   local menu10="防火墙管理"; (( NAT_MODE )) && menu10="NAT 信息 / 端口跳跃"
   local mode_lbl; mode_lbl=$(nat_mode_label)
@@ -14748,6 +14910,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
                       不写目标时回滚这三个，没有 .bak 的跳过。点名某一个却没有 .bak 时失败退出
                       systemd 和 OpenRC 都用同一套重启
   proxy update-script 只更新本脚本
+  proxy update-rules  立即检查 CN 规则数据；没有每日任务时自动建立，有变化才重启 Xray
   proxy export [文件]  导出密钥和证书（权限 600）。--password 加密；没有终端时请设置 PROXY_EXPORT_PASS
   proxy import <文件>  导入后重新检测 IP、NAT、SNI 和防火墙
   bash proxy.sh --import <文件> [--auto]   同上，可加原来的安装参数
@@ -15071,6 +15234,7 @@ parse_args() {
           *) die "proxy update --rollback 的参数只能是 xray、hy2、singbox 或 all: ${OPT_ROLLBACK}" ;;
         esac ;;
       update|upgrade) OPT_ACTION=update ;;
+      update-rules) OPT_ACTION=update-rules ;;
       export)
         OPT_ACTION="export"
         if [[ ${2-} == --password ]]; then OPT_EXPORT_ENC=1; shift; fi
@@ -15180,6 +15344,7 @@ main() {
     user) menu_users ;;
     update) menu_update ;;
     update-script) update_script ;;
+    update-rules) do_update_rules ;;
     status) menu_status ;;
     doctor) do_doctor ;;
     speed) menu_speed ;;

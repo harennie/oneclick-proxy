@@ -16,6 +16,7 @@ self_install() {
     rm -f "${BIN_PATH}.tmp"
   fi
   [[ -x $BIN_PATH ]] && ok "管理命令已安装：${BIN_PATH}（直接输入 proxy 即可打开菜单）"
+  cn_rules_install_job
   return 0
 }
 

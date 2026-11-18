@@ -177,6 +177,7 @@ menu_users() {
 }
 
 menu_update() {
+  take_lock
   if [[ -n ${OPT_ROLLBACK:-} ]]; then
     [[ -n ${OPT_XRAY_VER:-}${OPT_HY2_VER:-}${OPT_SINGBOX_VER:-} ]] && die "回滚和指定版本不能一起用。"
     do_rollback "$OPT_ROLLBACK"
@@ -190,6 +191,7 @@ menu_update() {
   preflight
   echo "  1) 更新 Xray-core    2) 更新 Hysteria2    3) 更新本脚本"
   echo "  4) 全部更新（含 sing-box）    5) 回滚到备份    0) 返回"
+  echo "  6) 检查规则数据更新（默认每日自动检查）"
   echo "  指定版本: proxy update --xray-ver <版本>  --hy2-ver <版本>  --singbox-ver <版本>"
   local c; ask c "请选择" "4"
   case $c in
@@ -210,6 +212,7 @@ menu_update() {
          4) do_rollback all ;;
          *) return 0 ;;
        esac ;;
+    6) do_update_rules ;;
     *) return 0 ;;
   esac
 }
@@ -262,6 +265,7 @@ update_script() {
     fi
     install -m 755 "${TMP_DIR}/proxy.sh" "$BIN_PATH"
     ok "脚本已更新为 $(grep -m1 '^readonly SCRIPT_VERSION=' "$BIN_PATH" | cut -d'"' -f2)"
+    cn_rules_install_job
   else
     warn "脚本更新失败。"
   fi
@@ -553,6 +557,8 @@ do_uninstall() {
     warn "将卸载 Xray、Hysteria2、本脚本防火墙规则、调优配置、fail2ban 规则及管理命令。"
   fi
   (( OPT_AUTO )) || confirm "确认卸载？" n || return 0
+  cn_rules_remove_job
+  take_lock
   step "卸载"
   svc_disable_stop xray
   if have systemctl; then systemctl disable --now 'xray@*' >/dev/null 2>&1 || true; fi

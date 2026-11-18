@@ -423,7 +423,7 @@ install_deps_nat() {
   if [[ $PKG == apk ]]; then
     # bash/curl 必须事先安装；coreutils/grep/gawk 替换 busybox 中功能不全的同名命令
     # 磁盘很小：只装必需包（busybox 已提供其余命令）；gawk/grep 替换功能不全的 busybox 版本
-    pkg_install bash ca-certificates curl openssl jq unzip iproute2 grep gawk musl-utils
+    pkg_install bash ca-certificates curl openssl jq unzip iproute2 grep gawk musl-utils flock
     pkg_try libqrencode-tools
   elif [[ $PKG == apt ]]; then
     pkg_install ca-certificates curl openssl jq unzip iproute2 procps gawk netbase

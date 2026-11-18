@@ -31,3 +31,5 @@ jobs:
         run: bash tests/doctor.sh
       - name: Protocol defaults and mainland destination policy
         run: bash tests/cn-policy.sh
+      - name: Scheduled routing data update and rollback
+        run: bash tests/rule-update.sh
