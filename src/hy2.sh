@@ -49,6 +49,7 @@ gen_hy2_cert() {
 }
 
 write_hy2_config() {
+  ensure_policy_gateway
   ensure_outbound_ip
   [[ -n $HY2_PASS ]] || HY2_PASS=$(rand_pass)
   local crt=$HY_CRT key=$HY_KEY
@@ -81,12 +82,7 @@ masquerade:
     url: https://${SNI}/
     rewriteHost: true
 HY
-  # 落地转发时第一条 outbound 必须是 socks5（否则 Hy2 会改走直连）。直连时用 direct.mode。
-  if relay_active; then
-    relay_hy2_yaml >>"${HY_CONF}.tmp"
-  else
-    hy2_outbound_yaml >>"${HY_CONF}.tmp"
-  fi
+  hy2_outbound_yaml >>"${HY_CONF}.tmp"
   local grp="root"; id hysteria >/dev/null 2>&1 && grp=hysteria
   if tls_present_real; then
     chown "root:${grp}" "${HY_CONF}.tmp"

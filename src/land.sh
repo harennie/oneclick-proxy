@@ -1749,31 +1749,15 @@ relay_tag() { land_tag_of "$RELAY_N" "$RELAY_H"; }
 relay_inject() { # $1 Xray 配置文件（节点模式）：落地出站放在最前 + 路由最后一条兜底到落地
   # 兜底不带 inboundTag，会匹配所有还没被前面规则接走的 TCP/UDP。
   # 落地入站的 ss-in 规则由 land_in_attach 先写好，所以不会进这条出站。
+  local_policy_attach "$1" || return 1
   relay_active || { [[ $RELAY_ON == 1 && -n $RELAY_LINK ]] && warn "保存的落地链接无法解析，已按直连生成配置。"; return 0; }
   local ob tag; tag=$(relay_tag)
   ob=$(land_outbound_json "$RELAY_M" "$RELAY_K" "$RELAY_H" "$RELAY_P" "$tag")
-  if [[ -z $RELAY_SOCKS ]] || ! is_port "$RELAY_SOCKS"; then RELAY_SOCKS=$(land_pick_default_port); fi
-  jq --argjson ob "$ob" --argjson sp "$RELAY_SOCKS" --argjson hy "${HY2_ENABLED:-0}" '
+  jq --argjson ob "$ob" '
     .outbounds = [$ob] + .outbounds
-    | (if $hy == 1 then .inbounds += [{tag: "hy2-relay", listen: "127.0.0.1", port: $sp, protocol: "socks",
-          settings: {auth: "noauth", udp: true, ip: "127.0.0.1"}}] else . end)
     | .routing.rules += [{type: "field", network: "tcp,udp", outboundTag: $ob.tag}]' "$1" >"${1}.relay" &&
     mv -f "${1}.relay" "$1"
 }
-relay_hy2_yaml() { # 追加到 Hysteria2 配置：经本机 Xray socks 入站走落地
-  relay_active || return 0
-  (( HY2_ENABLED )) && is_port "${RELAY_SOCKS:-}" || return 0
-  cat <<HY
-
-# 落地转发：Hysteria2 流量经本机 Xray（127.0.0.1:${RELAY_SOCKS}）→ 落地机 ${RELAY_H}
-outbounds:
-  - name: land
-    type: socks5
-    socks5:
-      addr: 127.0.0.1:${RELAY_SOCKS}
-HY
-}
-
 relay_test() { # 使用 RELAY_M/K/H/P：TCP 连接 → 经落地的真实请求（检查出口 IP）
   local hip
   info "测试 TCP 连接 ${RELAY_H}:${RELAY_P} ..."

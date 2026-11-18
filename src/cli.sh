@@ -321,7 +321,7 @@ usage() {
   --force-sni         保留兼容旧命令；手填 SNI 检测不通过也会继续使用
   --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
-  --hy2 / --no-hy2    安装 / 不安装 Hysteria2（默认安装）
+  --hy2 / --no-hy2    安装 / 不安装 Hysteria2（首次默认不装）
   --hy2-port <端口>   Hysteria2 UDP 端口（默认 443）
   --reality / --no-reality
                       开启 / 关闭 VLESS + REALITY + Vision（默认开启）
@@ -475,7 +475,7 @@ NAT 小鸡模式（端口映射 / LXC / OpenVZ / Alpine，自动跳过防火墙�
   proxy vless-enc     查看 CDN 线路的 VLESS Encryption。on / off 开关，rotate 换新钥匙
                       只重写 Xray 并刷新链接和订阅，不重装；REALITY 等不变
   proxy proto         协议开关（菜单第 16 项）。逐个开/关，不删除已有密钥
-                      默认开：Vision、XHTTP+REALITY、Hysteria2
+                      默认开：Vision、XHTTP+REALITY；Hysteria2 需明确开启
                       默认关：Trojan、TUIC、AnyTLS，以及 CDN 的 XHTTP+TLS / WebSocket+TLS
                       关闭只停止监听。这里关掉 Hysteria2 不删除程序；
                       重新安装时 --no-hy2 会移除它（密码仍留在 state.env）

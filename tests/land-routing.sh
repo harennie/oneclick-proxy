@@ -29,7 +29,7 @@ reset_opts() {
   LAND_MODE=0 LAND_IN=0
 }
 
-if [[ $SCRIPT_VERSION != 1.8.0 ]]; then fail "SCRIPT_VERSION=$SCRIPT_VERSION"; fi
+if [[ $SCRIPT_VERSION != 1.9.0 ]]; then fail "SCRIPT_VERSION=$SCRIPT_VERSION"; fi
 usage | grep -q -- '--with-land' || fail "help missing --with-land"
 usage | grep -q -- 'land-enable' || fail "help missing land-enable"
 usage | grep -q -- 'land-next' || fail "help missing land-next"
@@ -193,7 +193,7 @@ xray_apply_ip_strategy "$cfg"
 jq -e '.inbounds[] | select(.tag=="vless-reality") | .port == 443' "$cfg" >/dev/null || fail "Reality 入站丢了"
 jq -e '.inbounds[] | select(.tag=="ss-in") | .port == 8388 and .protocol == "shadowsocks"' "$cfg" >/dev/null || fail "没有 ss-in"
 jq -e '[.outbounds[].tag] | index("ss-out") | not' "$cfg" >/dev/null || fail "直连落地入站不应有 ss-out"
-jq -e '.routing.domainStrategy == "UseIPv6v4"' "$cfg" >/dev/null || fail "routing.domainStrategy"
+jq -e '.routing.domainStrategy == "AsIs"' "$cfg" >/dev/null || fail "outbound preference changed routing resolution policy"
 jq -e '.outbounds[] | select(.tag=="direct" and .protocol=="freedom") | .settings.domainStrategy == "UseIPv6v4"' "$cfg" >/dev/null || fail "direct domainStrategy"
 jq -e '
   .routing.rules[] | select(.inboundTag == ["ss-in"] and .outboundTag == "direct")

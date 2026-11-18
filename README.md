@@ -2,7 +2,7 @@
 
 一键在 VPS 上安装代理节点，不需要自己的域名。给用户运行的是仓库根目录拼好的 `proxy.sh`；源码在 `src/*.sh`，由 `build.sh` 按固定顺序拼起来。
 
-- 默认装好 VLESS + REALITY + Vision、VLESS + XHTTP + REALITY 和 Hysteria2，可选 Trojan、TUIC、AnyTLS 与 CDN 线路
+- 默认装好 VLESS + REALITY + Vision、VLESS + XHTTP + REALITY；Hysteria2 需明确开启，可选 Trojan、TUIC、AnyTLS 与 CDN 线路
 - 自动优选 REALITY 伪装站点，Hysteria2 支持端口跳跃；有域名时可以另外申请证书
 - 防火墙可严格默认拒绝，也可只放行代理端口；检测到 Docker 等环境时默认用温和模式，避免挡住现有服务
 - 支持 Debian / Ubuntu / RHEL 系（systemd）和 Alpine NAT（OpenRC），装完用 `proxy` 菜单管理
@@ -70,7 +70,7 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 
 双栈（同时能用 IPv4 和 IPv6 出站）在交互安装、重新安装时都会询问一次出站策略：IPv4优先（`46`）、IPv6优先（`64`）、仅IPv4（`4`）、仅IPv6（`6`）。默认选项是已保存的策略，重新安装时可以改选，例如从 IPv4优先改为 IPv6优先；选择记在 `state.env` 的 `OUTBOUND_IP`。普通配置重写沿用已保存值，不重复询问。`--auto` 不询问，沿用已有选择、首次未保存时使用 IPv4优先；显式 `--outbound` 参数优先。只有一种地址时按那一种出站。
 
-本机 IPv6 只有内网 ULA（`fc00::/7`，例如 `fd42::`）时，会用 `curl -6` 探测。回显是公网 IPv6（NAT66）就按双栈，可以选 IPv6优先。回显仍是 ULA 或探测失败，则当作没有 IPv6。这个选择只影响代理出站（Xray 的 `domainStrategy`、Hysteria2 的 `direct.mode`、sing-box 的地址策略）。落地机用同一套；原样转发按它重选 DNAT 目标。查看和修改见下方「常用维护」里的 `proxy outbound`。
+本机 IPv6 只有内网 ULA（`fc00::/7`，例如 `fd42::`）时，会用 `curl -6` 探测。回显是公网 IPv6（NAT66）就按双栈，可以选 IPv6优先。回显仍是 ULA 或探测失败，则当作没有 IPv6。这个选择只影响代理出站，由 Xray 的 freedom `domainStrategy` 执行；Hysteria2 / TUIC / AnyTLS 经本机 Xray 策略入口使用同一选择。落地机用同一套；原样转发按它重选 DNAT 目标。查看和修改见下方「常用维护」里的 `proxy outbound`。
 
 ### 使用解析到本机的 SNI 域名
 
@@ -90,7 +90,7 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--force-sni` | 保留兼容旧命令；手填 SNI 已默认在检测失败后继续使用 |
 | `--scan` | 高级：用 [RealiTLScanner](https://github.com/XTLS/RealiTLScanner) 扫描 VPS 附近 IP 寻找同机房目标（约 60 秒） |
 | `--port <N>` | VLESS-REALITY TCP 端口，默认 443（NAT 模式可写 `外部:内部`，如 `59221:443`） |
-| `--no-hy2` / `--hy2` | 不安装 / 安装 Hysteria2（默认安装） |
+| `--no-hy2` / `--hy2` | 不安装 / 安装 Hysteria2（首次默认不安装，重装沿用保存的开关） |
 | `--hy2-port <N>` | Hysteria2 UDP 端口，默认 443（NAT 模式可写 `外部:内部`） |
 | `--no-reality` / `--reality` | 关闭 / 开启 VLESS + REALITY + Vision（默认开启） |
 | `--no-xhttp` / `--xhttp` | 关闭 / 开启 VLESS + XHTTP + REALITY（默认开启，不需要自己的域名） |
@@ -164,7 +164,7 @@ CDN 线路示例：`bash proxy.sh --auto --cert-domain example.com --xhttp-tls -
 proxy proto
 ```
 
-菜单第 16 项「协议开关」作用相同。前三项默认开着：VLESS + REALITY + Vision、VLESS + XHTTP + REALITY、Hysteria2。第 4–6 项默认关：Trojan + REALITY、TUIC v5、AnyTLS。第 7–8 项是默认关的 CDN 线路，第 9 项只给这两条做 VLESS Encryption。Vision 和 XHTTP 都开着时，菜单下方的 `s` 切换是否共用同一个 TCP 端口。在这个菜单里关掉，只停止对应监听，不卸载程序，至少留一个协议。
+菜单第 16 项「协议开关」作用相同。前两项默认开着：VLESS + REALITY + Vision、VLESS + XHTTP + REALITY。第 3–6 项默认关：Hysteria2、Trojan + REALITY、TUIC v5、AnyTLS。第 7–8 项是默认关的 CDN 线路，第 9 项只给这两条做 VLESS Encryption。Vision 和 XHTTP 都开着时，菜单下方的 `s` 切换是否共用同一个 TCP 端口。在这个菜单里关掉，只停止对应监听，不卸载程序，至少留一个协议。
 
 共用或分开端口：
 
@@ -201,13 +201,12 @@ proxy --no-hy2 --auto
 
 ## 默认协议
 
-默认一次装好三个，都不需要自己的域名：
+默认安装两条，都不需要自己的域名：
 
 - **VLESS + REALITY + XTLS-Vision**（含后量子签名 ML-DSA-65）
 - **VLESS + XHTTP + REALITY**（与 Vision 共用同一把 Reality 密钥和 SNI。默认单独 TCP 8443；`--xhttp-on-443` 或 `proxy proto xhttp-443 on` 后改走 Vision 的端口）
-- **Hysteria2**（端口跳跃 + 证书指纹固定）
 
-第一次交互安装会确认 XHTTP 和 Hysteria2，直接回车就是装上。已经装过再重装时，回车沿用现在的开关。`--auto` 第一次按这三个默认值安装；状态里已经记下的开关会沿用，除非写了 `--xhttp` / `--no-xhttp` 或 `--hy2` / `--no-hy2`。更早的状态文件里如果没有 `XHTTP_ENABLED` 这一项，下一次安装会按默认打开 XHTTP。
+第一次交互安装会确认 XHTTP（默认开启）和 Hysteria2（`[y/N]`，回车不装）；需要 Hysteria2 时明确选 `y` 或加 `--hy2`。`--auto` 首次只装上述两条。已经装过再重装时，回车或 `--auto` 沿用保存的协议开关，显式参数优先；更早的状态文件没有 `XHTTP_ENABLED` 时也不会在重装中额外开启它。
 
 可选协议默认不装，安装时也不会询问：Trojan + REALITY、TUIC v5、AnyTLS，以及两条 CDN 线路（VLESS + XHTTP + TLS、VLESS + WebSocket + TLS）。安装时加 `--trojan`、`--tuic`、`--anytls`、`--xhttp-tls`、`--ws-tls`，或装完后用上面的 `proxy proto`。CDN 这两条还要有已经解析到本机的自有域名和公开证书（Let's Encrypt / ZeroSSL，或只给这两条用的 Cloudflare 源站证书）。Shadowsocks 2022 不是给客户端直连的协议：纯落地机用 `--land`，已经装好的节点用菜单第 22 项或 `proxy land-enable` 再加一条落地入站，不改现有节点链接。
 
@@ -219,6 +218,11 @@ proxy --no-hy2 --auto
 <summary>功能</summary>
 
 ## 功能
+
+- **禁回国（固定开启）**：所有解密后的代理请求先检查 CN 域名和 CN IPv4 / IPv6，再执行来源白名单、直连与落地转发。Xray 使用 `IPOnDemand`，域名未命中时也解析 IP 检查；不是拦截国内客户端连接，也不添加系统全局 OUTPUT 封禁。Hysteria2 / TUIC / AnyTLS 的代理出站只走 `127.0.0.1` 上的 Xray SOCKS 策略入口（支持 TCP / UDP），无直连兜底，不新增公网端口。因此只开启这些协议时 Xray 也需运行。
+  - 独立规则文件 `proxy-cn-geoip.dat`（Loyalsoldier/geoip 的 CN 数据，含 IPv6）和 `proxy-cn-geosite.dat`（v2fly/domain-list-community）放在 `/usr/local/share/xray/`，不覆盖原有 `geoip.dat` / `geosite.dat`。安装、重装和更新 Xray 时刷新，普通配置修改复用缓存；下载先核对发布的 SHA256，再用内核校验 CN 分类，失败不生成缺少过滤的新配置。
+  - 旧版仅更新管理脚本不会改正在运行的配置；通过 `proxy update` 选择全部更新或重装来应用。`proxy doctor` 会检查规则及其他内核的策略接入。
+  - IP / 域名归属取决于规则数据的准确性；原样 DNAT 转发不解密流量，必须在最终落地机执行此策略。
 
 - **环境预检**：必须 root；识别发行版与架构（amd64 / arm64）；显示 IP、城市、ASN、内存；内存 < 1G 且无 Swap 时自动加 1G Swap；自动更新系统并安装依赖（RHEL 系自动启用 EPEL）；未检测到时间同步服务时自动安装并启用 systemd-timesyncd / chrony（REALITY 要求系统时间准确）。
 - **系统调优（保守，不换内核）**：普通模式安装时默认启用 BBR + fq；TCP/UDP 缓冲区（满足 Hysteria2 建议的 16MB）、文件句柄上限；journald 日志上限 100M。配置写入 `/etc/sysctl.d/99-proxy-tune.conf`，卸载时恢复原值。也可以用 `proxy tune` 单独调整 / 恢复，见下文「网络调优」。
@@ -233,7 +237,7 @@ proxy --no-hy2 --auto
   - 更新前把当前程序备份为 `/usr/local/bin/xray.bak`。该目录剩余空间不足 50 MB 时跳过备份并警告。直接下载时先在临时文件上跑 `version`，并对当前配置跑 `xray run -test`，通过后才替换。官方安装脚本会自己写入程序，脚本在写完后做同样的检查，不通过就恢复备份。可用 `--xray-ver <标签>` 安装指定的已发布版本。
   - **安装后 REALITY 自检**：用已安装的 xray 在 127.0.0.1 随机端口起一个临时客户端，按生成的链接参数连接本机节点并访问外网，打印通过 / 未通过（不影响安装；更换 SNI 后也会自动自检）。临时客户端限制 `GOMEMLIMIT`，128MB 的 NAT 小鸡也能跑。
 - **REALITY 目标网站自动优选**（见下文「为什么 SNI 规则很重要」）。
-- **Hysteria2（可选，默认启用）**：普通模式用官方 get.hy2.sh；NAT / Alpine 直接下载 apernet/hysteria Release 并校验 SHA256。落地机不装 Hysteria2。自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。Cloudflare 源站证书不会交给 Hysteria2。更新前备份为 `hysteria.bak`（剩余空间不足 50 MB 时跳过并警告）。Hysteria2 没有配置检查命令，只确认新程序能跑 `version`。可用 `--hy2-ver <标签>`（例如 `v2.6.1`）安装指定版本。
+- **Hysteria2（可选，首次默认关闭）**：普通模式用官方 get.hy2.sh；NAT / Alpine 直接下载 apernet/hysteria Release 并校验 SHA256。落地机不装 Hysteria2。自签 EC 证书（CN = 所选 SNI），客户端使用 `pinSHA256` 固定证书指纹；随机密码；监听 UDP 443；伪装为反向代理 `https://<SNI>`；nftables 实现 UDP 20000-50000 → 443 端口跳跃。申请公开证书后，Hysteria2 改为出示那张证书，链接地址和 SNI 换成自有域名，不再带 `insecure` 或 `pinSHA256`。Cloudflare 源站证书不会交给 Hysteria2。更新前备份为 `hysteria.bak`（剩余空间不足 50 MB 时跳过并警告）。Hysteria2 没有配置检查命令，只确认新程序能跑 `version`。可用 `--hy2-ver <标签>`（例如 `v2.6.1`）安装指定版本。
 - **防火墙（nftables）**：独立表 `inet proxy_oneclick`，不改 Docker / Podman 自己的表。模式为 `strict`（入站默认拒绝，干净机器的默认）、`allow`（只放行代理端口和端口跳跃，不接管入站策略；检测到 Docker/Podman、WireGuard 或其它 UDP、已有 nftables/iptables/ufw/firewalld，或多个非标准监听端口时，交互安装默认推荐它，非交互且未指定 `--firewall` 时直接用它；已经装过又没写 `--firewall` 则沿用保存的模式，fail2ban 的 nftables 表不算已有规则）或 `off`（`--no-firewall`，不写规则）。严格模式放行 lo、已建立连接、ICMP/ICMPv6、DHCPv6 回包、**自动探测的 SSH 端口**（`sshd -T`、配置文件、监听进程、ssh.socket 及当前 SSH 会话端口）、当前已开启协议的 TCP/UDP 端口及 Hysteria2 跳跃范围；检测到其它对外服务时会询问是否一并放行。只有 HTTP-01（Let's Encrypt / ZeroSSL 的单域名或多域名）才额外放行 TCP 80。只有公开证书才放行订阅 HTTPS 端口。通配符 DNS-01 和 Cloudflare 源站证书不放行 80，源站证书也不开订阅。应用前先 `nft -c` 校验并备份原规则；由 systemd 单元 `proxy-oneclick-fw.service` 开机加载。检测到 firewalld / ufw 时，严格模式会询问是否停用（卸载时可恢复）；只放行模式，或选择保留它们时，会把当前代理端口和 Hysteria2 跳跃范围写进正在运行的 ufw（注释 `proxy-oneclick`）或 firewalld 默认区域，并记在 `/root/.proxy-oneclick/fw-host.list`。已经存在的放行（不论原来的注释）不会改注释，也不会记进这份清单。SSH 不记进清单，清理时也不会删。改端口、关协议、切换模式和卸载时只按清单删除本脚本自己加的规则。本机没有 ufw 也没有 firewalld 时这一步不做。不会关闭 SELinux（写入文件后执行 `restorecon`）。防火墙菜单、运行状态和安装结束时会逐行列出已经放行的端口，以及每一条属于哪个协议（Reality、XHTTP、Hysteria2、落地 SS2022、Trojan、TUIC、AnyTLS、CDN 的 XHTTP 与 WebSocket、订阅、证书申请的 TCP 80、SSH、端口跳跃，以及额外放行），并写出已经同步到 ufw / firewalld 的条目。严格模式下，没写出来的新连接仍然拒绝；只放行模式不会丢掉其它端口。装好后可用 `proxy firewall strict`、`proxy firewall allow`、`proxy firewall off` 切换。
 - **fail2ban**：sshd 监狱，10 分钟内失败 5 次封禁 1 小时（systemd 日志后端 + nftables 动作）。
 - **XHTTP（默认开启）**：VLESS + XHTTP + REALITY。与 Vision 共用同一把 x25519、ShortId、SNI 和 ML-DSA-65 种子，默认单独监听 TCP 8443，`flow` 必须为空，路径为随机 `/` + 十六进制。服务端和客户端链接的 `mode` 都是 `stream-one`（REALITY 直连；客户端用 `auto` 时有已知握手失败）。不需要自己的域名，也不把自己的证书挂到 XHTTP 上。这条和下面的「XHTTP + TLS（CDN）」是两条入站，互不替换。加上 `--xhttp-on-443`（或 `proxy proto xhttp-443 on`）后，Vision 的入站用 Xray fallbacks 把非 Vision 流量交给本机的 XHTTP 入站（优先 `/dev/shm/xray-xhttp.sock`，没有则用 127.0.0.1），链接端口、SNI、公钥和 ShortId 与 Vision 相同，防火墙不再单独放行 8443。已有安装默认仍是分开的 8443。NAT 只有一个 TCP 映射时，安装会建议或直接启用共用。
@@ -323,7 +327,7 @@ XHTTP 默认还要第二条外部 TCP 端口（8443，不能和 Vision 的 TCP 4
 | Swap | 容器里无法创建 / 启用 Swap |
 | sysctl 调优（BBR 等）——改为可选 | 容器共享宿主机内核，很多参数只读或由宿主机控制。交互安装时会询问，只应用容器内实际可写的参数（不强制 BBR）；`--auto` 时默认跳过，加 `--tune` 启用；之后也可随时 `proxy tune` |
 | 系统升级 | 节省时间与磁盘；需要时加 `--upgrade` |
-| geoip / geosite 数据文件 | 节省约 20MB 磁盘；内网屏蔽改为内置的私有网段列表 |
+| 完整 geoip / geosite 数据文件 | 内网屏蔽使用内置私有网段；仍下载禁回国必需的 CN IP 数据与域名数据（合计约 2.5MB，随上游增长） |
 | 时间同步服务 | 容器使用宿主机时钟（Alpine 虚拟机会安装 chrony） |
 | `--scan`、大规模 SNI 检测 | 小内存机器上 SNI 候选限制为 12 个、并发 3 |
 | 申请证书、CDN 上的 XHTTP+TLS / WebSocket+TLS | 证书和 CDN 都要能从公网访问到这台机器。NAT 小鸡通常没有这些映射。通配符、ZeroSSL 和源站证书同样不在 NAT 上申请。不带证书参数、`--xhttp-tls`、`--ws-tls` 时安装方式不变 |
@@ -492,7 +496,7 @@ bash proxy.sh --land --auto --port 8388 --land-method chacha20 --land-allow 203.
 apk add bash curl && bash proxy.sh --land --nat --auto --port 52430:8388 --nat-addr 1.2.3.4 --land-allow 203.0.113.10
 ```
 
-- **尽量轻**：只装 Xray 一个程序（直接下载官方 Release 并校验 SHA256，只解压 `xray` 本体，不带 geo 数据文件），不装 Reality / Hysteria2 / fail2ban / 默认拒绝防火墙；Xray 以 `nobody` 运行、日志 warning 且关闭访问日志，内存 < 256MB 时自动设置 `GOMEMLIMIT`（128MB 的 Alpine 容器实测 Xray 常驻约 30MB）。支持 Debian / Ubuntu / RHEL 系（systemd）以及 Alpine（OpenRC），NAT 映射端口写法与 NAT 模式相同。
+- **尽量轻**：只装 Xray 一个程序（直接下载官方 Release 并校验 SHA256，只解压 `xray` 本体，另下载禁回国必需的规则数据），不装 Reality / Hysteria2 / fail2ban / 默认拒绝防火墙；Xray 以 `nobody` 运行、日志 warning 且关闭访问日志，内存 < 256MB 时自动设置 `GOMEMLIMIT`。支持 Debian / Ubuntu / RHEL 系（systemd）以及 Alpine（OpenRC），NAT 映射端口写法与 NAT 模式相同。
 - **协议**：Shadowsocks 2022（SIP022），`network: tcp,udp`。默认 `2022-blake3-aes-128-gcm`（16 字节密钥），可选 `2022-blake3-aes-256-gcm` / `2022-blake3-chacha20-poly1305`（32 字节密钥，无 AES 硬件加速的 ARM 机器选 chacha20）；密钥用 `openssl rand -base64 <长度>` 生成。SS2022 会校验时间戳，两端时间相差超过 30 秒会被拒绝，脚本会检查 / 启用时间同步。
 - **出站限制**：与节点模式一样屏蔽访问内网 / 保留地址段与 BT。
 - **来源 IP 白名单**（可选，强烈建议）：只允许列出的中转机 IP。实现为两层：
