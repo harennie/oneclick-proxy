@@ -162,7 +162,11 @@ show_menu() {
   [[ -n $INIT_SYS ]] || detect_init
   cn_rules_install_job
   if (( LAND_MODE )); then show_land_menu; return; fi
-  local menu10="防火墙管理"; (( NAT_MODE )) && menu10="NAT 信息 / 端口跳跃"
+  local menu10="防火墙管理" sni_label="更换 SNI（手填 / 自动 / 扫描）"
+  if (( NAT_MODE )); then
+    menu10="NAT 信息 / 端口跳跃"
+    sni_label="更换 SNI（手填 / 自动优选）"
+  fi
   local mode_lbl; mode_lbl=$(nat_mode_label)
   local st_word
   if (( ! INSTALLED )); then st_word="未安装"
@@ -181,7 +185,7 @@ show_menu() {
   ui_columns "oneclick proxy" "退出" \
     "安装 / 重新安装" \
     "查看链接 / 二维码 / Clash 配置" \
-    "更换 SNI（手填 / 自动优选）" \
+    "$sni_label" \
     "重新生成密钥 / UUID" \
     "修改端口 / 端口跳跃" \
     "用户管理（添加 / 删除）" \
@@ -320,7 +324,8 @@ usage() {
                       内网 ULA（fc00::/7）若 NAT66 到公网 IPv6，按双栈，可选 IPv6优先
   --sni <域名>        指定 REALITY 目标网站（照常检测，不合格只警告并继续使用）
   --force-sni         保留兼容旧命令；手填 SNI 检测不通过也会继续使用
-  --scan              使用 RealiTLScanner 扫描 VPS 附近 IP 寻找 SNI（高级，约 60 秒）
+  --scan              交互时将扫描器优选设为自动结果页的默认选项（约 60 秒）
+                      无交互且需要优选时先扫描，再用候选库补齐
   --port <端口>       VLESS-REALITY TCP 端口（默认 443）
   --hy2 / --no-hy2    安装 / 不安装 Hysteria2（首次默认不装）
   --hy2-port <端口>   Hysteria2 UDP 端口（默认 443）

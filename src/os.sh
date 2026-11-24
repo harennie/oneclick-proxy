@@ -293,7 +293,7 @@ detect_geo() {
     fi
   fi
   GEO_CC=${GEO_CC^^}
-  [[ -n $GEO_CC ]] || warn "无法获取 IP 地理位置信息，SNI 优选将测试全部候选。"
+  [[ -n $GEO_CC ]] || warn "无法获取 IP 地理位置信息，SNI 优选将使用全球候选池。"
 }
 
 mem_mb() { awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo; }

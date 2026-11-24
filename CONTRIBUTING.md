@@ -25,6 +25,7 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `src/core.sh` | 启动参数、界面、状态文件 |
 | `src/os.sh` | 发行版、init（systemd / OpenRC）、软件包 |
 | `src/tune.sh` | 网络调优 |
+| `src/sni-catalog.sh` | 生成的全球 SNI 候选库 |
 | `src/xray.sh` | SNI 优选、端口检测、Xray |
 | `src/hy2.sh` | Hysteria2 |
 | `src/firewall.sh` | nftables（strict / allow / off）、端口跳跃、fail2ban |
@@ -40,3 +41,21 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `src/export.sh` | `proxy export` / `proxy import`（可选密码，迁机器时带走密钥和证书） |
 | `src/doctor.sh` | `proxy doctor` 健康检查，以及 `--fix` 里那几项安全修复 |
 | `src/cli.sh` | 菜单、参数和 `main` |
+
+## 更新 SNI 候选库
+
+生成器使用 ISO 3166-1 代码、联合国 M49 地区表的 HTML 和 ROR 数据包。[ISO 代码 JSON](https://salsa.debian.org/iso-codes-team/iso-codes/-/blob/main/data/iso_3166-1.json) · [M49 地区表](https://unstats.un.org/unsd/methodology/m49/overview/) · [ROR 2026-11-19 数据包](https://zenodo.org/records/24378467)
+
+`data/sni-supplement.csv` 来自 Wikidata 的官网字段和手工核对的当地机构网站。补源时按 `country,website` 格式填写机构所在地和官网 URL。[Wikidata 官网字段](https://www.wikidata.org/wiki/Property:P856)
+
+```bash
+python3 scripts/build-sni-catalog.py \
+  --iso /path/to/iso_3166-1.json \
+  --m49 /path/to/m49.html \
+  --ror /path/to/v2.16-2026-11-19-ror-data.zip \
+  --supplement data/sni-supplement.csv
+./build.sh
+make check
+```
+
+`data/sni-coverage.tsv` 中的 `catalog_candidates` 是随脚本发布的域名数。`local_vps_verified` 为 `pending` 时表示该地还没有实测记录。运行自动优选时，输出会报告测试总数、通过数以及解析 IP 与 VPS 同属一地的通过数。生成时可通过 `--verified` 导入实测记录，TSV 表头为 `country_code` 和 `local_vps_verified`。

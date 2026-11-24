@@ -88,7 +88,7 @@ curl -fsSLo proxy.sh https://raw.githubusercontent.com/harennie/oneclick-proxy/m
 | `--outbound <策略>` | 出站：`46` IPv4优先、`64` IPv6优先、`4` 仅IPv4、`6` 仅IPv6、`auto` 清掉已记住的选择再按本次检测。可与 `--land` 一起用。检测不到所写的地址族时只警告，仍按指定的写 |
 | `--sni <域名>` | 指定 REALITY 目标网站，照常检测；不合格只警告并继续使用 |
 | `--force-sni` | 保留兼容旧命令；手填 SNI 已默认在检测失败后继续使用 |
-| `--scan` | 高级：用 [RealiTLScanner](https://github.com/XTLS/RealiTLScanner) 扫描 VPS 附近 IP 寻找同机房目标（约 60 秒） |
+| `--scan` | 将扫描器优选设为交互式自动结果页的默认选项。无交互且需要优选时先扫描，再用候选库补齐。扫描约 60 秒 |
 | `--port <N>` | VLESS-REALITY TCP 端口，默认 443（NAT 模式可写 `外部:内部`，如 `59221:443`） |
 | `--no-hy2` / `--hy2` | 不安装 / 安装 Hysteria2（首次默认不安装，重装沿用保存的开关） |
 | `--hy2-port <N>` | Hysteria2 UDP 端口，默认 443（NAT 模式可写 `外部:内部`） |
@@ -332,7 +332,7 @@ XHTTP 默认还要第二条外部 TCP 端口（8443，不能和 Vision 的 TCP 4
 | 系统升级 | 节省时间与磁盘；需要时加 `--upgrade` |
 | 完整 geoip / geosite 数据文件 | 内网屏蔽使用内置私有网段；仍下载禁回国必需的 CN IP 数据与域名数据（合计约 2.5MB，随上游增长） |
 | 时间同步服务 | 容器使用宿主机时钟（Alpine 虚拟机会安装 chrony） |
-| `--scan`、大规模 SNI 检测 | 小内存机器上 SNI 候选限制为 12 个、并发 3 |
+| `--scan`、大规模 SNI 检测 | NAT 模式不运行扫描，自动优选最多实测 24 个不同域名，并发 3 |
 | 申请证书、CDN 上的 XHTTP+TLS / WebSocket+TLS | 证书和 CDN 都要能从公网访问到这台机器。NAT 小鸡通常没有这些映射。通配符、ZeroSSL 和源站证书同样不在 NAT 上申请。不带证书参数、`--xhttp-tls`、`--ws-tls` 时安装方式不变 |
 
 ### 小内存 / 小硬盘
@@ -627,7 +627,7 @@ proxy land-del
 
 REALITY 会把未通过认证的连接原样转发给「目标网站」，同时借用它的 TLS 特征。选错目标会让节点更容易被识别或者干脆不可用。脚本按以下规则在 **VPS 上实时检测** 每个候选：
 
-1. **与 VPS 同国家/地区（最好同城、同 ASN）**：一台洛杉矶 VPS 却“访问”东京网站，流量路径和延迟都不自然。候选列表按地区组织（例如洛杉矶 → www.csun.edu、www.cpp.edu…；香港 → my.hkust.edu.hk、factsfigures.cuhk.edu.hk…；另有 JP / KR / TW / SG / DE / NL / GB / FR / CA / AU 等数十个地区），不足时自动扩展到邻近地区；结果同国家优先，其次支持 X25519MLKEM768 的优先，再按 TLS 握手延迟排序。
+1. **与 VPS 同国家或地区**。优先测试手工名单和全球候选库的本地条目，目标是找到 6 个合格域名。本地不足时，在同一区域的不同国家间轮流取候选，还有缺口时再使用全球池。普通模式最多实测 48 个不同域名，NAT 模式最多实测 24 个、并发 3。结果按实际 IP 归属优先显示同国站点，其次按 X25519MLKEM768、证书链和延迟排序。
 2. **TLS 1.3 + X25519 + ALPN h2**：REALITY 要求目标支持 TLS 1.3；h2 是现代浏览器的常态，缺失会显得异常。
    **后量子密钥交换 X25519MLKEM768 为优先项（不是硬性要求）**：用已安装的 `xray tls ping` 检测，支持的目标排在前面；若本地区没有支持的候选，仍会选用其余检测全部通过的目标，并给出一行警告（REALITY 可正常使用，只是没有后量子密钥交换保护）。`--sni` / 手动输入的域名同样只警告不拒绝。
    **ML-DSA-65（pqv）需要目标证书链总长度 ≥ 3500 字节**（同样由 `xray tls ping` 检测，列表中的 Chain 列）：不满足时服务端带 `mldsa65Seed` 会导致所有客户端 REALITY 握手失败（`handshake did not complete successfully`），因此脚本会自动对该目标关闭 pqv；满足的目标排序时也会优先。
@@ -636,9 +636,13 @@ REALITY 会把未通过认证的连接原样转发给「目标网站」，同时
 5. **不在 CDN / WAF 后面**：解析 IP 对照 <https://www.cloudflare.com/ips-v4>、ips-v6，并按响应头识别 Cloudflare（`server: cloudflare`、`cf-ray`）、Imperva/Incapsula（`x-iinfo`、`x-cdn: Imperva`、`incap_ses` / `visid_incap` Cookie）、Fastly（`x-served-by: cache-…`、`x-fastly-*`、`via: … varnish`）、Akamai（`server: AkamaiGHost`、`x-akamai-*`）、CloudFront（`via: … cloudfront`、`x-amz-cf-*`）、Azure Front Door（`x-azure-ref`）以及 Sucuri、BunnyCDN。CDN 节点与你的 VPS 明显不属于同一网络，且这类站点被大量滥用做 REALITY 目标（只用 `tr` + `grep -iE`，Alpine / busybox 下同样可用）。
 6. **不是被墙网站或大厂默认域名**：google / yahoo / apple / microsoft / amazon / cloudflare / github / 各大社交平台等被列入黑名单（这些域名要么被墙，要么是所有人都在用的“默认值”，特征明显）；`.cn` 域名也会被排除。
 
-交互安装、重装和安装后的 `proxy sni` 都先询问 SNI 域名：可以自由填写，留空进入原有自动优选。手填域名与候选域名使用同一套检测；不合格时显示原因，并让你选择重新填写或继续使用。自动优选只列出检测通过的候选（TCP 延迟、TLS 握手时间、IP 归属），默认选第一名，也可以输入 `m` 手填域名。`--auto` 沿用已有 SNI，没有时自动优选；`--sni` 显式指定时同样检测，失败后警告并继续，避免非交互命令卡住。
+交互安装、重装和安装后的 `proxy sni` 都先询问 SNI 域名。留空会进入自动优选，在结果页可以输入候选序号、`m` 手填，或 `s` 进入扫描器优选。扫描完成后可以选扫描候选、按 `m` 手填，或按 `a` 返回之前的自动结果。两页都保留本次检测结果，返回时可以直接选择。NAT 模式提供自动优选和手填。
 
-填写域名不会自动部署网站或申请证书；目标网站是否支持 TLS 1.3 / HTTP/2 由检测结果说明，仍需以实际节点连接测试为准。高级选项 `--scan` 会下载官方 RealiTLScanner，对 VPS 附近 IP 做 60 秒低并发扫描，找出同机房的 TLS1.3 + h2 站点后再走同样的检测流程；扫描可能被少数服务商视为端口扫描，请自行权衡。
+手填域名与候选域名使用同一套检测。手填检测失败会显示原因，并让你选择重新填写或继续使用。`--auto` 安装会沿用已有 SNI，需要优选时自动选第一名。显式指定 `--sni` 时同样进行检测。
+
+候选库随 `proxy.sh` 发布，从 ROR 等公开机构目录收录官网。候选表按实际解析 IP 显示国家和城市。项目的[覆盖表](data/sni-coverage.tsv)列出各地的库内候选数量及本地 VPS 实测记录。
+
+扫描器优选使用 [RealiTLScanner](https://github.com/XTLS/RealiTLScanner)。交互时带 `--scan` 会把 `s` 设为首次查看自动结果时的默认选项。带 `--auto --scan` 且需要优选时，脚本会先扫描并验证近处站点，合格项不足时用候选库补齐。扫描可能被少数服务商视为端口扫描，请自行权衡。
 
 ---
 
@@ -1221,7 +1225,7 @@ proxy uninstall --auto
 
 ## 已知限制
 
-- 候选 SNI 列表是人工整理的，网站配置会变化；脚本每次都会实测，但某些地区可能全部不合格，此时请手动输入或使用 `--scan`。SG / PH 本地自建（非 CDN）的站点很少，通常会扩大到邻近地区。
+- 站点配置会变化，脚本会从当前 VPS 重新实测。候选池较小的地区可能优先从邻区补齐。没有候选通过时，可以按 `m` 手填，或在普通模式下按 `s` 尝试扫描器优选。
 - 在容器 / OpenVZ 等环境中 BBR、Swap 及部分 sysctl 可能无法生效（脚本会逐项检测并说明跳过原因）。容器无法加载内核模块：BBR / fq 等需要宿主机已加载；OpenVZ 7 容器通常完全不能修改拥塞控制。
 - 不会安装第三方内核（如 XanMod 的 BBRv3）；已经在用这类内核时，脚本只识别并使用其提供的算法。
 - Hysteria2、Trojan、TUIC、AnyTLS 各只有一个共享密码。「用户管理」添加的 UUID 会写进所有已开启的 VLESS 入站：Vision、XHTTP+REALITY，以及已经打开的 XHTTP+TLS 和 WebSocket+TLS。上面四个共享密码协议不加这个用户。
