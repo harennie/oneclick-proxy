@@ -8,6 +8,7 @@ files=(
   src/core.sh
   src/os.sh
   src/tune.sh
+  src/sni-catalog.sh
   src/xray.sh
   src/hy2.sh
   src/firewall.sh

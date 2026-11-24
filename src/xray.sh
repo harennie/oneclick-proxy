@@ -4,8 +4,7 @@
 # 规则：与 VPS 同国家/地区（最好同城/同 ASN）；TLS1.3 + X25519 + ALPN h2 + HSTS；
 #       证书链有效；不在 CDN / WAF 后面（Cloudflare、Imperva、Fastly、Akamai、CloudFront、Azure Front Door 等）；
 #       不是被墙网站/大厂默认域名。支持 X25519MLKEM768（后量子）的目标优先，但不是硬性要求。
-# 候选列表按地区组织（以大学及本地中型网站为主），运行时在 VPS 上逐一实测。
-# v1.1.1：已剔除响应头显示使用 CDN/WAF 的候选；SG / PH 本地自建站点很少，合格数不足时自动扩大到邻近地区。
+# 手工名单优先，再使用全球候选库；所有候选都在 VPS 上实测。
 sni_candidates() { # $1 = 地区键
   case $1 in
     US-CA)  echo "www.csun.edu www.cpp.edu www.uci.edu www.ucsd.edu www.stanford.edu www.sjsu.edu www.chapman.edu www.lmu.edu" ;;
@@ -82,7 +81,6 @@ sni_region_keys() {
   fi
   case $cc in
     UK) cc=GB ;;
-    MO) cc=HK ;;
   esac
   if [[ -n $cc && -n $(sni_candidates "$cc") ]]; then
     # 邻近地区作为次选
@@ -97,8 +95,35 @@ sni_region_keys() {
     esac
     echo "$cc|$near"
   else
-    echo "|US-EAST US-CA JP SG HK DE GB NL"
+    echo "|"
   fi
+}
+
+# 按本国、同一 M49 子区或其余地区取出候选，每行对应一个国家或地区。
+sni_catalog_groups() {
+  sni_catalog | awk -F'|' -v country="$1" -v tier="$2" '
+    $1 == country { home = $3; region = $2; next }
+    NF == 3 && $3 != "" { groups[++count] = $2; hosts[count] = $3 }
+    END {
+      if (tier == "local") { if (home != "") print home; exit }
+      for (i = 1; i <= count; i++) {
+        nearby = region != "" && region != "000" && groups[i] == region
+        if ((tier == "nearby" && nearby) || (tier == "global" && !nearby)) print hosts[i]
+      }
+    }'
+}
+
+sni_round_robin() {
+  awk 'NF {
+    size[NR] = NF
+    if (NF > longest) longest = NF
+    for (i = 1; i <= NF; i++) host[NR,i] = $i
+  }
+  END {
+    for (i = 1; i <= longest; i++)
+      for (row = 1; row <= NR; row++)
+        if (i <= size[row]) print host[row,i]
+  }'
 }
 
 # 大厂/被墙/CDN 默认域名黑名单（按域名标签精确匹配）
@@ -351,11 +376,8 @@ sni_probe() {
   echo "PASS|$host|$best|$tls_ms|$first|$cc|$city|$org|$pq|${SNI_CHAIN_LEN:-?}"
 }
 
-# NAT 模式（小内存）降低并发并减少候选数量
 SNI_PAR=10
-sni_cap() { # 输出候选列表（NAT 模式最多 12 个）
-  if (( NAT_MODE )); then tr ' ' '\n' <<<"$*" | awk 'NF && ++n <= 12' | tr '\n' ' '; else printf '%s' "$*"; fi
-}
+readonly SNI_PASS_GOAL=6
 # 并发测试一组域名，结果写入 $1 文件
 sni_test_list() {
   local outfile=$1; shift
@@ -374,9 +396,42 @@ sni_test_list() {
   cat "${dir}"/*.res 2>/dev/null >"$outfile" || : >"$outfile"
 }
 
+sni_pass_count() {
+  awk -F'|' -v country="${2:-}" '$1 == "PASS" && (country == "" || $6 == country) { count++ } END { print count + 0 }' "$1"
+}
+
+# Per-tier ceilings reserve part of the budget for sites outside the first pool.
+sni_probe_pool() {
+  local results=$1 tested=$2 limit=$3 country=$4 host checked
+  shift 4
+  local -A tested_domains=()
+  local batch=()
+  if (( $(sni_pass_count "$results" "$country") >= SNI_PASS_GOAL )); then return 0; fi
+  checked=$(wc -l <"$tested")
+  while IFS= read -r host; do tested_domains["$host"]=1; done <"$tested"
+  for host in "$@"; do
+    (( checked < limit )) || break
+    [[ -z ${tested_domains[$host]+set} ]] || continue
+    tested_domains["$host"]=1
+    printf '%s\n' "$host" >>"$tested"
+    checked=$((checked + 1))
+    batch+=("$host")
+    if (( ${#batch[@]} == SNI_PASS_GOAL )); then
+      sni_test_list "${results}.batch" "${batch[@]}"
+      cat "${results}.batch" >> "$results"
+      if (( $(sni_pass_count "$results" "$country") >= SNI_PASS_GOAL )); then return 0; fi
+      batch=()
+    fi
+  done
+  if (( ${#batch[@]} > 0 )); then
+    sni_test_list "${results}.batch" "${batch[@]}"
+    cat "${results}.batch" >> "$results"
+  fi
+}
+
 # 排序：同国家优先，其次支持 X25519MLKEM768 优先（Y > ? > N），再证书链 ≥ 3500（可用 pqv）优先，最后按 TLS 握手 / TCP 延迟
-sni_sorted_pass() { # $1 结果文件
-  awk -F'|' -v cc="$GEO_CC" -v min="$MLDSA_MIN_CHAIN" '$1=="PASS"{s=($6==cc || cc=="")?0:1; p=($9=="Y")?0:(($9=="N")?2:1)
+sni_sorted_pass() { # $1 结果文件 $2 国家或地区代码
+  awk -F'|' -v cc="$2" -v min="$MLDSA_MIN_CHAIN" '$1=="PASS"{s=($6==cc || cc=="")?0:1; p=($9=="Y")?0:(($9=="N")?2:1)
       c=($10 ~ /^[0-9]+$/ && $10+0 < min+0)?1:0; print s"|"p"|"c"|"$0}' "$1" |
     sort -t'|' -k1,1n -k2,2n -k3,3n -k7,7n -k6,6n | cut -d'|' -f4-
 }
@@ -390,7 +445,7 @@ sni_pq_warn() {
 }
 
 sni_print_table() { # $1 = 已排序 PASS 列表文件, $2 = 显示条数
-  local i=0 line host rtt tls ip cc city org pq chain
+  local i=0 host rtt tls ip cc city org pq chain
   printf '  %-4s %-30s %-9s %-9s %-6s %-6s %-16s %s\n' "No." "Domain(域名)" "TCP-RTT" "TLS-HS" "MLKEM" "Chain" "IP" "位置 / ASN"
   while IFS='|' read -r _ host rtt tls ip cc city org pq chain; do
     i=$((i + 1)); (( i > $2 )) && break
@@ -423,7 +478,7 @@ scanner_collect() { # $1 输出候选列表文件
     chmod 755 "${SCANNER_BIN}.tmp"; mv -f "${SCANNER_BIN}.tmp" "$SCANNER_BIN"
   fi
   mktmp
-  csv="${TMP_DIR}/scan.csv"
+  csv="$out.csv"
   warn "在 VPS 上扫描可能被服务商视为端口扫描（少数商家会警告），将以低并发扫描 ${secs} 秒。"
   info "正在扫描 ${PUBLIC_IP4} 附近的 IP ..."
   ( cd "$TMP_DIR" && timeout "$secs" "$SCANNER_BIN" -addr "$PUBLIC_IP4" -port 443 -thread 4 -timeout 4 -out "$csv" >/dev/null 2>&1 ) || true
@@ -433,10 +488,98 @@ scanner_collect() { # $1 输出候选列表文件
   info "扫描得到 $(wc -l <"$out") 个候选域名，开始逐一验证 ..."
 }
 
+sni_probe_scanned() { # $1 结果文件前缀 $2 探测上限 $3 VPS 国家或地区代码
+  local scanned="$1.scan.list"
+  local -a scan_queue
+  if scanner_collect "$scanned"; then
+    mapfile -t scan_queue <"$scanned"
+    sni_probe_pool "$1.results" "$1.tested" "$2" "$3" "${scan_queue[@]}"
+  fi
+}
+
+sni_show_results() {
+  local results="$1.results" sorted="$1.sorted" tested="$1.tested" country=$2
+  local npass=$3 checked fails
+  checked=$(wc -l <"$tested")
+  if [[ -n $country ]]; then
+    info "共探测 ${checked} 个，${npass} 个通过，其中 $(sni_pass_count "$results" "$country") 个的 IP 位于 ${country}。"
+  else
+    info "共探测 ${checked} 个，${npass} 个通过。"
+  fi
+  if (( npass == 0 )); then
+    warn "没有候选域名通过全部检测。"
+    awk -F'|' '$1=="FAIL" && ++n <= 15 {printf "    %s: %s\n", $2, $3}' "$results"
+    return 0
+  fi
+  echo
+  _green "通过检测的候选（按同国、MLKEM、证书链和延迟排序）："
+  sni_print_table "$sorted" 8
+  fails=$(grep -c '^FAIL' "$results" || true)
+  printf '  （另有 %s 个候选未通过，已排除）\n\n' "$fails"
+  if ! cut -d'|' -f9 "$sorted" | grep -q '^Y$'; then
+    warn "通过检测的候选均不支持（或无法确认支持）X25519MLKEM768，已放宽为偏好条件，仍从中选择。"
+  fi
+}
+
+sni_pick_candidate() {
+  local result pq
+  result=$(sed -n "$2p" "$1")
+  IFS='|' read -r _ SNI _ _ _ _ _ _ pq _ <<<"$result"
+  sni_pq_warn "$SNI" "$pq"
+}
+
+sni_choose_interactive() {
+  local auto_results=$1 scan_results=$2 country=$3 scan_limit=$4
+  local page=auto active_results npass prompt default_choice choice TTY_EOF=0
+  while :; do
+    if [[ $page == scan ]]; then
+      active_results=$scan_results
+      prompt="输入 a 返回自动优选，或 m 手动填写域名"
+      default_choice=a
+      if [[ ! -f $scan_results.sorted ]]; then
+        step "扫描器优选 REALITY 目标网站 (SNI)"
+        : >"$scan_results.results"
+        : >"$scan_results.tested"
+        sni_probe_scanned "$scan_results" "$scan_limit" "$country"
+        sni_sorted_pass "$scan_results.results" "$country" >"$scan_results.sorted"
+      fi
+      step "扫描器优选结果"
+    else
+      active_results=$auto_results
+      prompt="输入 m 手动填写域名"
+      default_choice=m
+      if (( ! NAT_MODE )); then prompt+="，或 s 扫描器优选"; fi
+      step "自动优选结果"
+    fi
+    npass=$(wc -l <"$active_results.sorted")
+    sni_show_results "$active_results" "$country" "$npass"
+    if (( npass > 0 )); then
+      prompt="请选择候选序号，或${prompt}"
+      default_choice=1
+    fi
+    if [[ $page == auto && ! -f $scan_results.sorted ]] && (( OPT_SCAN && ! NAT_MODE )); then
+      default_choice=s
+    fi
+    ask choice "$prompt" "$default_choice"
+    if [[ $choice =~ ^0*([1-8])$ ]] && (( BASH_REMATCH[1] <= npass )); then
+      sni_pick_candidate "$active_results.sorted" "${BASH_REMATCH[1]}"
+      break
+    fi
+    (( ! TTY_EOF )) || die "未读取到 SNI 选项。"
+    case ${choice,,} in
+      m) manual_sni && break; page=auto ;;
+      a) if [[ $page == scan ]]; then page=auto; else warn "输入无效。"; fi ;;
+      s) if [[ $page == auto ]] && (( ! NAT_MODE )); then page=scan; else warn "输入无效。"; fi ;;
+      *) warn "输入无效。" ;;
+    esac
+  done
+  ok "已选择 SNI: ${SNI}"
+}
+
 # 手填优先，留空进入自动优选。结果写入全局 SNI。
 select_sni() {
   mktmp
-  local keys main near cands="" k res="${TMP_DIR}/sni.res" sorted="${TMP_DIR}/sni.sorted"
+  local keys main near k
   if [[ -n $OPT_SNI ]]; then
     manual_sni "$OPT_SNI"
     return 0
@@ -447,80 +590,67 @@ select_sni() {
     manual_sni && return 0
   fi
 
+  local country=$GEO_CC
+  [[ $country != UK ]] || country=GB
   keys=$(sni_region_keys)
   main=${keys%%|*} near=${keys#*|}
+  local selection_dir auto_results res sorted tested
+  selection_dir=$(mktemp -d "${TMP_DIR}/sni.XXXXXX")
+  auto_results="$selection_dir/auto"
+  res="$auto_results.results" sorted="$auto_results.sorted" tested="$auto_results.tested"
+  : >"$res"
+  : >"$tested"
+  local budget=48 local_max=24 global_reserve=6 SNI_PAR=6
+  local local_limit
+  local -a queue
   step "自动优选 REALITY 目标网站 (SNI)"
   if (( NAT_MODE )); then
+    budget=24 local_max=12
     SNI_PAR=3
-    (( OPT_SCAN )) && { warn "NAT 模式不支持 --scan（节省资源，且 NAT 机器扫描邻居 IP 意义不大），已忽略。"; OPT_SCAN=0; }
-    info "NAT 精简模式：每个地区最多测试 12 个候选，并发 3。"
+    if (( OPT_SCAN )); then warn "NAT 模式不支持 --scan，已忽略。"; fi
   fi
   info "VPS 位置: ${GEO_CC:-未知} ${GEO_REGION} ${GEO_CITY}  ${GEO_ORG}"
+  info "目标：${SNI_PASS_GOAL} 个通过检测的域名。最多探测 ${budget} 个，并发 ${SNI_PAR}。"
   info "筛选规则: 同地区 · TLS1.3+X25519 · ALPN h2 · HSTS · 证书有效 · 非 CDN/WAF · 非大厂/被墙域名（支持 X25519MLKEM768 者优先）"
 
-  if (( OPT_SCAN )); then
-    local scanned="${TMP_DIR}/scan.list"
-    if scanner_collect "$scanned"; then
-      # shellcheck disable=SC2046
-      sni_test_list "$res" $(cat "$scanned")
-      sni_sorted_pass "$res" >"$sorted"
+  if (( OPT_AUTO && OPT_SCAN && ! NAT_MODE )); then
+    sni_probe_scanned "$auto_results" "$local_max" "$country"
+  fi
+  mapfile -t queue < <(
+    { sni_candidates "$main"; sni_catalog_groups "$country" local; } | awk '{ for (i = 1; i <= NF; i++) print $i }'
+  )
+  if (( ${#queue[@]} > 0 && $(sni_pass_count "$res" "$country") < SNI_PASS_GOAL )); then
+    info "测试 ${main:-${country:-本地区}} 候选..."
+    local_limit=$(( $(wc -l <"$tested") + local_max ))
+    if (( local_limit > budget - 2 * global_reserve )); then local_limit=$((budget - 2 * global_reserve)); fi
+    sni_probe_pool "$res" "$tested" "$local_limit" "$country" "${queue[@]}"
+  fi
+  if (( $(sni_pass_count "$res") < SNI_PASS_GOAL )); then
+    mapfile -t queue < <(
+      { for k in $near; do sni_candidates "$k"; done; sni_catalog_groups "$country" nearby; } | sni_round_robin
+    )
+    if (( ${#queue[@]} > 0 )); then
+      info "扩大到邻近国家和地区..."
+      sni_probe_pool "$res" "$tested" "$((budget - global_reserve))" "" "${queue[@]}"
     fi
   fi
-  if [[ ! -s ${sorted} ]]; then
-    [[ -n $main ]] && cands=$(sni_cap "$(sni_candidates "$main")")
-    info "测试 ${main:-通用} 地区候选（$(wc -w <<<"$cands") 个）..."
-    # shellcheck disable=SC2086
-    [[ -n $cands ]] && sni_test_list "$res" $cands
-    [[ -f $res ]] || : >"$res"
-    sni_sorted_pass "$res" >"$sorted"
-    if (( $(wc -l <"$sorted") < 3 )) && [[ -n $near ]]; then
-      cands=""
-      for k in $near; do cands+=" $(sni_candidates "$k")"; done
-      cands=$(sni_cap "$cands")
-      info "本地区合格数量不足，扩大到邻近地区（$(wc -w <<<"$cands") 个）..."
-      # shellcheck disable=SC2086
-      sni_test_list "${res}.2" $cands
-      cat "${res}.2" >>"$res"
-      sni_sorted_pass "$res" >"$sorted"
-    fi
+  if (( $(sni_pass_count "$res") < SNI_PASS_GOAL )); then
+    mapfile -t queue < <(
+      { for k in US-EAST US-CA JP SG HK DE GB NL; do sni_candidates "$k"; done; sni_catalog_groups "$country" global; } | sni_round_robin
+    )
+    info "扩大到全球候选池..."
+    sni_probe_pool "$res" "$tested" "$budget" "" "${queue[@]}"
   fi
+  sni_sorted_pass "$res" "$country" >"$sorted"
 
-  local npass; npass=$(wc -l <"$sorted")
-  if (( npass == 0 )); then
-    warn "没有候选域名通过全部检测。"
-    awk -F'|' '$1=="FAIL" && ++n <= 15 {printf "    %s: %s\n", $2, $3}' "$res"
-    (( OPT_AUTO )) && die "自动模式下无法确定 SNI，请用 --sni 指定域名。"
-    manual_sni && return 0
-    die "未选择 SNI。"
-  fi
-  echo
-  _green "通过检测的候选（按 同国家优先 + 支持 MLKEM 优先 + TLS 握手延迟 排序）："
-  sni_print_table "$sorted" 8
-  local fails; fails=$(grep -c '^FAIL' "$res" || true)
-  printf '  （另有 %s 个候选未通过，已排除）\n\n' "$fails"
-  if ! cut -d'|' -f9 "$sorted" | grep -q '^Y$'; then
-    warn "通过检测的候选均不支持（或无法确认支持）X25519MLKEM768，已放宽为偏好条件，仍从中选择。"
-  fi
-  local best; best=$(head -n1 "$sorted" | cut -d'|' -f2)
   if (( OPT_AUTO )); then
-    SNI=$best; ok "自动选择: ${SNI}"
-    sni_pq_warn "$SNI" "$(head -n1 "$sorted" | cut -d'|' -f9)"
-    return 0
+    sni_show_results "$auto_results" "$country" "$(wc -l <"$sorted")"
+    [[ -s $sorted ]] || die "自动模式下无法确定 SNI，请用 --sni 指定域名。"
+    sni_pick_candidate "$sorted" 1
+    ok "自动选择: ${SNI}"
+  else
+    sni_choose_interactive "$auto_results" "$selection_dir/scan" "$country" "$local_max"
   fi
-  local choice
-  while :; do
-    ask choice "请选择序号，或输入 m 手动填写域名" "1"
-    if [[ $choice =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= npass && choice <= 8 )); then
-      SNI=$(sed -n "${choice}p" "$sorted" | cut -d'|' -f2)
-      sni_pq_warn "$SNI" "$(sed -n "${choice}p" "$sorted" | cut -d'|' -f9)"
-      break
-    elif [[ $choice == [mM] ]]; then
-      manual_sni && break
-    else
-      warn "输入无效。"
-    fi
-  done
-  ok "已选择 SNI: ${SNI}"
 }
 
 manual_sni() {
